@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+trimesh
+numpy
+scipy
+cadquery
+gmsh
+ezdxf
