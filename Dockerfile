@@ -1,18 +1,23 @@
 FROM python:3.11-slim
 
-# System dependencies via apt: these are standard, widely-available Debian
-# packages (unlike calculix-ccx below, these reliably resolve).
-# - libgl1 / libglu1-mesa: OpenGL libs that OCP (cadquery's OpenCASCADE binding)
-#   and some trimesh code paths expect to find even when running headless.
-# - libxrender1, libxext6, libsm6, libice6, libx11-6, libxi6, libxrandr1,
-#   libxfixes3, libxcursor1, libxinerama1, libfontconfig1: X11/font runtime
-#   libraries that OpenCASCADE (via OCP) dynamically loads at import time even
-#   in a fully headless container with nothing ever displayed.
-# - build-essential: a few pip packages compile small extensions on install.
-# - wget/bzip2: needed to fetch and unpack the Miniforge installer below.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Split into isolated RUN steps (rather than one big chained command) so that
+# if any step fails, Render's build log shows exactly WHICH step failed —
+# the previous single-command version gave only a generic wrapper error with
+# no way to tell whether `apt-get update` itself failed (network/mirror
+# issue) or a specific package name was bad.
+
+# Step 1: update package index alone — isolates a network/mirror-reachability
+# failure from a package-resolution failure.
+RUN apt-get update
+
+# Step 2: OpenGL libs (small, minimal group)
+RUN apt-get install -y --no-install-recommends \
     libgl1 \
-    libglu1-mesa \
+    libglu1-mesa
+
+# Step 3: X11/font runtime libs that OCP (cadquery's OpenCASCADE binding)
+# needs at import time even in a fully headless container.
+RUN apt-get install -y --no-install-recommends \
     libxrender1 \
     libxext6 \
     libsm6 \
@@ -23,7 +28,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxfixes3 \
     libxcursor1 \
     libxinerama1 \
-    libfontconfig1 \
+    libfontconfig1
+
+# Step 4: build tools + fetch tools for the CalculiX install below.
+RUN apt-get install -y --no-install-recommends \
     build-essential \
     wget \
     bzip2 \
@@ -61,6 +69,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 
-# Render (and most PaaS Docker hosts) inject $PORT at runtime — bind to it
-# rather than a hardcoded port, or the platform's health check will fail.
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
