@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: lumexa-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: GOOGLE_API_KEY
+        sync: false        # paste the real value in Render's dashboard, not here
+      - key: ALLOWED_ORIGINS
+        value: https://your-frontend-domain.com
