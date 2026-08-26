@@ -4,11 +4,26 @@ FROM python:3.11-slim
 # packages (unlike calculix-ccx below, these reliably resolve).
 # - libgl1 / libglu1-mesa: OpenGL libs that OCP (cadquery's OpenCASCADE binding)
 #   and some trimesh code paths expect to find even when running headless.
+# - libxrender1, libxext6, libsm6, libice6, libx11-6, libxi6, libxrandr1,
+#   libxfixes3, libxcursor1, libxinerama1, libfontconfig1: X11/font runtime
+#   libraries that OpenCASCADE (via OCP) dynamically loads at import time even
+#   in a fully headless container with nothing ever displayed.
 # - build-essential: a few pip packages compile small extensions on install.
 # - wget/bzip2: needed to fetch and unpack the Miniforge installer below.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglu1-mesa \
+    libxrender1 \
+    libxext6 \
+    libsm6 \
+    libice6 \
+    libx11-6 \
+    libxi6 \
+    libxrandr1 \
+    libxfixes3 \
+    libxcursor1 \
+    libxinerama1 \
+    libfontconfig1 \
     build-essential \
     wget \
     bzip2 \
