@@ -18,6 +18,13 @@ RUN apt-get install -y --no-install-recommends libxcursor1
 RUN apt-get install -y --no-install-recommends libxinerama1
 RUN apt-get install -y --no-install-recommends libfontconfig1
 
+RUN apt-get install -y --no-install-recommends libxft2
+RUN apt-get install -y --no-install-recommends libxt6
+RUN apt-get install -y --no-install-recommends libxkbcommon0
+RUN apt-get install -y --no-install-recommends libdbus-1-3
+RUN apt-get install -y --no-install-recommends libxcb1
+RUN apt-get install -y --no-install-recommends libgomp1
+
 RUN apt-get install -y --no-install-recommends \
     build-essential \
     wget \
