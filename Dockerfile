@@ -15,20 +15,22 @@ RUN apt-get install -y --no-install-recommends \
     libgl1 \
     libglu1-mesa
 
-# Step 3: X11/font runtime libs that OCP (cadquery's OpenCASCADE binding)
-# needs at import time even in a fully headless container.
-RUN apt-get install -y --no-install-recommends \
-    libxrender1 \
-    libxext6 \
-    libsm6 \
-    libice6 \
-    libx11-6 \
-    libxi6 \
-    libxrandr1 \
-    libxfixes3 \
-    libxcursor1 \
-    libxinerama1 \
-    libfontconfig1
+# Step 3: X11/font runtime libs, ONE PER STEP — deliberately not batched this
+# time. After 2 rounds of guessing which package in a batch was the problem,
+# splitting to one-per-step means the exact failing step tells us the exact
+# bad package with certainty on the next attempt, instead of narrowing a list
+# again. Once we know which one it is, these collapse back into one RUN line.
+RUN apt-get install -y --no-install-recommends libxrender1
+RUN apt-get install -y --no-install-recommends libxext6
+RUN apt-get install -y --no-install-recommends libsm6
+RUN apt-get install -y --no-install-recommends libice6
+RUN apt-get install -y --no-install-recommends libx11-6
+RUN apt-get install -y --no-install-recommends libxi6
+RUN apt-get install -y --no-install-recommends libxrandr1
+RUN apt-get install -y --no-install-recommends libxfixes3
+RUN apt-get install -y --no-install-recommends libxcursor1
+RUN apt-get install -y --no-install-recommends libxinerama1
+RUN apt-get install -y --no-install-recommends libfontconfig1
 
 # Step 4: build tools + fetch tools for the CalculiX install below.
 RUN apt-get install -y --no-install-recommends \
@@ -49,17 +51,6 @@ RUN wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Mi
     && /opt/conda/bin/conda install -y -c conda-forge calculix \
     && /opt/conda/bin/conda clean -afy \
     && ln -s /opt/conda/bin/ccx /usr/local/bin/ccx
-# Deliberately NOT adding /opt/conda/bin to PATH — that would put conda's own
-# Python ahead of this image's python:3.11-slim on PATH and could silently
-# change which Python `pip install`/`uvicorn` below actually use. Only the
-# `ccx` binary itself is symlinked out, so the rest of this image's Python
-# environment is untouched.
-#
-# The symlink alone isn't enough, though: `ccx` dynamically links against
-# shared libraries (gfortran, BLAS, etc.) that conda-forge installed into
-# /opt/conda/lib, which a plain symlink doesn't carry along. LD_LIBRARY_PATH
-# (not PATH) tells the dynamic linker where to find those at runtime, without
-# affecting which `python`/`pip` gets resolved.
 ENV LD_LIBRARY_PATH="/opt/conda/lib:${LD_LIBRARY_PATH}"
 
 WORKDIR /app
