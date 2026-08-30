@@ -2,12 +2,20 @@ services:
   - type: web
     name: lumexa-backend
     runtime: docker
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
+    dockerfilePath: ./deploy-main/Dockerfile
+    dockerContext: ./deploy-main
     plan: free
     healthCheckPath: /
     envVars:
-      - key: GOOGLE_API_KEY
-        sync: false        # paste the real value in Render's dashboard, not here
+      - key: GROQ_API_KEY
+        sync: false
       - key: ALLOWED_ORIGINS
         value: https://your-frontend-domain.com
+
+  - type: web
+    name: lumexa-analysis
+    runtime: docker
+    dockerfilePath: ./deploy-analysis/Dockerfile
+    dockerContext: ./deploy-analysis
+    plan: free
+    healthCheckPath: /
