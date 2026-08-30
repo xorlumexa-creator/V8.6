@@ -5,5 +5,4 @@ trimesh
 numpy
 scipy
 cadquery
-gmsh
 ezdxf
