@@ -973,6 +973,13 @@ ENGINEERING DEFAULTS (apply unless the prompt specifies otherwise):
   box just because that's simpler. A box with fillets bolted on the corners
   is NOT the same as a genuinely tapered or curved shape, and looks
   noticeably different from what was actually asked for.
+- Do NOT blanket-fillet every edge of a loft/tapered solid in one
+  .edges().fillet() call. The corners where a sloped taper edge meets two
+  flat profile edges are a compound 3-edge blend — a known-hard case that
+  can silently produce self-intersecting (non-watertight) geometry with no
+  Python error at all. Prefer a smaller radius, fillet only the flat
+  profile edges (top/bottom), or skip fillets on a tapered body entirely if
+  the prompt didn't specifically require them there.
 - Words like "flange", "leg", "L-bracket", "bent bracket", "angle bracket", or "folded
   sheet metal" describe TWO FACES THAT ARE NOT COPLANAR — a real fold, not just two
   flat pieces at different in-plane orientations. For ANY part matching this
@@ -2303,14 +2310,15 @@ def rule_engine_v8(mesh,wt_,ctx,mat_key,holes,sharp,fea,part_desc=""):
     elif asp>12: add("R02","HIGH",f"Aspect {asp:.1f}:1 — buckling risk","Add ribs")
     elif asp>7: add("R02","MEDIUM",f"Aspect {asp:.1f}:1","Consider ribbing")
     if not mesh.is_watertight: add("R03","HIGH","Mesh not watertight",
-        "The most common real cause: two solids were union()-ed at an exact "
-        "flush/coincident plane (e.g. translate()-ing an end plate to sit "
-        "exactly where a tapered/lofted member ends) instead of genuinely "
-        "overlapping by a small real depth first. If the script builds "
-        "separate pieces and unions them end-to-end, check every union() "
-        "join and add real overlap (a few percent of the smaller "
-        "cross-section) before unioning — do not rely on parts merely "
-        "touching.","STL standard")
+        "Two common real causes, both confirmed live: (1) two solids "
+        "union()-ed at an exact flush/coincident plane instead of a genuine "
+        "overlap — check every union() join. (2) blanket .edges().fillet() "
+        "on ALL edges of a loft/tapered solid, including the compound "
+        "corners where a sloped taper edge meets two flat profile edges — "
+        "this can silently produce self-intersecting geometry with no "
+        "Python error. If the script filleted every edge of a loft at once, "
+        "try a smaller radius or fillet only the flat profile edges, not "
+        "the sloped taper edges.","STL standard")
     if sfv<1.0: add("R04","CRITICAL",f"SF={sfv:.2f} < 1.0 — IMMINENT FAILURE","Redesign immediately","ASME")
     elif sfv<min_sf_: add("R04","HIGH",f"SF={sfv:.2f} < required {min_sf_:.1f}","Increase section","Design code")
     buck_sf=fea.get("buckling",{}).get("safety_factor",999)
