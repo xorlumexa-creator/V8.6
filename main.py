@@ -958,6 +958,14 @@ ENGINEERING DEFAULTS (apply unless the prompt specifies otherwise):
 - External edges: chamfer 0.5-1mm for safe handling unless a sharp edge is functionally required
 - Keep aspect ratios (longest/shortest dimension) under 15:1 unless the prompt explicitly asks for a slender part
 - Center the part roughly on the origin so the bounding box is well-formed
+- When union()-ing two separately-built solids that attach end-to-end (e.g. an
+  end plate/boss/flange on a tapered or curved member), do NOT place them so
+  they only touch at one exact coincident plane with no real overlap — this is
+  a common cause of a non-watertight result, especially when their
+  cross-sections differ in size at that interface (e.g. a large plate meeting
+  a much smaller tapered tip). Translate the attachment so it genuinely
+  overlaps the other solid by a small real depth (a few percent of the
+  smaller cross-section's size is enough) before calling union().
 - If the prompt describes a tapered, curved, streamlined, or organic-looking
   shape (e.g. "tapered arm", "curved bracket", "aerodynamic", "smoothly
   blends into"), use loft() between profiles or sweep() along a spline path
