@@ -2290,6 +2290,42 @@ def exact_zones(mesh):
              "bounds_min":{"x":round(mn[0],2),"y":round(mn[1],2),"z":round(mn[2],2)},
              "bounds_max":{"x":round(mx[0],2),"y":round(mx[1],2),"z":round(mx[2],2)}} for n,mn,mx in zd]
 
+def _find_watertight_defect_locations(mesh, max_regions=3):
+    """
+    A watertight mesh has every edge shared by exactly 2 faces. Find edges
+    shared by only 1 (the actual boundary/gap causing non-watertightness),
+    cluster their vertices into separate defect regions by proximity, and
+    return each region's centroid — real (x,y,z) coordinates the AI can
+    actually target on the next iteration, instead of a bare "not
+    watertight" label with no location at all.
+    """
+    try:
+        edges_sorted = np.sort(mesh.edges_sorted, axis=1)
+        uniq, counts = np.unique(edges_sorted, axis=0, return_counts=True)
+        naked = uniq[counts == 1]
+        if len(naked) == 0:
+            return []
+        pts = mesh.vertices[np.unique(naked)]
+        # Cheap greedy clustering: group points within 5% of the part's
+        # longest dimension of each other, so several separate gaps don't
+        # collapse into one meaningless average location.
+        tol = float(max(mesh.extents)) * 0.05 or 1.0
+        clusters = []
+        for p in pts:
+            placed = False
+            for c in clusters:
+                if np.linalg.norm(c[0] - p) < tol:
+                    c.append(p); placed = True; break
+            if not placed:
+                clusters.append([p])
+        clusters.sort(key=len, reverse=True)
+        return [{"x": round(float(np.mean([p[0] for p in c])), 2),
+                  "y": round(float(np.mean([p[1] for p in c])), 2),
+                  "z": round(float(np.mean([p[2] for p in c])), 2),
+                  "edge_count": len(c)} for c in clusters[:max_regions]]
+    except Exception:
+        return []
+
 def rule_engine_v8(mesh,wt_,ctx,mat_key,holes,sharp,fea,part_desc=""):
     mat=MATERIALS.get(mat_key,MATERIALS["aluminum_6061"]);V=[]
     exts=[sf(e) for e in mesh.extents];se=sorted(exts);asp=se[2]/se[0] if se[0]>0 else 0
@@ -2309,7 +2345,14 @@ def rule_engine_v8(mesh,wt_,ctx,mat_key,holes,sharp,fea,part_desc=""):
     if asp>20: add("R02","CRITICAL",f"Aspect {asp:.1f}:1 — extreme buckling","Add bracing","Euler")
     elif asp>12: add("R02","HIGH",f"Aspect {asp:.1f}:1 — buckling risk","Add ribs")
     elif asp>7: add("R02","MEDIUM",f"Aspect {asp:.1f}:1","Consider ribbing")
-    if not mesh.is_watertight: add("R03","HIGH","Mesh not watertight",
+    if not mesh.is_watertight:
+        defect_locs = _find_watertight_defect_locations(mesh)
+        loc_txt = (" Gap location(s) found: " +
+                   "; ".join(f"({d['x']}, {d['y']}, {d['z']})" for d in defect_locs) +
+                   " — inspect and fix the geometry construction near these exact "
+                   "coordinates specifically, not the whole part."
+                   ) if defect_locs else " (could not isolate the exact gap location.)"
+        add("R03","HIGH","Mesh not watertight",
         "Two common real causes, both confirmed live: (1) two solids "
         "union()-ed at an exact flush/coincident plane instead of a genuine "
         "overlap — check every union() join. (2) blanket .edges().fillet() "
@@ -2318,7 +2361,8 @@ def rule_engine_v8(mesh,wt_,ctx,mat_key,holes,sharp,fea,part_desc=""):
         "this can silently produce self-intersecting geometry with no "
         "Python error. If the script filleted every edge of a loft at once, "
         "try a smaller radius or fillet only the flat profile edges, not "
-        "the sloped taper edges.","STL standard")
+        "the sloped taper edges." + loc_txt,
+        "STL standard", defect_locs[0] if defect_locs else None)
     if sfv<1.0: add("R04","CRITICAL",f"SF={sfv:.2f} < 1.0 — IMMINENT FAILURE","Redesign immediately","ASME")
     elif sfv<min_sf_: add("R04","HIGH",f"SF={sfv:.2f} < required {min_sf_:.1f}","Increase section","Design code")
     buck_sf=fea.get("buckling",{}).get("safety_factor",999)
@@ -2345,7 +2389,7 @@ def rule_engine_v8(mesh,wt_,ctx,mat_key,holes,sharp,fea,part_desc=""):
     try:
         cog=mesh.center_mass;gc=(mesh.bounds[0]+mesh.bounds[1])/2
         off=float(np.linalg.norm(cog-gc)/max(max(exts),1)*100)
-        if off>40: add("R13","HIGH",f"CoG offset {off:.1f}%","Redistribute mass")
+        if off>40: add("R13","HIGH",f"CoG offset {off:.1f}%","Redistribute mass",pos={"x":round(float(cog[0]),2),"y":round(float(cog[1]),2),"z":round(float(cog[2]),2)})
     except: pass
     if part_desc:
         pd=part_desc.lower()
