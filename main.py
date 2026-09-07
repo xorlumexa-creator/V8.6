@@ -903,6 +903,13 @@ FOLD_BRACKET_KEYWORDS = ("vertical flange","vertical leg","vertical wall","verti
     "right-angle bracket","right angle bracket","90 degree bend",
     "90° bend","fold line","bent sheet metal")
 
+# Same purpose as FOLD_BRACKET_KEYWORDS above, for parts needing a genuine
+# loft/taper instead of a constant cross-section — confirmed live, twice,
+# that hand-written loft+fillet code is unreliable (see make_tapered_beam).
+TAPER_KEYWORDS = ("taper","tapered","tapering","drone arm","connecting rod",
+    "streamlined","aerodynamic profile","tapered leg","tapered beam",
+    "tapered spar","loft between")
+
 GEMINI_CADQUERY_SYSTEM = """You are a CadQuery expert mechanical engineer.
 Generate Python CadQuery code to create the described 3D part.
 
@@ -974,12 +981,15 @@ ENGINEERING DEFAULTS (apply unless the prompt specifies otherwise):
   is NOT the same as a genuinely tapered or curved shape, and looks
   noticeably different from what was actually asked for.
 - Do NOT blanket-fillet every edge of a loft/tapered solid in one
-  .edges().fillet() call. The corners where a sloped taper edge meets two
-  flat profile edges are a compound 3-edge blend — a known-hard case that
-  can silently produce self-intersecting (non-watertight) geometry with no
-  Python error at all. Prefer a smaller radius, fillet only the flat
-  profile edges (top/bottom), or skip fillets on a tapered body entirely if
-  the prompt didn't specifically require them there.
+  .edges().fillet() call — confirmed live, twice, as a real cause of
+  self-intersecting (non-watertight) geometry with no Python error at all.
+  The corners where a sloped taper edge meets two flat profile edges are a
+  compound 3-edge blend, a known-hard case for any CAD kernel. For a
+  loft/tapered body: skip fillets on it entirely unless the prompt
+  specifically requires edge-breaking there — an unfilleted taper edge is
+  far better than a self-intersecting one. If fillets are truly required,
+  fillet only the flat top/bottom profile edges individually via an
+  explicit edge selector, never .edges() (all edges) on the whole loft.
 - Words like "flange", "leg", "L-bracket", "bent bracket", "angle bracket", or "folded
   sheet metal" describe TWO FACES THAT ARE NOT COPLANAR — a real fold, not just two
   flat pieces at different in-plane orientations. For ANY part matching this
@@ -1467,6 +1477,7 @@ async def gemini_generate_script(prompt: str, previous_script: Optional[str] = N
         ]
     else:
         is_fold_part = any(w in prompt.lower() for w in FOLD_BRACKET_KEYWORDS)
+        is_taper_part = any(w in prompt.lower() for w in TAPER_KEYWORDS)
         if is_fold_part:
             user_msg = (
                 f"Generate CadQuery code for: {prompt}\n\n"
@@ -1484,6 +1495,25 @@ async def gemini_generate_script(prompt: str, previous_script: Optional[str] = N
                 ")\n\n"
                 "Pick leg1_length/leg2_length/width/thickness/holes from the dimensions "
                 "stated in the prompt above. Return ONLY Python code. No markdown."
+            )
+        elif is_taper_part:
+            user_msg = (
+                f"Generate CadQuery code for: {prompt}\n\n"
+                "This part is tapered/lofted (per the description above). MANDATORY: "
+                "do not write your own loft()/fillet() geometry code for this — "
+                "confirmed live, twice, that hand-written loft+fillet code on a "
+                "tapered body produces silently broken (non-watertight) geometry "
+                "with no Python error at all. Your entire script must build the "
+                "part by calling the make_tapered_beam(...) helper that is already "
+                "available in this environment. Example:\n\n"
+                "result = make_tapered_beam(\n"
+                "    length=150.0, base_width=25.0, base_thick=10.0,\n"
+                "    tip_width=15.0, tip_thick=6.0, fillet_radius=1.0,\n"
+                "    holes_base=[(6.0, 0.0, 4.0), (-6.0, 0.0, 4.0)],\n"
+                "    holes_tip=[(3.0, 3.0, 3.0), (3.0, -3.0, 3.0), (-3.0, 3.0, 3.0), (-3.0, -3.0, 3.0)],\n"
+                ")\n\n"
+                "Pick length/base_width/base_thick/tip_width/tip_thick/holes from the "
+                "dimensions stated in the prompt above. Return ONLY Python code. No markdown."
             )
         else:
             user_msg = f"Generate CadQuery code for: {prompt}\n\nReturn ONLY Python code. No markdown."
@@ -1702,6 +1732,62 @@ def make_bent_bracket(leg1_length, leg2_length, width, thickness,
 
     return bracket
 
+def make_tapered_beam(length, base_width, base_thick, tip_width, tip_thick,
+                       fillet_radius=0.0, holes_base=None, holes_tip=None):
+    """
+    Build a tapered/lofted beam (drone arm, tapered leg, connecting rod, fin,
+    tapered housing wall) as one solid, guaranteeing correct topology via a
+    proper loft() plus SAFE fillet handling — instead of relying on the model
+    to hand-write loft+fillet code itself. Confirmed live, twice: blanket
+    .edges().fillet() on ALL of a loft's edges — including the compound
+    corners where a sloped taper edge meets two flat profile edges — silently
+    produces self-intersecting (non-watertight) geometry with no Python error
+    at all, and simply telling the model the exact coordinates of the
+    resulting gap was NOT enough for it to reliably avoid the mistake next
+    time. This is trusted server-side code, not AI-generated, so it only
+    needs to be gotten right once.
+
+    The beam runs along Z from 0 (base) to length (tip). Cross-section is a
+    rectangle: base_width x base_thick at Z=0, tapering to tip_width x
+    tip_thick at Z=length. holes_base/holes_tip are each an optional list of
+    (x_from_center_mm, y_from_center_mm, diameter_mm) tuples, drilled
+    straight through that end's flat face in its own local centered frame —
+    no 3D math required by the caller.
+
+    fillet_radius, if given, is applied ONLY to the 8 flat top/bottom
+    profile edges (the rectangle outlines at Z=0 and Z=length) — NEVER the 4
+    sloped taper edges connecting them, since the compound corners where
+    those meet are exactly where the self-intersection risk lives. Default
+    0 (no fillet): an unfilleted-but-correct beam is far better than a
+    filleted-but-broken one.
+
+    Returns the finished CadQuery solid — assign it to `result`.
+    """
+    holes_base = holes_base or []
+    holes_tip = holes_tip or []
+
+    beam = (cq.Workplane("XY")
+            .rect(base_width, base_thick)
+            .workplane(offset=length)
+            .rect(tip_width, tip_thick)
+            .loft())
+
+    if fillet_radius and fillet_radius > 0:
+        try:
+            flat_edges = [e for e in beam.edges().vals()
+                          if abs(e.Center().z) < 0.1 or abs(e.Center().z - length) < 0.1]
+            if flat_edges:
+                beam = beam.newObject(flat_edges).fillet(fillet_radius)
+        except Exception:
+            pass  # unfilleted taper is a fine fallback; don't fail the whole part
+
+    for hx, hy, hd in holes_base:
+        beam = beam.faces("<Z").workplane().pushPoints([(hx, hy)]).hole(hd)
+    for hx, hy, hd in holes_tip:
+        beam = beam.faces(">Z").workplane().pushPoints([(hx, hy)]).hole(hd)
+
+    return beam
+
 def execute_cq_script_safely(script: str):
     """
     Execute an AI-generated CadQuery script in a sandboxed namespace.
@@ -1763,6 +1849,7 @@ def execute_cq_script_safely(script: str):
         "math": math,
         "np": np,
         "make_bent_bracket": make_bent_bracket,
+        "make_tapered_beam": make_tapered_beam,
         "result": None,
     }
 
@@ -2401,6 +2488,28 @@ def rule_engine_v8(mesh,wt_,ctx,mat_key,holes,sharp,fea,part_desc=""):
                 "thickness=..., bend_angle_deg=90.0, fillet_radius=..., holes_leg1=[...], "
                 "holes_leg2=[...]) helper that is already available — it guarantees a real "
                 "fold. Replace the whole script body with a single call to it.","Engineering judgment")
+        if any(w in pd for w in TAPER_KEYWORDS):
+            try:
+                ax=int(np.argmax(exts))
+                lo,hi=mesh.bounds[0][ax],mesh.bounds[1][ax];span=hi-lo
+                normal=[0,0,0];normal[ax]=1
+                def _cross_width(frac):
+                    origin=[0,0,0];origin[ax]=lo+span*frac
+                    sec=mesh.section(plane_origin=origin,plane_normal=normal)
+                    if sec is None: return None
+                    pl,_=sec.to_planar();b=pl.bounds
+                    return max(b[1][0]-b[0][0],b[1][1]-b[0][1])
+                w_near=_cross_width(0.15);w_far=_cross_width(0.85)
+                if w_near and w_far and abs(w_near-w_far)/max(w_near,w_far)<0.1:
+                    add("R16","CRITICAL",f"Prompt implies a taper but cross-section is "
+                        f"nearly constant ({w_near:.1f}mm vs {w_far:.1f}mm along the main axis)",
+                        "Do not write manual loft()/fillet() code for this. Call the "
+                        "make_tapered_beam(length=..., base_width=..., base_thick=..., "
+                        "tip_width=..., tip_thick=..., fillet_radius=..., holes_base=[...], "
+                        "holes_tip=[...]) helper that is already available — it guarantees a "
+                        "genuine, safely-filleted taper. Replace the whole script body with "
+                        "a single call to it.","Engineering judgment")
+            except Exception: pass
     return sorted(V,key=lambda x:{"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3}.get(x["severity"],4))
 
 def health_score_v8(is_wt,rules,wt_,asp,cog_pct,fea):
