@@ -990,6 +990,15 @@ ENGINEERING DEFAULTS (apply unless the prompt specifies otherwise):
   far better than a self-intersecting one. If fillets are truly required,
   fillet only the flat top/bottom profile edges individually via an
   explicit edge selector, never .edges() (all edges) on the whole loft.
+- When drilling a hole into the END FACE of a tapered/lofted body, ALWAYS
+  give .hole() an explicit depth — do not rely on its default, which cuts
+  through the ENTIRE current solid (the full length), not just the local
+  wall near that end. Confirmed live: a hole with default depth can tunnel
+  far enough along a tapering body that it exits through the narrowing side
+  walls partway along, producing a degenerate cut and non-watertight
+  geometry. Bound depth to roughly 1.5x the LOCAL wall thickness at that end
+  (e.g. .hole(diameter, depth=local_thickness*1.5)), never the unspecified
+  default, on any body whose cross-section isn't constant along that axis.
 - Words like "flange", "leg", "L-bracket", "bent bracket", "angle bracket", or "folded
   sheet metal" describe TWO FACES THAT ARE NOT COPLANAR — a real fold, not just two
   flat pieces at different in-plane orientations. For ANY part matching this
@@ -1781,10 +1790,18 @@ def make_tapered_beam(length, base_width, base_thick, tip_width, tip_thick,
         except Exception:
             pass  # unfilleted taper is a fine fallback; don't fail the whole part
 
+    # IMPORTANT: explicit, bounded depth here — .hole() with no depth cuts
+    # through the ENTIRE current solid (the full `length`), not just the
+    # local wall near this end. For a tapered body that means the cylinder
+    # tunnels far enough that it can exit through the narrowing side walls
+    # partway along, producing a degenerate partial-intersection cut and a
+    # non-watertight result. Confirmed live. Bounding depth to a small
+    # multiple of the LOCAL end thickness keeps the cut safely within the
+    # region where the cross-section hasn't meaningfully tapered yet.
     for hx, hy, hd in holes_base:
-        beam = beam.faces("<Z").workplane().pushPoints([(hx, hy)]).hole(hd)
+        beam = beam.faces("<Z").workplane().pushPoints([(hx, hy)]).hole(hd, depth=base_thick*1.5)
     for hx, hy, hd in holes_tip:
-        beam = beam.faces(">Z").workplane().pushPoints([(hx, hy)]).hole(hd)
+        beam = beam.faces(">Z").workplane().pushPoints([(hx, hy)]).hole(hd, depth=tip_thick*1.5)
 
     return beam
 
@@ -2440,15 +2457,17 @@ def rule_engine_v8(mesh,wt_,ctx,mat_key,holes,sharp,fea,part_desc=""):
                    "coordinates specifically, not the whole part."
                    ) if defect_locs else " (could not isolate the exact gap location.)"
         add("R03","HIGH","Mesh not watertight",
-        "Two common real causes, both confirmed live: (1) two solids "
+        "Three real causes, all confirmed live: (1) two solids "
         "union()-ed at an exact flush/coincident plane instead of a genuine "
         "overlap — check every union() join. (2) blanket .edges().fillet() "
         "on ALL edges of a loft/tapered solid, including the compound "
         "corners where a sloped taper edge meets two flat profile edges — "
-        "this can silently produce self-intersecting geometry with no "
-        "Python error. If the script filleted every edge of a loft at once, "
-        "try a smaller radius or fillet only the flat profile edges, not "
-        "the sloped taper edges." + loc_txt,
+        "silently produces self-intersecting geometry with no Python error. "
+        "(3) a .hole() cut into the end face of a tapered body with no "
+        "explicit depth — cuts through the ENTIRE length by default, which "
+        "can tunnel out through the narrowing side walls partway along. "
+        "Give end-face holes on a tapered body an explicit depth bounded to "
+        "the local wall thickness, not the default." + loc_txt,
         "STL standard", defect_locs[0] if defect_locs else None)
     if sfv<1.0: add("R04","CRITICAL",f"SF={sfv:.2f} < 1.0 — IMMINENT FAILURE","Redesign immediately","ASME")
     elif sfv<min_sf_: add("R04","HIGH",f"SF={sfv:.2f} < required {min_sf_:.1f}","Increase section","Design code")
