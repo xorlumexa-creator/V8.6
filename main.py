@@ -2011,6 +2011,23 @@ def multi_section_fea(mesh, mat_key, force_n=1000, force_dir="z", min_sf_=2.0):
     axis_span=bounds[1][ax]-bounds[0][ax]
     inset=min(axis_span*0.05, axis_span*0.4)  # never eat >40% of the span
     z_positions=np.linspace(bounds[0][ax]+inset,bounds[1][ax]-inset,12)
+    # FIX: a highly tapered/slender loft (confirmed live on a 200mm tapered beam,
+    # ~25:1 aspect ratio) can make mesh.section() return a near-zero-area sliver
+    # at one or more z positions — a slicing/parametrization artifact, not a real
+    # physical throat. The old defense (drop slices below 10% of the median of
+    # ALL positive slices, applied further down) doesn't catch this when MORE
+    # THAN ONE slice is degenerate, since a cluster of tiny values drags the
+    # median down with them and they end up passing their own filter. That tiny
+    # A_min then hits the max(A_min,0.01) floor clamp downstream — confirmed
+    # live: axial_mpa=40000.0 is an exact match for 400N/0.01mm^2, not real
+    # physics, on a perfectly legitimate, buildable tapered beam. Fix: reject
+    # any slice below an ABSOLUTE floor tied to the part's own bounding-box
+    # footprint (2% of it — real cross-sections of a machined/printed part don't
+    # legitimately shrink to a sliver of their own bounding box) before it can
+    # ever reach valid_a/valid_I/A_min at all.
+    other_axes=[i for i in range(3) if i!=ax]
+    bbox_cross_area=exts[other_axes[0]]*exts[other_axes[1]]
+    area_floor=max(bbox_cross_area*0.02, 1e-6)
     cut_areas=[];cut_I=[]
     for z in z_positions:
         origin=[0,0,0];origin[ax]=z
@@ -2020,8 +2037,23 @@ def multi_section_fea(mesh, mat_key, force_n=1000, force_dir="z", min_sf_=2.0):
             pl,_=sec.to_planar()
             pts=pl.vertices
             if len(pts)<3: cut_areas.append(0);cut_I.append(0);continue
+            # FIX: this used to be a hand-rolled shoelace sum over pl.vertices,
+            # which treats every point from every sub-loop as one single closed
+            # walk. A cross-section taken right at a fillet-to-taper blend
+            # (confirmed live: z=26.36mm on a 200mm tapered beam, exactly where
+            # make_tapered_beam's base fillet meets the straight loft) can come
+            # back from to_planar() as more than one loop, or with a winding
+            # order the naive sum doesn't handle — the sum then partially
+            # cancels between loops and returns a near-zero area for a section
+            # that isn't physically thin at all. That poisoned A_min, which then
+            # hit the max(A_min,0.01) floor clamp below and produced exactly
+            # axial_mpa=40000.0 (=400N/0.01mm^2) — a slicing artifact, not a
+            # real 25:1-taper failure. pl.area is trimesh's own shapely-backed
+            # polygon area, which correctly handles multiple loops/holes instead
+            # of assuming a single simple walk.
             x_,y_=pts[:,0],pts[:,1]
-            area=abs(np.sum(x_[:-1]*y_[1:]-x_[1:]*y_[:-1]))*0.5
+            area=abs(float(pl.area))
+            if area<=area_floor: cut_areas.append(0);cut_I.append(0);continue
             cx,cy=x_.mean(),y_.mean()
             I=np.sum((y_-cy)**2)*area/max(len(pts)-1,1)
             cut_areas.append(area);cut_I.append(I)
@@ -2072,9 +2104,18 @@ def multi_section_fea(mesh, mat_key, force_n=1000, force_dir="z", min_sf_=2.0):
     # cross-sectional area/inertia, so to go from the current safety factor to the
     # required one, the weak section needs about this much more area/thickness.
     strengthen_x=round(min_sf_/sfv,2) if sfv>0 else None
+    # Defensive backstop, independent of the area-calc fix above: no legitimately
+    # slender-but-real section should produce stress orders of magnitude past
+    # yield, or a deflection many times the part's own length, under this linear
+    # model. If it does, something upstream (mesh slicing, a future trimesh
+    # version, an even more extreme geometry) produced a numerical artifact, not
+    # a real structural finding — say so explicitly rather than reporting FAIL
+    # with fabricated-looking millions-of-MPa numbers as if they were physical.
+    numerically_suspect = bool(vm > 50*Sy or delta > 10*max(L,1))
     return {"method":"multi_section_v8",
             "note":"Analytical estimate — not benchmarked against NAFEMS or other "
                     "published test cases; do not treat this as a validated accuracy %.",
+            "numerically_suspect": numerically_suspect,
             "stress":{"axial_mpa":round(sa,3),"bending_mpa":round(sb,3),
                       "shear_mpa":round(tau,3),"von_mises_mpa":round(vm,3),
                       "stress_concentration_kt":round(Kt,3)},
@@ -4663,6 +4704,16 @@ def build_engineering_diagnosis(result, state=None):
     status = "PASS" if (fea_status == "PASS" and geo.get("is_watertight", True)
                          and not has_critical_rule) else "FAIL"
 
+    numerically_suspect = bool(fea.get("numerically_suspect"))
+    if numerically_suspect:
+        # The analytical solver itself is flagging its own stress/deflection numbers as
+        # implausible (a cross-section slicing artifact, not a real structural finding —
+        # see multi_section_fea's own comment). Lead with this so the agent doesn't spend
+        # an iteration "fixing" a problem that may not actually exist, and doesn't report
+        # a confident FAIL built on fabricated-looking numbers.
+        failure_modes = ["SOLVER OUTPUT NUMERICALLY SUSPECT — treat this iteration's stress/"
+                          "deflection numbers as unreliable, not a confirmed structural failure"] + failure_modes
+
     critical_region = None
     if crit.get("position_mm") is not None:
         axis = crit.get("axis", "z"); pos_mm = crit.get("position_mm")
@@ -4687,6 +4738,7 @@ def build_engineering_diagnosis(result, state=None):
         "fatigue_status": (result.get("fatigue_analysis", {}) or {}).get("status"),
         "is_watertight": geo.get("is_watertight"),
         "mass_g": (fea.get("dynamics", {}) or {}).get("estimated_mass_g"),
+        "numerically_suspect": numerically_suspect,
     }
 
 
@@ -5666,7 +5718,7 @@ Understand -> Inspect -> Diagnose -> Propose -> Modify -> Verify -> Simulate -> 
 
 1. UNDERSTAND: read the engineering request. Call set_initial_design with your best translation of it into concrete parameters for whichever primitive fits (tapered_beam or bent_bracket), or generic_script if neither fits. Before proposing a change on later iterations, silently answer for yourself: what is being built, its engineering purpose, its important geometric features, the loads/constraints on it, what is currently failing and where, what design variable could influence that failure, what change you will attempt, why it should help, and what must NOT change.
 2. INSPECT: after building or modifying geometry, call validate_geometry then run_mesh before trusting any other inspection tool — inspect_geometry/measure_geometry/find_holes/check_watertight/etc. all need a meshed design and will tell you so if you call them too early.
-3. DIAGNOSE: call run_fea (this also runs fatigue/rule-engine checks) and read diagnose_failure/find_problem_regions for WHERE and WHY it is failing. Trust these numbers completely — never override or second-guess a solver result.
+3. DIAGNOSE: call run_fea (this also runs fatigue/rule-engine checks) and read diagnose_failure/find_problem_regions for WHERE and WHY it is failing. Trust these numbers completely — never override or second-guess a solver result. Exception: if failure_modes leads with "SOLVER OUTPUT NUMERICALLY SUSPECT", the solver itself flagged that iteration's stress/deflection numbers as an implausible artifact (not a real structural finding) — don't treat it as a confirmed FAIL or try to "fix" it with a large parameter change; a small, unrelated tweak and re-running run_fea is enough to get past a one-off slicing artifact.
 4. PROPOSE + MODIFY: pick ONE targeted, physically-justified change at a time (modify_parameter and its shortcuts modify_thickness/length/width/height/fillet/taper, add_hole, or for anything the built-in primitives can't express, modify_feature/create_feature/remove_feature/add_rib/add_gusset/modify_chamfer). Every modify call requires a `reason` — the engineering justification — and should include a `predicted_effect` — what you expect to happen. Do not rewrite the whole design when one parameter needs changing. Do not fix one flagged issue by weakening something that was already fine elsewhere.
 5. VERIFY + SIMULATE: after every modification, validate_geometry -> run_mesh -> run_fea again. If a change is rejected (bad parameters, or the resulting geometry is non-manifold/non-watertight), you will be told so explicitly and the system automatically preserves the best known-valid design — just try a different, smaller, or better-justified change next.
 6. COMPARE + REFINE: call compare_designs to see whether your last change actually helped versus the previous iteration (or the best-so-far). Never assume a change worked — check.
@@ -5820,6 +5872,7 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
     tool_trace = []
     stopped_reason = None
     step = 0
+    no_tool_call_strikes = 0
 
     for step in range(1, max_steps + 1):
         rate_limit_wait_remaining = 90.0
@@ -5842,13 +5895,29 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
         messages.append(assistant["_raw_message"])
 
         if not assistant["tool_calls"]:
+            # Confirmed live: a reasoning model asked to call finalize_design will
+            # sometimes just explain itself in prose instead on the very first
+            # nudge. One miss used to end the whole loop outright, discarding
+            # whatever it actually said. Give it up to 2 misses, with an
+            # increasingly explicit nudge, and keep its prose as a fallback
+            # summary rather than throwing it away.
+            if assistant.get("content") and not state.final_summary:
+                state.final_summary = assistant["content"][:2000]
             if state.iteration_count > 0:
-                stopped_reason = "model_stopped_without_finalize"
-                break
+                no_tool_call_strikes += 1
+                if no_tool_call_strikes >= 2:
+                    stopped_reason = "model_stopped_without_finalize"
+                    break
+                messages.append({"role": "user", "content":
+                    "You responded without calling a tool. Call finalize_design now — pass 'verdict' "
+                    "(PASSED/BEST_EFFORT/FAILED) and 'summary' as arguments to that tool, don't just "
+                    "describe your assessment in text."})
+                continue
             messages.append({"role": "user", "content":
                 "Please proceed by calling a tool — start with set_initial_design. Do not describe what "
                 "you would do in prose; call the tool directly."})
             continue
+        no_tool_call_strikes = 0
 
         finalize_called = False
         for tc in assistant["tool_calls"]:
