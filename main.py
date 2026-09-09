@@ -4321,6 +4321,8 @@ async def analyze_assembly(
 # unaffected and still works on any configured provider as before.
 # ══════════════════════════════════════════════════════════════════════════
 
+import gc
+
 AGENT_TURN_MAX_TOKENS = 3000
 
 # ----------------------------------------------------------------------
@@ -4583,6 +4585,7 @@ def _revert_to_last_known_good(state):
         state.obj = obj
         state.mesh = None
         state.stl_bytes = None
+        gc.collect()  # drop the rejected candidate's OCCT shape promptly (see _rebuild_beam)
         return True
     except Exception:
         return False
@@ -4750,6 +4753,9 @@ def _rebuild_beam(state, new_params, change_desc, reason, predicted_effect=None)
                 "constraint": "kernel_geometric_feasibility"}
     old_params = state.params
     state.params = new_params; state.obj = obj; state.mesh = None; state.stl_bytes = None
+    gc.collect()  # OCCT-wrapped shapes are C++-backed; encourage prompt release of the
+                  # superseded object rather than waiting on Python's GC schedule — free-tier
+                  # 512MB instances have no headroom for stale shapes piling up across iterations
     state.pending_hypothesis = {"change": change_desc, "reason": reason,
                                  "predicted_effect": predicted_effect or "address the diagnosed issue"}
     return {"status": "OK", "change_applied": change_desc, "diff": _diff_params(old_params, new_params),
@@ -4768,6 +4774,7 @@ def _rebuild_bracket(state, new_params, change_desc, reason, predicted_effect=No
                 "constraint": "kernel_geometric_feasibility"}
     old_params = state.params
     state.params = new_params; state.obj = obj; state.mesh = None; state.stl_bytes = None
+    gc.collect()
     state.pending_hypothesis = {"change": change_desc, "reason": reason,
                                  "predicted_effect": predicted_effect or "address the diagnosed issue"}
     return {"status": "OK", "change_applied": change_desc, "diff": _diff_params(old_params, new_params),
@@ -5269,6 +5276,7 @@ async def _tool_run_mesh(state):
                 "reason": "Meshed geometry is non-manifold/non-watertight — rejected per monotonic refinement protection.",
                 "reverted": reverted, "current_params": state.params}
     state.mesh = mesh; state.stl_bytes = stl_bytes
+    gc.collect()
     if state.best_valid_design is None:
         # Nothing valid recorded yet at all — record a placeholder (score -1, always
         # superseded by any real post-FEA snapshot) purely so there's SOMETHING to
@@ -5850,6 +5858,10 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
             messages.append(_format_tool_result_message(tc["id"], tc["name"], result))
             if tc["name"] == "finalize_design":
                 finalize_called = True
+
+        gc.collect()  # end of this step's tool-call batch — a natural point to release
+                      # whatever the last modify/mesh/FEA cycle allocated before the next
+                      # (possibly slow) model round-trip, rather than let it sit and stack up
 
         if finalize_called:
             stopped_reason = "agent_finalized"
