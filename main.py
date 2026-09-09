@@ -5879,9 +5879,26 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
     stopped_reason = None
     step = 0
     no_tool_call_strikes = 0
+    rate_limit_wait_remaining = 75.0  # BUG FIX: this used to be reset to 90.0 inside the
+    # step loop below, meaning EVERY step got its own fresh 90s retry budget instead of
+    # the whole request sharing one. With up to max_steps (~40) steps, that's a
+    # theoretical 40*90s=3600s of possible retry waiting with no overall cap — confirmed
+    # live as a hang: max_iterations=3 timed out at the full 300s client --max-time with
+    # 0 bytes received (a genuine hang, not the earlier OOM-style connection abort).
+    # Scoped to the whole run now, so sustained rate-limiting fails fast with a clear
+    # "rate_limited" stopped_reason instead of silently retrying past any client timeout.
+    run_started = time.time()
+    MAX_WALL_CLOCK_SECONDS = 240.0  # comfortably under the --max-time 300 used in testing —
+    # the server should always be the one to give up first, with an honest partial result,
+    # rather than depend on the caller's timeout to be the only thing that ever stops this
 
     for step in range(1, max_steps + 1):
-        rate_limit_wait_remaining = 90.0
+        if time.time() - run_started > MAX_WALL_CLOCK_SECONDS:
+            stopped_reason = "wall_clock_budget_exceeded"
+            print(f"[engineering-agent] step {step}: stopping — {MAX_WALL_CLOCK_SECONDS}s wall-clock "
+                  f"budget exceeded ({time.time()-run_started:.1f}s elapsed)")
+            break
+        step_started = time.time()
         assistant = None
         while True:
             try:
@@ -5891,12 +5908,18 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
                 if e.status_code == 429 and rate_limit_wait_remaining > 0:
                     wait_s = min(_parse_groq_retry_after(str(e.detail)), rate_limit_wait_remaining)
                     rate_limit_wait_remaining -= wait_s
+                    print(f"[engineering-agent] step {step}: 429 rate-limited, waiting {wait_s:.1f}s "
+                          f"({rate_limit_wait_remaining:.1f}s of retry budget left for this request)")
                     await asyncio.sleep(wait_s)
                     continue
                 stopped_reason = "rate_limited" if e.status_code == 429 else f"model_call_failed: {e.detail}"
                 break
         if assistant is None:
+            print(f"[engineering-agent] step {step}: giving up — {stopped_reason} "
+                  f"(elapsed so far: {time.time()-run_started:.1f}s)")
             break
+        print(f"[engineering-agent] step {step}: model call took {time.time()-step_started:.1f}s, "
+              f"{len(assistant['tool_calls'])} tool call(s), total elapsed {time.time()-run_started:.1f}s")
 
         messages.append(assistant["_raw_message"])
 
@@ -5927,9 +5950,14 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
 
         finalize_called = False
         for tc in assistant["tool_calls"]:
+            tool_started = time.time()
             result = await _execute_agent_tool(state, tc["name"], tc["arguments"])
+            tool_elapsed = round(time.time() - tool_started, 2)
+            print(f"[engineering-agent] step {step}: tool={tc['name']} took {tool_elapsed}s "
+                  f"-> {result.get('status') if isinstance(result, dict) else '?'}")
             tool_trace.append({"step": step, "tool": tc["name"], "arguments": tc["arguments"],
-                                "result_status": result.get("status") if isinstance(result, dict) else None})
+                                "result_status": result.get("status") if isinstance(result, dict) else None,
+                                "elapsed_s": tool_elapsed})
             messages.append(_format_tool_result_message(tc["id"], tc["name"], result))
             if tc["name"] == "finalize_design":
                 finalize_called = True
