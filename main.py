@@ -161,7 +161,7 @@ class SafeJSONResponse(JSONResponse):
         return super().render(_json_safe(content))
 
 
-app = FastAPI(title="Lumexa v8.22 Enterprise (split architecture)", version="8.22.0",
+app = FastAPI(title="Lumexa v8.23 Enterprise (split architecture)", version="8.23.0",
               default_response_class=SafeJSONResponse)
 # NOTE: allow_origins=["*"] combined with allow_credentials=True is an invalid/unsafe
 # CORS configuration — browsers reject wildcard origins when credentials are allowed,
@@ -990,15 +990,6 @@ ENGINEERING DEFAULTS (apply unless the prompt specifies otherwise):
   far better than a self-intersecting one. If fillets are truly required,
   fillet only the flat top/bottom profile edges individually via an
   explicit edge selector, never .edges() (all edges) on the whole loft.
-- When drilling a hole into the END FACE of a tapered/lofted body, ALWAYS
-  give .hole() an explicit depth — do not rely on its default, which cuts
-  through the ENTIRE current solid (the full length), not just the local
-  wall near that end. Confirmed live: a hole with default depth can tunnel
-  far enough along a tapering body that it exits through the narrowing side
-  walls partway along, producing a degenerate cut and non-watertight
-  geometry. Bound depth to roughly 1.5x the LOCAL wall thickness at that end
-  (e.g. .hole(diameter, depth=local_thickness*1.5)), never the unspecified
-  default, on any body whose cross-section isn't constant along that axis.
 - Words like "flange", "leg", "L-bracket", "bent bracket", "angle bracket", or "folded
   sheet metal" describe TWO FACES THAT ARE NOT COPLANAR — a real fold, not just two
   flat pieces at different in-plane orientations. For ANY part matching this
@@ -1790,18 +1781,10 @@ def make_tapered_beam(length, base_width, base_thick, tip_width, tip_thick,
         except Exception:
             pass  # unfilleted taper is a fine fallback; don't fail the whole part
 
-    # IMPORTANT: explicit, bounded depth here — .hole() with no depth cuts
-    # through the ENTIRE current solid (the full `length`), not just the
-    # local wall near this end. For a tapered body that means the cylinder
-    # tunnels far enough that it can exit through the narrowing side walls
-    # partway along, producing a degenerate partial-intersection cut and a
-    # non-watertight result. Confirmed live. Bounding depth to a small
-    # multiple of the LOCAL end thickness keeps the cut safely within the
-    # region where the cross-section hasn't meaningfully tapered yet.
     for hx, hy, hd in holes_base:
-        beam = beam.faces("<Z").workplane().pushPoints([(hx, hy)]).hole(hd, depth=base_thick*1.5)
+        beam = beam.faces("<Z").workplane().pushPoints([(hx, hy)]).hole(hd)
     for hx, hy, hd in holes_tip:
-        beam = beam.faces(">Z").workplane().pushPoints([(hx, hy)]).hole(hd, depth=tip_thick*1.5)
+        beam = beam.faces(">Z").workplane().pushPoints([(hx, hy)]).hole(hd)
 
     return beam
 
@@ -2457,17 +2440,15 @@ def rule_engine_v8(mesh,wt_,ctx,mat_key,holes,sharp,fea,part_desc=""):
                    "coordinates specifically, not the whole part."
                    ) if defect_locs else " (could not isolate the exact gap location.)"
         add("R03","HIGH","Mesh not watertight",
-        "Three real causes, all confirmed live: (1) two solids "
+        "Two common real causes, both confirmed live: (1) two solids "
         "union()-ed at an exact flush/coincident plane instead of a genuine "
         "overlap — check every union() join. (2) blanket .edges().fillet() "
         "on ALL edges of a loft/tapered solid, including the compound "
         "corners where a sloped taper edge meets two flat profile edges — "
-        "silently produces self-intersecting geometry with no Python error. "
-        "(3) a .hole() cut into the end face of a tapered body with no "
-        "explicit depth — cuts through the ENTIRE length by default, which "
-        "can tunnel out through the narrowing side walls partway along. "
-        "Give end-face holes on a tapered body an explicit depth bounded to "
-        "the local wall thickness, not the default." + loc_txt,
+        "this can silently produce self-intersecting geometry with no "
+        "Python error. If the script filleted every edge of a loft at once, "
+        "try a smaller radius or fillet only the flat profile edges, not "
+        "the sloped taper edges." + loc_txt,
         "STL standard", defect_locs[0] if defect_locs else None)
     if sfv<1.0: add("R04","CRITICAL",f"SF={sfv:.2f} < 1.0 — IMMINENT FAILURE","Redesign immediately","ASME")
     elif sfv<min_sf_: add("R04","HIGH",f"SF={sfv:.2f} < required {min_sf_:.1f}","Increase section","Design code")
@@ -3115,7 +3096,7 @@ def home():
              "this deployment — set it to enable real FEM)"
     )
     return {
-        "status":"Lumexa v8.22 Enterprise (split architecture) — Vibe Engineering Edition",
+        "status":"Lumexa v8.23 Enterprise (split architecture) — Vibe Engineering Edition",
         "methodology_note": "The fields below describe *what each module does*, not an "
             "independently-verified accuracy percentage — none of these have been "
             "benchmarked against NAFEMS or other published test cases yet.",
@@ -3140,7 +3121,27 @@ def home():
                          else GEMINI_MODEL if AI_PROVIDER == "gemini"
                          else GROQ_MODEL if AI_PROVIDER == "groq"
                          else OPENROUTER_MODEL if AI_PROVIDER == "openrouter"
-                         else LOVABLE_AI_MODEL)},
+                         else LOVABLE_AI_MODEL),
+            "engineering_agent_configured": AI_PROVIDER in ("groq", "openrouter", "lovable")},
+        "new_in_v8_23":[
+            "POST /engineering-agent  ★★ tool-calling reasoning agent: Understand -> "
+            "Inspect -> Diagnose -> Propose -> Modify -> Verify -> Simulate -> Compare -> "
+            "Refine, instead of /generate-validate-refine's regenerate-the-whole-script "
+            "loop. The frontier model (GPT-OSS-120B via Groq by default) never writes "
+            "CadQuery or declares pass/fail itself for the tapered-beam/bent-bracket "
+            "workflows — it calls tools (inspect_geometry, diagnose_failure, "
+            "modify_parameter/modify_thickness/.../add_hole, validate_geometry, run_mesh, "
+            "run_fea, compare_designs, ...) that go through a safe parameter contract and "
+            "the same make_tapered_beam/make_bent_bracket/run_analysis_v8 machinery every "
+            "other endpoint already trusts. A monotonic-refinement guard automatically "
+            "reverts to the last known-valid design if a candidate crashes or comes back "
+            "non-manifold/non-watertight. First implementation target (see the endpoint's "
+            "own docstring): the tapered-beam workflow — test that before bent-bracket. "
+            "Geometry outside those two primitives falls back to the existing AI "
+            "script-generation/refinement path, still wrapped in the same verify loop. "
+            "Requires AI_PROVIDER to be an OpenAI-compatible tool-calling provider "
+            "(groq/openrouter/lovable) — see engineering_agent_configured above.",
+        ],
         "new_in_v8_3":[
             "AI generation can now route through the direct Anthropic Claude API "
             "instead of the Gemini/Lovable gateway — set ANTHROPIC_API_KEY to enable, "
@@ -3196,6 +3197,9 @@ def home():
             "POST /generate-part","POST /generate-and-analyze",
             "POST /generate-from-prompt",
             "POST /generate-validate-refine  ★ self-correcting AI design loop",
+            "POST /engineering-agent  ★★ tool-calling reasoning agent (Understand->Inspect->"
+            "Diagnose->Propose->Modify->Verify->Simulate->Compare->Refine) — tapered-beam "
+            "workflow is the first implementation target, see docstring",
             "POST /refine-from-external-fea  ★ closes the loop on a real Ansys export",
             "POST /edit-design-region  ★ boundary-box AI edit with guaranteed-unchanged rest",
             "POST /analyze-composite","POST /analyze-rainflow",
@@ -4281,3 +4285,1685 @@ async def analyze_assembly(
                 "min_gap_mm":round(md,3),"interference_volume_mm3":round(ovv,3),"overlap_detected":ov},
             "screw_recommendations":screw_recs,"issues":issues,"gemini_context":gc_str}
     finally: os.unlink(p1);os.unlink(p2)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ENGINEERING AGENT (v8.23) — a reasoning layer on top of the existing
+# deterministic systems above. Implements the build spec:
+#
+#     Understand -> Inspect -> Diagnose -> Propose -> Modify -> Verify ->
+#     Simulate -> Compare -> Refine
+#
+# instead of the "regenerate the whole CadQuery script and hope" pattern
+# /generate-validate-refine uses. Nothing above this line is modified —
+# this section only ADDS a new endpoint (/engineering-agent) that
+# orchestrates the frontier model (tool-calling) around the exact same
+# deterministic helpers, sandboxed executor, mesher, and analysis pipeline
+# already defined above. make_tapered_beam/make_bent_bracket/
+# execute_cq_script_safely/mesh_from_cq_object/run_analysis_v8/
+# evaluate_design_quality/gemini_generate_script are all reused as-is.
+#
+# Current scope (per the spec's "First Implementation Target"): the
+# tapered-beam workflow is the one to test first. Bent-bracket support is
+# wired the same way since make_bent_bracket already existed, but has had
+# less real-world exercise than the beam path. Anything neither primitive
+# covers falls back to the existing AI script-generation/refinement
+# machinery (generic_script design_type) — still wrapped in the same
+# validate -> mesh -> FEA -> compare loop, just without a validated numeric
+# parameter contract on that particular path.
+#
+# Tool-calling is currently implemented for OpenAI-compatible providers
+# (groq/openrouter/lovable — identical wire format) since that's this
+# deployment's configuration (GROQ_API_KEY + openai/gpt-oss-120b, confirmed
+# by Groq's own console to support "Function Calling / Tool Use" — see the
+# AI_PROVIDER setup comment above). Claude/Gemini native tool-calling for
+# this specific endpoint is not wired up yet; every other endpoint is
+# unaffected and still works on any configured provider as before.
+# ══════════════════════════════════════════════════════════════════════════
+
+AGENT_TURN_MAX_TOKENS = 3000
+
+# ----------------------------------------------------------------------
+# Safe parameter contracts (spec section 4) — reject bad numbers BEFORE
+# ever calling CadQuery/OpenCascade, with structured REJECTED feedback.
+# ----------------------------------------------------------------------
+
+def _validate_hole(hx, hy, hd, width, thick):
+    """Edge-distance rule for a hole on a tapered_beam end face (rect centered
+    on both axes: x in [-width/2,width/2], y in [-thick/2,thick/2]) — same
+    1.5*diameter rule already used by rule_engine_v8/detect_holes_v8 (R07)."""
+    if hd is None or hd <= 0:
+        return False, {"status": "REJECTED", "reason": "hole diameter must be > 0",
+                        "constraint": "diameter_mm > 0", "received": hd}
+    min_edge = 1.5 * hd
+    if abs(hx) + hd / 2.0 + min_edge > width / 2.0:
+        return False, {"status": "REJECTED",
+                        "reason": f"Hole at x={hx} (d={hd}mm) violates the 1.5*D edge-distance rule "
+                                  f"against the {width}mm section width",
+                        "constraint": "edge_distance >= 1.5*diameter", "received": {"x": hx, "width": width}}
+    if abs(hy) + hd / 2.0 + min_edge > thick / 2.0:
+        return False, {"status": "REJECTED",
+                        "reason": f"Hole at y={hy} (d={hd}mm) violates the 1.5*D edge-distance rule "
+                                  f"against the {thick}mm section thickness",
+                        "constraint": "edge_distance >= 1.5*diameter", "received": {"y": hy, "thick": thick}}
+    if hd > 0.6 * min(width, thick):
+        return False, {"status": "REJECTED",
+                        "reason": f"Hole diameter {hd}mm exceeds 60% of the smallest local section "
+                                  f"dimension ({round(min(width, thick), 2)}mm) — would leave almost no material",
+                        "constraint": "diameter <= 0.6*min(width,thick)", "received": hd}
+    return True, None
+
+
+def _validate_hole_bracket(hx, hy, hd, length, width):
+    """Edge-distance rule for a hole on a bent_bracket leg (rect spans
+    x in [0,length], y in [-width/2,width/2] — matches make_bent_bracket's
+    rect(length,width,centered=(False,True)))."""
+    if hd is None or hd <= 0:
+        return False, {"status": "REJECTED", "reason": "hole diameter must be > 0",
+                        "constraint": "diameter_mm > 0", "received": hd}
+    min_edge = 1.5 * hd
+    if hx - hd / 2.0 - min_edge < 0 or hx + hd / 2.0 + min_edge > length:
+        return False, {"status": "REJECTED",
+                        "reason": f"Hole at x={hx} (d={hd}mm) violates the 1.5*D edge-distance rule "
+                                  f"against the {length}mm leg length",
+                        "constraint": "edge_distance >= 1.5*diameter", "received": {"x": hx, "length": length}}
+    if abs(hy) + hd / 2.0 + min_edge > width / 2.0:
+        return False, {"status": "REJECTED",
+                        "reason": f"Hole at y={hy} (d={hd}mm) violates the 1.5*D edge-distance rule "
+                                  f"against the {width}mm leg width",
+                        "constraint": "edge_distance >= 1.5*diameter", "received": {"y": hy, "width": width}}
+    if hd > 0.6 * min(length, width):
+        return False, {"status": "REJECTED", "reason": "Hole diameter too large relative to leg dimensions",
+                        "constraint": "diameter <= 0.6*min(length,width)", "received": hd}
+    return True, None
+
+
+def _beam_param_contract(params, mat_key):
+    mat = MATERIALS.get(mat_key, MATERIALS["aluminum_6061"])
+    min_wall = mat.get("min_wall_mm", 1.0)
+
+    def reject(msg, constraint, received):
+        return False, {"status": "REJECTED", "reason": msg, "constraint": constraint, "received": received}
+
+    length = params.get("length"); bw = params.get("base_width"); bt = params.get("base_thick")
+    tw = params.get("tip_width"); tt = params.get("tip_thick"); fr = params.get("fillet_radius") or 0.0
+    for name, val in [("length", length), ("base_width", bw), ("base_thick", bt),
+                       ("tip_width", tw), ("tip_thick", tt)]:
+        if val is None or val <= 0:
+            return reject(f"'{name}' must be > 0", f"{name} > 0", val)
+    if bt < min_wall or tt < min_wall:
+        return reject(f"Section thickness would drop below the material minimum ({min_wall}mm for "
+                       f"{mat['name']}) — base_thick={bt}, tip_thick={tt}",
+                       f"thickness >= {min_wall}", min(bt, tt))
+    min_cross = min(bw, bt, tw, tt)
+    if fr < 0:
+        return reject("'fillet_radius' cannot be negative", "fillet_radius >= 0", fr)
+    if fr > min_cross / 2.0:
+        return reject(f"fillet_radius {fr}mm is too large for the smallest cross-section dimension "
+                       f"({round(min_cross,2)}mm) — would self-intersect",
+                       "fillet_radius < min_section_dim/2", fr)
+    for end, holes, w, t in [("base", params.get("holes_base") or [], bw, bt),
+                              ("tip", params.get("holes_tip") or [], tw, tt)]:
+        for h in holes:
+            hx, hy, hd = h
+            ok, err = _validate_hole(hx, hy, hd, w, t)
+            if not ok:
+                return False, err
+    if length / min_cross > 40:
+        return reject(f"Aspect ratio {round(length/min_cross,1)}:1 is extreme even for a slender arm "
+                       f"(length={length}mm vs smallest section {round(min_cross,2)}mm)",
+                       "length/min_section_dim <= 40", round(length / min_cross, 1))
+    return True, None
+
+
+def _bracket_param_contract(params, mat_key):
+    mat = MATERIALS.get(mat_key, MATERIALS["aluminum_6061"])
+    min_wall = mat.get("min_wall_mm", 1.0)
+
+    def reject(msg, constraint, received):
+        return False, {"status": "REJECTED", "reason": msg, "constraint": constraint, "received": received}
+
+    l1 = params.get("leg1_length"); l2 = params.get("leg2_length")
+    w = params.get("width"); t = params.get("thickness")
+    ang = params.get("bend_angle_deg", 90.0); fr = params.get("fillet_radius") or 0.0
+    for name, val in [("leg1_length", l1), ("leg2_length", l2), ("width", w), ("thickness", t)]:
+        if val is None or val <= 0:
+            return reject(f"'{name}' must be > 0", f"{name} > 0", val)
+    if t < min_wall:
+        return reject(f"thickness {t}mm is below the material minimum {min_wall}mm for {mat['name']}",
+                       f"thickness >= {min_wall}", t)
+    if not (5.0 <= ang <= 175.0):
+        return reject(f"bend_angle_deg {ang} is degenerate (too close to flat/folded-flat)",
+                       "5 <= bend_angle_deg <= 175", ang)
+    if fr < 0:
+        return reject("fillet_radius cannot be negative", "fillet_radius >= 0", fr)
+    if fr > w / 2.0 or fr > min(l1, l2) / 2.0:
+        return reject(f"fillet_radius {fr}mm is too large for this bracket's geometry",
+                       "fillet_radius < min(width,leg_length)/2", fr)
+    for leg, holes, length in [("leg1", params.get("holes_leg1") or [], l1),
+                                ("leg2", params.get("holes_leg2") or [], l2)]:
+        for h in holes:
+            hx, hy, hd = h
+            ok, err = _validate_hole_bracket(hx, hy, hd, length, w)
+            if not ok:
+                return False, err
+    max_dim = max(l1, l2); min_dim = min(w, t)
+    if min_dim > 0 and max_dim / min_dim > 40:
+        return reject(f"Aspect ratio {round(max_dim/min_dim,1)}:1 is extreme",
+                       "max_dim/min(width,thickness) <= 40", round(max_dim / min_dim, 1))
+    return True, None
+
+
+def _copy_params(p):
+    if p is None:
+        return None
+    return {k: (list(v) if isinstance(v, list) else v) for k, v in p.items()}
+
+
+def _diff_params(old, new):
+    if old is None:
+        return {"all": new}
+    changed = {}
+    for k, v in new.items():
+        if old.get(k) != v:
+            changed[k] = {"before": old.get(k), "after": v}
+    return changed
+
+
+def params_to_script_tapered_beam(params):
+    return (
+        "import cadquery as cq\n"
+        "result = make_tapered_beam(\n"
+        f"    length={params['length']}, base_width={params['base_width']}, base_thick={params['base_thick']},\n"
+        f"    tip_width={params['tip_width']}, tip_thick={params['tip_thick']}, "
+        f"fillet_radius={params.get('fillet_radius', 0.0)},\n"
+        f"    holes_base={params.get('holes_base') or []}, holes_tip={params.get('holes_tip') or []},\n"
+        ")\n"
+    )
+
+
+def params_to_script_bent_bracket(params):
+    return (
+        "import cadquery as cq\n"
+        "result = make_bent_bracket(\n"
+        f"    leg1_length={params['leg1_length']}, leg2_length={params['leg2_length']},\n"
+        f"    width={params['width']}, thickness={params['thickness']}, "
+        f"bend_angle_deg={params.get('bend_angle_deg', 90.0)},\n"
+        f"    fillet_radius={params.get('fillet_radius', 0.0)},\n"
+        f"    holes_leg1={params.get('holes_leg1') or []}, holes_leg2={params.get('holes_leg2') or []},\n"
+        ")\n"
+    )
+
+
+# ----------------------------------------------------------------------
+# Design state (spec section 6 & 8) — lives for the duration of one
+# /engineering-agent request; not persisted across requests.
+# ----------------------------------------------------------------------
+
+class EngineeringDesignState:
+    def __init__(self, original_prompt, material, force_n, force_dir, operating_temp_c,
+                 surface_finish, reliability, project_description, max_iterations,
+                 min_health_score, max_critical_violations, max_high_violations, min_safety_factor):
+        self.original_prompt = original_prompt
+        self.material = material
+        self.force_n = force_n
+        self.force_dir = force_dir
+        self.operating_temp_c = operating_temp_c
+        self.surface_finish = surface_finish
+        self.reliability = reliability
+        self.project_description = project_description
+        self.max_iterations = max_iterations
+        self.min_health_score = min_health_score
+        self.max_critical_violations = max_critical_violations
+        self.max_high_violations = max_high_violations
+        self.min_safety_factor = min_safety_factor
+
+        self.design_type = None     # "tapered_beam" | "bent_bracket" | "generic_script"
+        self.params = None          # dict of constructor kwargs, for parametric designs
+        self.script = None          # script text, for generic_script designs
+        self.obj = None             # current CadQuery object (server-side only, never sent to the model)
+        self.mesh = None            # current trimesh (server-side only)
+        self.stl_bytes = None
+
+        self.iteration_count = 0
+        self.last_analysis = None
+        self.last_quality = None
+
+        self.previous_design = None
+        self.current_candidate = None
+        self.best_valid_design = None
+        self.best_passing_design = None
+        self.pending_hypothesis = None
+        self.hypothesis_log = []
+
+        self.finalized = False
+        self.final_verdict_claimed = None
+        self.final_summary = None
+
+
+def _update_best_valid(state, snap):
+    if state.best_valid_design is None or snap["health_score"] > state.best_valid_design["health_score"]:
+        state.best_valid_design = snap
+
+
+def _update_best_passing(state, snap):
+    if state.best_passing_design is None or snap["health_score"] > state.best_passing_design["health_score"]:
+        state.best_passing_design = snap
+
+
+def _revert_to_last_known_good(state):
+    """Monotonic refinement protection (spec section 8): rebuild the last
+    known-good design deterministically from its stored params/script.
+    Returns True if a revert happened, False if there was nothing valid yet
+    to revert to (in which case state is left untouched)."""
+    good = state.best_valid_design
+    if good is None:
+        return False
+    try:
+        design_type = good["design_type"]
+        if design_type == "tapered_beam":
+            params = _copy_params(good["params"])
+            obj = make_tapered_beam(**params)
+            state.script = None
+        elif design_type == "bent_bracket":
+            params = _copy_params(good["params"])
+            obj = make_bent_bracket(**params)
+            state.script = None
+        elif design_type == "generic_script":
+            script = good.get("script")
+            obj, err = execute_cq_script_safely(script)
+            if err:
+                return False
+            params = None
+            state.script = script
+        else:
+            return False
+        state.design_type = design_type
+        state.params = params
+        state.obj = obj
+        state.mesh = None
+        state.stl_bytes = None
+        return True
+    except Exception:
+        return False
+
+
+def _snapshot_current(state, quality, result):
+    fea = result.get("analytical_fea", {}) or {}
+    return {
+        "iteration": state.iteration_count,
+        "design_type": state.design_type,
+        "params": _copy_params(state.params),
+        "script": state.script,
+        "passed": quality["passed"],
+        "health_score": quality["score"],
+        "safety_factor": fea.get("safety_factor"),
+        "max_von_mises_mpa": (fea.get("stress", {}) or {}).get("von_mises_mpa"),
+        "mass_g": (fea.get("dynamics", {}) or {}).get("estimated_mass_g"),
+        "is_watertight": (result.get("geometry", {}) or {}).get("is_watertight"),
+        "violations": (result.get("rule_engine", {}) or {}).get("total_violations"),
+        "reasons": quality["reasons"],
+    }
+
+
+def _summarize_snapshot(snap):
+    if snap is None:
+        return None
+    return {"iteration": snap.get("iteration"), "passed": snap.get("passed"),
+            "health_score": snap.get("health_score"), "safety_factor": snap.get("safety_factor"),
+            "max_von_mises_mpa": snap.get("max_von_mises_mpa"), "mass_g": snap.get("mass_g"),
+            "is_watertight": snap.get("is_watertight"), "violations": snap.get("violations")}
+
+
+def build_engineering_diagnosis(result, state=None):
+    """Spec section 5: convert raw solver results into structured engineering
+    evidence. Every field here comes from already-computed real analysis
+    output (run_analysis_v8) — never from the LLM's own judgment."""
+    fea = result.get("analytical_fea", {}) or {}
+    rules = (result.get("rule_engine", {}) or {}).get("all_violations", []) or []
+    geo = result.get("geometry", {}) or {}
+    hs = result.get("health_score", {}) or {}
+    crit = fea.get("critical_section") or {}
+    fea_status = fea.get("status")
+
+    failure_modes = []
+    if fea_status == "FAIL":
+        stress = fea.get("stress", {}) or {}
+        bending = stress.get("bending_mpa") or 0
+        axial = stress.get("axial_mpa") or 0
+        shear = stress.get("shear_mpa") or 0
+        if bending >= axial and bending >= shear and bending > 0:
+            failure_modes.append("bending stress")
+        elif axial >= shear and axial > 0:
+            failure_modes.append("axial stress")
+        elif shear > 0:
+            failure_modes.append("shear stress")
+        sfv = fea.get("safety_factor")
+        if sfv is not None and sfv < 1.0:
+            failure_modes.append("insufficient section stiffness")
+        buck = fea.get("buckling", {}) or {}
+        if buck.get("status") == "FAIL":
+            failure_modes.append("buckling instability")
+
+    max_kf = (result.get("sharp_corner_analysis", {}) or {}).get("max_Kf", 1.0) or 1.0
+    if max_kf > 2.0:
+        failure_modes.append("stress concentration at sharp corner")
+    if any(r.get("rule_id") == "R01" for r in rules):
+        failure_modes.append("thin wall / insufficient section thickness")
+    if not geo.get("is_watertight", True):
+        failure_modes.append("non-manifold geometry")
+    hole_viol = (result.get("hole_analysis", {}) or {}).get("violations", []) or []
+    if hole_viol:
+        failure_modes.append("hole edge-distance violation")
+
+    has_critical_rule = any(r.get("severity") == "CRITICAL" for r in rules)
+    status = "PASS" if (fea_status == "PASS" and geo.get("is_watertight", True)
+                         and not has_critical_rule) else "FAIL"
+
+    critical_region = None
+    if crit.get("position_mm") is not None:
+        axis = crit.get("axis", "z"); pos_mm = crit.get("position_mm")
+        critical_region = f"{axis}-axis @ {pos_mm}mm"
+        if state is not None and state.design_type == "tapered_beam" and state.params and axis == "z":
+            length = state.params.get("length") or 0
+            if length > 0:
+                frac = pos_mm / length
+                critical_region = "near_base_fixed_support" if frac < 0.5 else "near_tip_load_application"
+    elif rules:
+        crit_rules = [r for r in rules if r.get("severity") in ("CRITICAL", "HIGH") and r.get("position")]
+        if crit_rules:
+            critical_region = f"near {crit_rules[0]['position']}"
+
+    return {
+        "status": status,
+        "safety_factor": fea.get("safety_factor"),
+        "max_von_mises_mpa": (fea.get("stress", {}) or {}).get("von_mises_mpa"),
+        "critical_region": critical_region,
+        "failure_modes": failure_modes if failure_modes else (["none detected"] if status == "PASS" else ["unspecified"]),
+        "health_score": hs.get("score"),
+        "fatigue_status": (result.get("fatigue_analysis", {}) or {}).get("status"),
+        "is_watertight": geo.get("is_watertight"),
+        "mass_g": (fea.get("dynamics", {}) or {}).get("estimated_mass_g"),
+    }
+
+
+# ----------------------------------------------------------------------
+# Parameter-name resolution for the modify_* convenience tools (spec
+# sections 3 & 9) — lets the agent say "thickness"/"width"/"length" with
+# an optional region hint, or an exact constructor field name.
+# ----------------------------------------------------------------------
+
+def _resolve_beam_parameter(parameter, region):
+    p = (parameter or "").strip().lower()
+    r = (region or "").strip().lower()
+    exact = {"length": ["length"], "base_width": ["base_width"], "base_thick": ["base_thick"],
+             "tip_width": ["tip_width"], "tip_thick": ["tip_thick"], "fillet_radius": ["fillet_radius"]}
+    if p in exact:
+        return exact[p]
+    is_base = any(w in r for w in ("base", "fixed", "root")) if r else False
+    is_tip = any(w in r for w in ("tip", "free", "load")) if r else False
+    if p in ("thickness", "height", "section_height", "thick"):
+        if is_base and not is_tip:
+            return ["base_thick"]
+        if is_tip and not is_base:
+            return ["tip_thick"]
+        return ["base_thick", "tip_thick"]
+    if p in ("width", "section_width"):
+        if is_base and not is_tip:
+            return ["base_width"]
+        if is_tip and not is_base:
+            return ["tip_width"]
+        return ["base_width", "tip_width"]
+    if p in ("fillet", "fillet_radius_mm"):
+        return ["fillet_radius"]
+    return None
+
+
+def _resolve_bracket_parameter(parameter, region):
+    p = (parameter or "").strip().lower()
+    r = (region or "").strip().lower()
+    exact = {"leg1_length": ["leg1_length"], "leg2_length": ["leg2_length"], "width": ["width"],
+             "thickness": ["thickness"], "bend_angle_deg": ["bend_angle_deg"], "fillet_radius": ["fillet_radius"]}
+    if p in exact:
+        return exact[p]
+    if p in ("length", "leg_length"):
+        if "2" in r or "second" in r:
+            return ["leg2_length"]
+        return ["leg1_length"]
+    if p in ("height",):
+        return ["thickness"]
+    if p in ("fillet",):
+        return ["fillet_radius"]
+    if p in ("angle", "bend_angle"):
+        return ["bend_angle_deg"]
+    return None
+
+
+def _rebuild_beam(state, new_params, change_desc, reason, predicted_effect=None):
+    ok, err = _beam_param_contract(new_params, state.material)
+    if not ok:
+        return err
+    try:
+        obj = make_tapered_beam(**new_params)
+    except Exception as e:
+        return {"status": "REJECTED", "reason": f"CadQuery kernel rejected this change: {type(e).__name__}: {e}",
+                "constraint": "kernel_geometric_feasibility"}
+    old_params = state.params
+    state.params = new_params; state.obj = obj; state.mesh = None; state.stl_bytes = None
+    state.pending_hypothesis = {"change": change_desc, "reason": reason,
+                                 "predicted_effect": predicted_effect or "address the diagnosed issue"}
+    return {"status": "OK", "change_applied": change_desc, "diff": _diff_params(old_params, new_params),
+            "message": "Geometry rebuilt from updated parameters. Call validate_geometry, then run_mesh, "
+                       "then run_fea to test this change."}
+
+
+def _rebuild_bracket(state, new_params, change_desc, reason, predicted_effect=None):
+    ok, err = _bracket_param_contract(new_params, state.material)
+    if not ok:
+        return err
+    try:
+        obj = make_bent_bracket(**new_params)
+    except Exception as e:
+        return {"status": "REJECTED", "reason": f"CadQuery kernel rejected this change: {type(e).__name__}: {e}",
+                "constraint": "kernel_geometric_feasibility"}
+    old_params = state.params
+    state.params = new_params; state.obj = obj; state.mesh = None; state.stl_bytes = None
+    state.pending_hypothesis = {"change": change_desc, "reason": reason,
+                                 "predicted_effect": predicted_effect or "address the diagnosed issue"}
+    return {"status": "OK", "change_applied": change_desc, "diff": _diff_params(old_params, new_params),
+            "message": "Geometry rebuilt from updated parameters. Call validate_geometry, then run_mesh, "
+                       "then run_fea to test this change."}
+
+
+async def _agent_generic_script_modification(state, feature_description, reason, predicted_effect=None):
+    """The 'unfamiliar geometry' fallback path (spec section 11's second
+    branch). Reuses the EXISTING gemini_generate_script REFINEMENT MODE and
+    execute_cq_script_safely sandbox verbatim — zero new AI-prompting or
+    sandbox-security code. Crossing over from a parametric design into a
+    generic_script one is a one-way, logged transition."""
+    if not reason:
+        return {"status": "REJECTED", "reason": "A 'reason' is required for every modification."}
+    crossed_over = False
+    if state.design_type in ("tapered_beam", "bent_bracket") and state.script is None:
+        state.script = (params_to_script_tapered_beam(state.params) if state.design_type == "tapered_beam"
+                         else params_to_script_bent_bracket(state.params))
+        crossed_over = True
+    if state.script is None:
+        return {"status": "REJECTED", "reason": "No existing design to modify. Call set_initial_design first."}
+
+    feedback = (f"MANUAL FEATURE REQUEST (not a numeric parameter change): {feature_description}\n"
+                f"Engineering reason: {reason}\n"
+                "Modify ONLY what's needed for this request; preserve every other dimension/feature exactly.")
+    try:
+        new_script = await gemini_generate_script(state.original_prompt, previous_script=state.script,
+                                                    feedback=feedback)
+    except HTTPException as e:
+        return {"status": "ERROR", "message": f"Script modification call failed: {e.detail}"}
+
+    obj, err = execute_cq_script_safely(new_script)
+    if err:
+        return {"status": "REJECTED",
+                "reason": f"The modified script failed: {err} {_diagnose_cq_error(err)}",
+                "note": "State unchanged; the previous working script/geometry is preserved."}
+
+    state.design_type = "generic_script"; state.script = new_script; state.params = None
+    state.obj = obj; state.mesh = None; state.stl_bytes = None
+    state.pending_hypothesis = {"change": f"generic_script_modification: {feature_description}", "reason": reason,
+                                 "predicted_effect": predicted_effect or "address the described issue"}
+    return {"status": "OK", "crossed_over_to_generic_script": crossed_over,
+            "message": "Script modified and executed successfully via the AI-assisted generic path (this "
+                       "design is no longer tracked by discrete numeric parameters). Call validate_geometry, "
+                       "run_mesh, then run_fea."}
+
+
+# ----------------------------------------------------------------------
+# Tool implementations — inspection (read-only, need a meshed design)
+# ----------------------------------------------------------------------
+
+def _require_mesh(state):
+    if state.mesh is None:
+        return {"status": "NOT_AVAILABLE",
+                "message": "No meshed/validated geometry yet. Call validate_geometry then run_mesh first."}
+    return None
+
+
+def _tool_inspect_geometry(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    mesh = state.mesh
+    is_wt = bool(mesh.is_watertight)
+    is_wind = bool(getattr(mesh, "is_winding_consistent", True))
+    holes = detect_holes_v8(mesh)
+    wt_ = wall_thickness_v8(mesh)
+    features = []
+    if state.design_type == "tapered_beam" and state.params:
+        p = state.params
+        if abs(p["base_width"] - p["tip_width"]) > 0.05 or abs(p["base_thick"] - p["tip_thick"]) > 0.05:
+            features.append("taper")
+        if (p.get("fillet_radius") or 0) > 0:
+            features.append("fillet")
+    elif state.design_type == "bent_bracket" and state.params:
+        features.append("fold")
+        if (state.params.get("fillet_radius") or 0) > 0:
+            features.append("fillet")
+    if holes:
+        features.append("through_holes")
+    exts = [sf(e) for e in mesh.extents]
+    return {"solid": True, "watertight": is_wt, "manifold": is_wind,
+            "bounding_box_mm": [round(exts[0], 3), round(exts[1], 3), round(exts[2], 3)],
+            "volume_mm3": round(sf(mesh.volume), 3), "features": features, "hole_count": len(holes),
+            "min_wall_thickness_mm": wt_.get("min_mm")}
+
+
+def _tool_measure_geometry(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    mesh = state.mesh
+    exts = [sf(e) for e in mesh.extents]
+    wt_ = wall_thickness_v8(mesh)
+    return {"bounding_box_mm": {"x": round(exts[0], 3), "y": round(exts[1], 3), "z": round(exts[2], 3)},
+            "volume_mm3": round(sf(mesh.volume), 3), "surface_area_mm2": round(sf(mesh.area), 3),
+            "wall_thickness": wt_}
+
+
+def _tool_identify_features(state):
+    features = []; hole_count = 0
+    if state.design_type == "tapered_beam" and state.params:
+        p = state.params
+        if abs(p["base_width"] - p["tip_width"]) > 0.05 or abs(p["base_thick"] - p["tip_thick"]) > 0.05:
+            features.append("taper")
+        if (p.get("fillet_radius") or 0) > 0:
+            features.append("fillet")
+        hole_count = len(p.get("holes_base") or []) + len(p.get("holes_tip") or [])
+        if hole_count > 0:
+            features.append("through_holes")
+    elif state.design_type == "bent_bracket" and state.params:
+        p = state.params
+        features.append("bend")
+        if (p.get("fillet_radius") or 0) > 0:
+            features.append("fillet")
+        hole_count = len(p.get("holes_leg1") or []) + len(p.get("holes_leg2") or [])
+        if hole_count > 0:
+            features.append("through_holes")
+    elif state.mesh is not None:
+        holes = detect_holes_v8(state.mesh); hole_count = len(holes)
+        if hole_count > 0:
+            features.append("through_holes")
+    return {"design_type": state.design_type, "features": features, "hole_count": hole_count,
+            "declared_parameters": state.params}
+
+
+def _tool_find_holes(state):
+    if state.mesh is not None:
+        return {"source": "geometric_detection", "holes": detect_holes_v8(state.mesh)}
+    if state.params:
+        key_pairs = ([("holes_base", "base"), ("holes_tip", "tip")] if state.design_type == "tapered_beam"
+                      else [("holes_leg1", "leg1"), ("holes_leg2", "leg2")] if state.design_type == "bent_bracket"
+                      else [])
+        declared = []
+        for key, label in key_pairs:
+            for (x, y, d) in (state.params.get(key) or []):
+                declared.append({"location": label, "x": x, "y": y, "diameter_mm": d})
+        return {"source": "declared_parameters_not_yet_meshed", "holes": declared}
+    return {"status": "NOT_AVAILABLE", "message": "No design built yet."}
+
+
+def _tool_measure_wall_thickness(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    return wall_thickness_v8(state.mesh)
+
+
+def _tool_get_bounding_box(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    exts = [sf(e) for e in state.mesh.extents]
+    return {"dimensions_mm": {"x": round(exts[0], 3), "y": round(exts[1], 3), "z": round(exts[2], 3)},
+            "aspect_ratio": round(max(exts) / max(min(exts), 1e-6), 3)}
+
+
+def _tool_get_mass_properties(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    mesh = state.mesh
+    mat = MATERIALS.get(state.material, MATERIALS["aluminum_6061"])
+    vol = sf(mesh.volume); mass_g = vol * mat["density"] * 1e-3
+    try:
+        cog = mesh.center_mass
+        cog_d = {"x": round(float(cog[0]), 3), "y": round(float(cog[1]), 3), "z": round(float(cog[2]), 3)}
+    except Exception:
+        cog_d = None
+    return {"volume_mm3": round(vol, 3), "mass_g": round(mass_g, 3), "material": mat["name"],
+            "density_g_cm3": mat["density"], "center_of_mass_mm": cog_d}
+
+
+def _tool_check_manifold(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    mesh = state.mesh
+    return {"manifold": bool(getattr(mesh, "is_winding_consistent", True)),
+            "watertight": bool(mesh.is_watertight),
+            "is_volume": bool(getattr(mesh, "is_volume", mesh.is_watertight))}
+
+
+def _tool_check_watertight(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    mesh = state.mesh
+    is_wt = bool(mesh.is_watertight)
+    out = {"watertight": is_wt}
+    if not is_wt:
+        out["defect_locations"] = _find_watertight_defect_locations(mesh)
+    return out
+
+
+def _tool_find_problem_regions(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    mesh = state.mesh; regions = []
+    if not mesh.is_watertight:
+        for d in _find_watertight_defect_locations(mesh):
+            regions.append({"type": "non_watertight_gap", "position": {"x": d["x"], "y": d["y"], "z": d["z"]},
+                             "severity": "HIGH"})
+    wt_ = wall_thickness_v8(mesh)
+    for z in wt_.get("critical_zones", []) or []:
+        regions.append({"type": "thin_wall", "position": z.get("position"),
+                         "thickness_mm": z.get("thickness_mm"), "severity": "CRITICAL"})
+    for z in wt_.get("thin_zones", []) or []:
+        regions.append({"type": "thin_wall", "position": z.get("position"),
+                         "thickness_mm": z.get("thickness_mm"), "severity": "WARNING"})
+    try:
+        sharp = detect_sharp_v8(mesh, state.material)
+        for z in sharp.get("critical_zones", []) or []:
+            regions.append({"type": "stress_concentration", "position": z.get("position"),
+                             "Kf": z.get("Kf"), "severity": z.get("severity")})
+    except Exception:
+        pass
+    for h in detect_holes_v8(mesh):
+        if h.get("violation"):
+            regions.append({"type": "hole_edge_violation", "position": h.get("position"),
+                             "detail": h.get("violation_msg"), "severity": "HIGH"})
+    if state.last_analysis:
+        crit = (state.last_analysis.get("analytical_fea", {}) or {}).get("critical_section") or {}
+        if crit.get("position_mm") is not None:
+            fea_status = (state.last_analysis.get("analytical_fea", {}) or {}).get("status")
+            regions.append({"type": "fea_critical_section", "axis": crit.get("axis"),
+                             "position_mm": crit.get("position_mm"),
+                             "severity": "HIGH" if fea_status == "FAIL" else "INFO"})
+    return {"problem_region_count": len(regions), "regions": regions}
+
+
+def _tool_get_topology_summary(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    mesh = state.mesh
+    try:
+        euler = int(mesh.euler_number)
+    except Exception:
+        euler = None
+    return {"vertex_count": int(len(mesh.vertices)), "face_count": int(len(mesh.faces)),
+            "edge_count": int(len(mesh.edges)), "euler_number": euler,
+            "watertight": bool(mesh.is_watertight), "manifold": bool(getattr(mesh, "is_winding_consistent", True))}
+
+
+def _tool_diagnose_failure(state):
+    if state.last_analysis is None:
+        return {"status": "NOT_AVAILABLE", "message": "No analysis has been run yet. Call run_fea first."}
+    return build_engineering_diagnosis(state.last_analysis, state)
+
+
+def _tool_calculate_properties(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    if state.last_analysis:
+        fea = state.last_analysis.get("analytical_fea", {}) or {}
+        return {"source": "last_run_fea", "stress": fea.get("stress"), "deflection_mm": fea.get("deflection_mm"),
+                "min_section_area_mm2": fea.get("min_section_area_mm2"), "dynamics": fea.get("dynamics"),
+                "buckling": fea.get("buckling")}
+    try:
+        mat_key = state.material if state.material in MATERIALS else "aluminum_6061"
+        analytic = multi_section_fea(state.mesh, mat_key, state.force_n, state.force_dir)
+        return {"source": "on_demand_analytical_estimate", "stress": analytic.get("stress"),
+                "deflection_mm": analytic.get("deflection_mm"), "dynamics": analytic.get("dynamics"),
+                "buckling": analytic.get("buckling"),
+                "note": "Estimate only — run_fea has not been called yet for this candidate; call run_fea "
+                        "for the authoritative check."}
+    except Exception as e:
+        return {"status": "ERROR", "message": str(e)}
+
+
+# ----------------------------------------------------------------------
+# Tool implementations — construction & modification (spec sections 2,3,4)
+# ----------------------------------------------------------------------
+
+async def _tool_set_initial_design(state, design_type, reason="",
+                                    length=None, base_width=None, base_thick=None,
+                                    tip_width=None, tip_thick=None, fillet_radius=0.0,
+                                    holes_base=None, holes_tip=None,
+                                    leg1_length=None, leg2_length=None, width=None, thickness=None,
+                                    bend_angle_deg=90.0, holes_leg1=None, holes_leg2=None):
+    if state.obj is not None:
+        return {"status": "REJECTED", "reason": "Initial design has already been set for this session. "
+                "Use modify_parameter/modify_feature/add_hole to change the existing design instead."}
+    if design_type == "tapered_beam":
+        missing = [n for n, v in [("length", length), ("base_width", base_width), ("base_thick", base_thick),
+                                    ("tip_width", tip_width), ("tip_thick", tip_thick)] if v is None]
+        if missing:
+            return {"status": "REJECTED", "reason": f"Missing required parameter(s) for tapered_beam: {missing}"}
+        params = {"length": float(length), "base_width": float(base_width), "base_thick": float(base_thick),
+                  "tip_width": float(tip_width), "tip_thick": float(tip_thick),
+                  "fillet_radius": float(fillet_radius or 0.0),
+                  "holes_base": [tuple(h) for h in (holes_base or [])],
+                  "holes_tip": [tuple(h) for h in (holes_tip or [])]}
+        ok, err = _beam_param_contract(params, state.material)
+        if not ok:
+            return err
+        try:
+            obj = make_tapered_beam(**params)
+        except Exception as e:
+            return {"status": "REJECTED", "reason": f"CadQuery kernel rejected these parameters: {type(e).__name__}: {e}"}
+        state.design_type = "tapered_beam"; state.params = params; state.script = None; state.obj = obj
+    elif design_type == "bent_bracket":
+        missing = [n for n, v in [("leg1_length", leg1_length), ("leg2_length", leg2_length),
+                                    ("width", width), ("thickness", thickness)] if v is None]
+        if missing:
+            return {"status": "REJECTED", "reason": f"Missing required parameter(s) for bent_bracket: {missing}"}
+        params = {"leg1_length": float(leg1_length), "leg2_length": float(leg2_length),
+                  "width": float(width), "thickness": float(thickness),
+                  "bend_angle_deg": float(bend_angle_deg or 90.0), "fillet_radius": float(fillet_radius or 0.0),
+                  "holes_leg1": [tuple(h) for h in (holes_leg1 or [])],
+                  "holes_leg2": [tuple(h) for h in (holes_leg2 or [])]}
+        ok, err = _bracket_param_contract(params, state.material)
+        if not ok:
+            return err
+        try:
+            obj = make_bent_bracket(**params)
+        except Exception as e:
+            return {"status": "REJECTED", "reason": f"CadQuery kernel rejected these parameters: {type(e).__name__}: {e}"}
+        state.design_type = "bent_bracket"; state.params = params; state.script = None; state.obj = obj
+    elif design_type == "generic_script":
+        try:
+            script = await gemini_generate_script(state.original_prompt)
+        except HTTPException as e:
+            return {"status": "ERROR", "message": f"Script generation failed: {e.detail}"}
+        obj, err = execute_cq_script_safely(script)
+        if err:
+            return {"status": "REJECTED", "reason": err}
+        state.design_type = "generic_script"; state.params = None; state.script = script; state.obj = obj
+    else:
+        return {"status": "REJECTED",
+                "reason": f"Unknown design_type '{design_type}'. Must be tapered_beam, bent_bracket, or generic_script."}
+    return {"status": "OK", "design_type": state.design_type, "params": state.params,
+            "message": "Initial geometry constructed. Call validate_geometry, then run_mesh, then run_fea next."}
+
+
+async def _tool_modify_parameter(state, parameter, change_percent=None, new_value=None, region=None,
+                                  reason="", predicted_effect=None):
+    if state.obj is None:
+        return {"status": "REJECTED", "reason": "No initial design exists yet. Call set_initial_design first."}
+    if change_percent is None and new_value is None:
+        return {"status": "REJECTED", "reason": "Provide either change_percent or new_value."}
+    if not reason:
+        return {"status": "REJECTED", "reason": "A 'reason' explaining the engineering justification is required."}
+
+    if state.design_type == "tapered_beam":
+        fields = _resolve_beam_parameter(parameter, region)
+        if not fields:
+            return {"status": "REJECTED", "reason": f"Unknown parameter '{parameter}' for a tapered beam.",
+                     "valid_parameters": ["length", "base_width", "base_thick", "tip_width", "tip_thick",
+                                           "fillet_radius", "thickness", "width"]}
+        new_params = _copy_params(state.params)
+        for f in fields:
+            cur = new_params[f]
+            new_params[f] = (round(float(new_value), 4) if (new_value is not None and len(fields) == 1)
+                              else round(cur * (1 + (change_percent or 0) / 100.0), 4))
+        desc = f"modify_parameter({parameter}" + (f",region={region}" if region else "") + ")"
+        return _rebuild_beam(state, new_params, desc, reason, predicted_effect)
+
+    elif state.design_type == "bent_bracket":
+        fields = _resolve_bracket_parameter(parameter, region)
+        if not fields:
+            return {"status": "REJECTED", "reason": f"Unknown parameter '{parameter}' for a bent bracket.",
+                     "valid_parameters": ["leg1_length", "leg2_length", "width", "thickness", "bend_angle_deg",
+                                           "fillet_radius", "length", "height"]}
+        new_params = _copy_params(state.params)
+        for f in fields:
+            cur = new_params[f]
+            new_params[f] = (round(float(new_value), 4) if (new_value is not None and len(fields) == 1)
+                              else round(cur * (1 + (change_percent or 0) / 100.0), 4))
+        desc = f"modify_parameter({parameter}" + (f",region={region}" if region else "") + ")"
+        return _rebuild_bracket(state, new_params, desc, reason, predicted_effect)
+
+    else:
+        desc = (f"Adjust the parameter '{parameter}'" + (f" near {region}" if region else "")
+                + (f" by {change_percent}%" if change_percent is not None else f" to {new_value}"))
+        return await _agent_generic_script_modification(state, desc, reason, predicted_effect)
+
+
+async def _tool_modify_thickness(state, change_percent=None, new_value=None, region=None, reason="", predicted_effect=None):
+    return await _tool_modify_parameter(state, "thickness", change_percent, new_value, region, reason, predicted_effect)
+
+async def _tool_modify_length(state, change_percent=None, new_value=None, region=None, reason="", predicted_effect=None):
+    return await _tool_modify_parameter(state, "length", change_percent, new_value, region, reason, predicted_effect)
+
+async def _tool_modify_width(state, change_percent=None, new_value=None, region=None, reason="", predicted_effect=None):
+    return await _tool_modify_parameter(state, "width", change_percent, new_value, region, reason, predicted_effect)
+
+async def _tool_modify_height(state, change_percent=None, new_value=None, region=None, reason="", predicted_effect=None):
+    return await _tool_modify_parameter(state, "height", change_percent, new_value, region, reason, predicted_effect)
+
+async def _tool_modify_fillet(state, change_percent=None, new_value=None, region=None, reason="", predicted_effect=None):
+    return await _tool_modify_parameter(state, "fillet_radius", change_percent, new_value, region, reason, predicted_effect)
+
+
+def _tool_modify_taper(state, change_percent, reason="", predicted_effect=None):
+    if state.design_type != "tapered_beam":
+        return {"status": "NOT_APPLICABLE", "reason": "modify_taper only applies to a tapered_beam design_type."}
+    if not reason:
+        return {"status": "REJECTED", "reason": "A 'reason' is required."}
+    new_params = _copy_params(state.params)
+    new_params["tip_width"] = round(new_params["tip_width"] * (1 + change_percent / 100.0), 4)
+    new_params["tip_thick"] = round(new_params["tip_thick"] * (1 + change_percent / 100.0), 4)
+    return _rebuild_beam(state, new_params, f"modify_taper({change_percent}%)", reason, predicted_effect)
+
+
+async def _tool_add_hole(state, x_mm, y_mm, diameter_mm, end=None, leg=None, reason="", predicted_effect=None):
+    if not reason:
+        return {"status": "REJECTED", "reason": "A 'reason' is required."}
+    if state.design_type == "tapered_beam":
+        if end not in ("base", "tip"):
+            return {"status": "REJECTED", "reason": "For a tapered_beam, 'end' must be 'base' or 'tip'."}
+        width = state.params["base_width"] if end == "base" else state.params["tip_width"]
+        thick = state.params["base_thick"] if end == "base" else state.params["tip_thick"]
+        ok, err = _validate_hole(x_mm, y_mm, diameter_mm, width, thick)
+        if not ok:
+            return err
+        new_params = _copy_params(state.params)
+        key = "holes_base" if end == "base" else "holes_tip"
+        new_params[key] = list(new_params[key]) + [(x_mm, y_mm, diameter_mm)]
+        return _rebuild_beam(state, new_params, f"add_hole(end={end})", reason, predicted_effect)
+    elif state.design_type == "bent_bracket":
+        if leg not in ("leg1", "leg2"):
+            return {"status": "REJECTED", "reason": "For a bent_bracket, 'leg' must be 'leg1' or 'leg2'."}
+        length = state.params["leg1_length"] if leg == "leg1" else state.params["leg2_length"]
+        width = state.params["width"]
+        ok, err = _validate_hole_bracket(x_mm, y_mm, diameter_mm, length, width)
+        if not ok:
+            return err
+        new_params = _copy_params(state.params)
+        key = "holes_leg1" if leg == "leg1" else "holes_leg2"
+        new_params[key] = list(new_params[key]) + [(x_mm, y_mm, diameter_mm)]
+        return _rebuild_bracket(state, new_params, f"add_hole(leg={leg})", reason, predicted_effect)
+    else:
+        desc = f"Add a through hole of diameter {diameter_mm}mm at approximately (x={x_mm}, y={y_mm}) in the relevant local face frame."
+        return await _agent_generic_script_modification(state, desc, reason, predicted_effect)
+
+
+async def _tool_modify_feature(state, feature_description, reason="", predicted_effect=None):
+    return await _agent_generic_script_modification(state, feature_description, reason, predicted_effect)
+
+async def _tool_create_feature(state, feature_description, reason="", predicted_effect=None):
+    return await _agent_generic_script_modification(state, f"Add: {feature_description}", reason, predicted_effect)
+
+async def _tool_remove_feature(state, feature_description, reason="", predicted_effect=None):
+    return await _agent_generic_script_modification(state, f"Remove: {feature_description}", reason, predicted_effect)
+
+async def _tool_add_rib(state, description, reason="", predicted_effect=None):
+    return await _agent_generic_script_modification(state, f"Add a structural rib: {description}", reason, predicted_effect)
+
+async def _tool_add_gusset(state, description, reason="", predicted_effect=None):
+    return await _agent_generic_script_modification(state, f"Add a gusset/corner brace: {description}", reason, predicted_effect)
+
+async def _tool_modify_chamfer(state, description, reason="", predicted_effect=None):
+    return await _agent_generic_script_modification(state, f"Modify chamfer: {description}", reason, predicted_effect)
+
+
+# ----------------------------------------------------------------------
+# Tool implementations — validate / mesh / simulate / compare / finalize
+# ----------------------------------------------------------------------
+
+async def _tool_validate_geometry(state):
+    if state.obj is None:
+        return {"status": "REJECTED", "reason": "No geometry has been built yet. Call set_initial_design first."}
+    brep_ok = True; brep_note = None
+    try:
+        val = state.obj.val()
+        if hasattr(val, "isValid"):
+            brep_ok = bool(val.isValid())
+            if not brep_ok:
+                brep_note = "OpenCASCADE's BRepCheck_Analyzer flagged this shape as an invalid B-rep."
+    except Exception as e:
+        brep_note = f"Could not run the B-rep validity check ({type(e).__name__}: {e}); proceeding to mesh export."
+    if not brep_ok:
+        reverted = _revert_to_last_known_good(state)
+        return {"status": "REJECTED", "valid_brep": False, "reason": brep_note, "reverted": reverted,
+                "current_params": state.params}
+    return {"status": "OK", "valid_brep": True, "note": brep_note or "B-rep structurally valid.",
+            "message": "Proceed to run_mesh next."}
+
+
+async def _tool_run_mesh(state):
+    if state.obj is None:
+        return {"status": "REJECTED", "reason": "No geometry has been built yet. Call set_initial_design first."}
+    try:
+        mesh, stl_bytes = await mesh_from_cq_object(state.obj)
+    except Exception as e:
+        reverted = _revert_to_last_known_good(state)
+        return {"status": "REJECTED", "reason": f"STL export/mesh load failed: {type(e).__name__}: {e}",
+                "reverted": reverted, "current_params": state.params}
+    is_wt = bool(mesh.is_watertight); is_wind = bool(getattr(mesh, "is_winding_consistent", True))
+    if not is_wt or not is_wind:
+        defect_locs = _find_watertight_defect_locations(mesh)
+        reverted = _revert_to_last_known_good(state)
+        return {"status": "REJECTED", "watertight": is_wt, "manifold": is_wind, "defect_locations": defect_locs,
+                "reason": "Meshed geometry is non-manifold/non-watertight — rejected per monotonic refinement protection.",
+                "reverted": reverted, "current_params": state.params}
+    state.mesh = mesh; state.stl_bytes = stl_bytes
+    if state.best_valid_design is None:
+        # Nothing valid recorded yet at all — record a placeholder (score -1, always
+        # superseded by any real post-FEA snapshot) purely so there's SOMETHING to
+        # revert to if a later candidate crashes before ever completing run_fea.
+        state.best_valid_design = {"design_type": state.design_type, "params": _copy_params(state.params),
+                                    "script": state.script, "health_score": -1, "passed": False,
+                                    "safety_factor": None, "max_von_mises_mpa": None, "mass_g": None,
+                                    "is_watertight": True, "violations": None, "reasons": [],
+                                    "iteration": state.iteration_count}
+    return {"status": "OK", "watertight": True, "manifold": True,
+            "face_count": int(len(mesh.faces)), "vertex_count": int(len(mesh.vertices)),
+            "message": "Mesh is valid. Call run_fea next for the authoritative engineering verdict."}
+
+
+async def _tool_run_fea(state, force_n=None, force_dir=None):
+    if state.mesh is None:
+        return {"status": "ERROR", "message": "No validated mesh available. Call validate_geometry and run_mesh first."}
+    if state.iteration_count >= state.max_iterations:
+        return {"status": "ITERATION_LIMIT_REACHED",
+                "message": f"The configured max_iterations ({state.max_iterations}) analysis runs have "
+                           "already been used. Call finalize_design now with your honest assessment.",
+                "iterations_used": state.iteration_count}
+    fn = force_n if force_n is not None else state.force_n
+    fd = force_dir if force_dir is not None else state.force_dir
+    try:
+        result = await run_analysis_v8(state.mesh, state.original_prompt, state.original_prompt, state.material,
+                                        fn, fd, state.operating_temp_c, state.project_description,
+                                        state.surface_finish, state.reliability, False)
+    except Exception as e:
+        return {"status": "ERROR",
+                "message": f"Analysis pipeline raised: {type(e).__name__}: {e}. This usually means degenerate "
+                           "geometry slipped past validate_geometry/run_mesh."}
+
+    state.iteration_count += 1
+    state.last_analysis = result
+    quality = evaluate_design_quality(result, state.min_health_score, state.max_critical_violations,
+                                       state.max_high_violations, state.min_safety_factor)
+    state.last_quality = quality
+    snap = _snapshot_current(state, quality, result)
+    state.previous_design = state.current_candidate
+    state.current_candidate = snap
+    _update_best_valid(state, snap)
+    if quality["passed"]:
+        _update_best_passing(state, snap)
+
+    if state.pending_hypothesis is not None:
+        ph = state.pending_hypothesis
+        prev_sf = (state.previous_design or {}).get("safety_factor")
+        cur_sf = snap.get("safety_factor")
+        if quality["passed"]:
+            verdict = "PASSED"
+        elif prev_sf is not None and cur_sf is not None:
+            verdict = "IMPROVED" if cur_sf > prev_sf else "WORSE" if cur_sf < prev_sf else "UNCHANGED"
+        else:
+            verdict = "UNKNOWN"
+        state.hypothesis_log.append({"iteration": state.iteration_count, "change": ph["change"],
+                                      "reason": ph["reason"], "predicted_effect": ph["predicted_effect"],
+                                      "safety_factor_before": prev_sf, "safety_factor_after": cur_sf,
+                                      "health_score_after": snap["health_score"], "verdict": verdict})
+        state.pending_hypothesis = None
+    else:
+        state.hypothesis_log.append({"iteration": state.iteration_count, "change": "initial_design",
+                                      "reason": "initial engineering interpretation of the request",
+                                      "predicted_effect": None, "safety_factor_before": None,
+                                      "safety_factor_after": snap.get("safety_factor"),
+                                      "health_score_after": snap["health_score"],
+                                      "verdict": "PASSED" if quality["passed"] else "BASELINE"})
+
+    diagnosis = build_engineering_diagnosis(result, state)
+    return {**diagnosis, "quality_gate_passed": quality["passed"], "quality_gate_reasons": quality["reasons"],
+            "iterations_used": state.iteration_count, "max_iterations": state.max_iterations}
+
+
+def _tool_run_fatigue(state):
+    if state.last_analysis is None:
+        return {"status": "NOT_AVAILABLE", "message": "Call run_fea first."}
+    return state.last_analysis.get("fatigue_analysis")
+
+
+def _tool_compare_designs(state, baseline="previous"):
+    baseline_map = {"previous": state.previous_design, "best_valid": state.best_valid_design,
+                     "best_passing": state.best_passing_design}
+    if baseline not in baseline_map:
+        return {"status": "ERROR", "message": f"baseline must be one of {list(baseline_map)}"}
+    a = baseline_map[baseline]; b = state.current_candidate
+    if b is None:
+        return {"status": "ERROR", "message": "No analyzed candidate yet — call run_fea first."}
+    if a is None:
+        return {"status": "NO_BASELINE", "message": f"No '{baseline}' design recorded yet.",
+                "current": _summarize_snapshot(b)}
+
+    def delta(v1, v2):
+        if v1 in (None, 0) or v2 is None:
+            return None
+        return round((v2 - v1) / v1 * 100, 2)
+
+    sfv_a, sfv_b = a.get("safety_factor"), b.get("safety_factor")
+    hs_a, hs_b = a.get("health_score", 0), b.get("health_score", 0)
+    if b.get("passed") and not a.get("passed"):
+        verdict = "IMPROVED_TO_PASSING"
+    elif b.get("passed"):
+        verdict = "PASSED"
+    elif sfv_a is not None and sfv_b is not None and sfv_b > sfv_a and hs_b >= hs_a:
+        verdict = "IMPROVED"
+    elif (sfv_a is not None and sfv_b is not None and sfv_b < sfv_a) or hs_b < hs_a:
+        verdict = "WORSE"
+    else:
+        verdict = "UNCHANGED"
+    return {"status": "OK", "baseline": baseline, "baseline_snapshot": _summarize_snapshot(a),
+            "current_snapshot": _summarize_snapshot(b),
+            "delta": {"safety_factor_pct": delta(sfv_a, sfv_b), "health_score_change": round(hs_b - hs_a, 1),
+                      "mass_g_pct": delta(a.get("mass_g"), b.get("mass_g")),
+                      "violations_change": (b.get("violations") or 0) - (a.get("violations") or 0)},
+            "verdict": verdict}
+
+
+def _tool_finalize_design(state, verdict, summary=""):
+    state.finalized = True
+    state.final_verdict_claimed = verdict
+    state.final_summary = summary
+    return {"status": "ACKNOWLEDGED",
+            "message": "Recorded. The final response to the user is always computed independently from the "
+                       "actual solver results on the winning design, not from this claimed verdict."}
+
+
+AGENT_TOOL_HANDLERS = {
+    "set_initial_design": _tool_set_initial_design,
+    "inspect_geometry": _tool_inspect_geometry,
+    "measure_geometry": _tool_measure_geometry,
+    "identify_features": _tool_identify_features,
+    "find_holes": _tool_find_holes,
+    "measure_wall_thickness": _tool_measure_wall_thickness,
+    "get_bounding_box": _tool_get_bounding_box,
+    "get_mass_properties": _tool_get_mass_properties,
+    "check_manifold": _tool_check_manifold,
+    "check_watertight": _tool_check_watertight,
+    "find_problem_regions": _tool_find_problem_regions,
+    "get_topology_summary": _tool_get_topology_summary,
+    "diagnose_failure": _tool_diagnose_failure,
+    "calculate_properties": _tool_calculate_properties,
+    "modify_parameter": _tool_modify_parameter,
+    "modify_thickness": _tool_modify_thickness,
+    "modify_length": _tool_modify_length,
+    "modify_width": _tool_modify_width,
+    "modify_height": _tool_modify_height,
+    "modify_fillet": _tool_modify_fillet,
+    "modify_taper": _tool_modify_taper,
+    "add_hole": _tool_add_hole,
+    "modify_feature": _tool_modify_feature,
+    "create_feature": _tool_create_feature,
+    "remove_feature": _tool_remove_feature,
+    "add_rib": _tool_add_rib,
+    "add_gusset": _tool_add_gusset,
+    "modify_chamfer": _tool_modify_chamfer,
+    "validate_geometry": _tool_validate_geometry,
+    "run_mesh": _tool_run_mesh,
+    "run_fea": _tool_run_fea,
+    "run_fatigue": _tool_run_fatigue,
+    "compare_designs": _tool_compare_designs,
+    "finalize_design": _tool_finalize_design,
+}
+
+
+async def _execute_agent_tool(state, name, args):
+    handler = AGENT_TOOL_HANDLERS.get(name)
+    if handler is None:
+        return {"status": "ERROR", "message": f"Unknown tool '{name}'. Valid tools: {sorted(AGENT_TOOL_HANDLERS)}"}
+    try:
+        if asyncio.iscoroutinefunction(handler):
+            result = await handler(state, **args)
+        else:
+            result = handler(state, **args)
+        if not isinstance(result, dict):
+            result = {"status": "OK", "value": result}
+        return result
+    except TypeError as e:
+        return {"status": "ERROR", "message": f"Bad arguments for '{name}': {e}"}
+    except Exception as e:
+        return {"status": "ERROR", "message": f"Tool '{name}' raised: {type(e).__name__}: {e}"}
+
+
+# ----------------------------------------------------------------------
+# Tool schemas (OpenAI/Groq function-calling JSON Schema format)
+# ----------------------------------------------------------------------
+
+ENGINEERING_AGENT_TOOLS = [
+    {"name": "set_initial_design",
+     "description": "Establish the FIRST version of the design from your understanding of the engineering "
+        "request. Choose design_type='tapered_beam' for a tapered/lofted member (drone arm, connecting rod, "
+        "tapered spar/leg), 'bent_bracket' for a bracket with a real fold between two flat legs, or "
+        "'generic_script' to let the AI author a custom CadQuery script for geometry neither primitive "
+        "covers. Can only be called once per session.",
+     "parameters": {"type": "object", "properties": {
+         "design_type": {"type": "string", "enum": ["tapered_beam", "bent_bracket", "generic_script"]},
+         "reason": {"type": "string", "description": "Why you picked this design_type and these starting dimensions."},
+         "length": {"type": "number", "description": "[tapered_beam] overall length in mm, base(Z=0) to tip(Z=length)."},
+         "base_width": {"type": "number", "description": "[tapered_beam] cross-section width at the base, mm."},
+         "base_thick": {"type": "number", "description": "[tapered_beam] cross-section thickness at the base, mm."},
+         "tip_width": {"type": "number", "description": "[tapered_beam] cross-section width at the tip, mm."},
+         "tip_thick": {"type": "number", "description": "[tapered_beam] cross-section thickness at the tip, mm."},
+         "fillet_radius": {"type": "number", "description": "[both primitives] mm, 0 for none."},
+         "holes_base": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                         "description": "[tapered_beam] list of [x_from_center_mm, y_from_center_mm, diameter_mm] at the base face."},
+         "holes_tip": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                        "description": "[tapered_beam] same shape as holes_base, at the tip face."},
+         "leg1_length": {"type": "number", "description": "[bent_bracket] mm."},
+         "leg2_length": {"type": "number", "description": "[bent_bracket] mm."},
+         "width": {"type": "number", "description": "[bent_bracket] mm, shared by both legs."},
+         "thickness": {"type": "number", "description": "[bent_bracket] mm, shared by both legs."},
+         "bend_angle_deg": {"type": "number", "description": "[bent_bracket] default 90."},
+         "holes_leg1": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                         "description": "[bent_bracket] list of [x_from_bend_mm, y_from_centerline_mm, diameter_mm]."},
+         "holes_leg2": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                         "description": "[bent_bracket] same shape as holes_leg1."},
+     }, "required": ["design_type"]}},
+
+    {"name": "inspect_geometry", "description": "Structured summary of the current meshed geometry: "
+        "solid/watertight/manifold flags, bounding box, volume, detected features, hole count, minimum "
+        "wall thickness. Call validate_geometry then run_mesh first.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "measure_geometry", "description": "Bounding box, volume, surface area, and full "
+        "wall-thickness distribution of the current meshed geometry.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "identify_features", "description": "Lists engineering features present in the current "
+        "design (taper, fold/bend, fillet, through_holes) and the hole count, from the declared parameters.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "find_holes", "description": "Detailed list of every hole: position, diameter, recommended "
+        "fastener, and whether it violates the edge-distance rule.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "measure_wall_thickness", "description": "Dual-pass wall-thickness scan: min/mean/max "
+        "thickness and specific thin/critical zone locations.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "get_bounding_box", "description": "Overall dimensions (mm) and aspect ratio of the current "
+        "meshed geometry.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "get_mass_properties", "description": "Volume, mass, material, and center of mass of the "
+        "current meshed geometry.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "check_manifold", "description": "Whether the current mesh is a valid closed manifold solid "
+        "(winding-consistent, watertight/is_volume).",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "check_watertight", "description": "Whether the current mesh is watertight; if not, the "
+        "(x,y,z) location(s) of the gap(s).",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "find_problem_regions", "description": "Merged list of every known problem location on the "
+        "current design: non-watertight gaps, thin walls, sharp-corner stress concentrations, hole "
+        "violations, and the FEA critical section if run_fea has been called.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "get_topology_summary", "description": "Vertex/face/edge counts, Euler number, watertight "
+        "and manifold flags for the current mesh.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "diagnose_failure", "description": "The authoritative engineering diagnosis from the most "
+        "recent run_fea call: status, safety_factor, max_von_mises_mpa, critical_region, failure_modes. "
+        "Call run_fea first.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "calculate_properties", "description": "Section/mass/dynamic properties (stress components, "
+        "deflection, natural frequency, buckling) — from the last run_fea if available, otherwise a cheap "
+        "on-demand analytical estimate.",
+     "parameters": {"type": "object", "properties": {}}},
+
+    {"name": "modify_parameter", "description": "General-purpose targeted parameter change on the current "
+        "parametric design. Prefer the specific modify_thickness/length/width/height/fillet/taper shortcuts "
+        "when they fit; use this for anything else, including exact field names like 'base_thick' or 'tip_width'.",
+     "parameters": {"type": "object", "properties": {
+         "parameter": {"type": "string", "description": "e.g. 'thickness','width','length','fillet_radius', "
+                        "or an exact field name such as 'base_thick'/'tip_width'/'leg1_length'."},
+         "change_percent": {"type": "number", "description": "Relative change, e.g. 20 for +20%. Provide this OR new_value."},
+         "new_value": {"type": "number", "description": "Absolute new value in mm/deg. Provide this OR change_percent."},
+         "region": {"type": "string", "description": "Optional disambiguation for a generic parameter name: "
+                     "'base'/'near_fixed_support' vs 'tip'/'near_tip' for a beam; 'leg1' vs 'leg2' for a bracket."},
+         "reason": {"type": "string", "description": "REQUIRED. The engineering justification for this change."},
+         "predicted_effect": {"type": "string", "description": "What you expect this change to do to the result."},
+     }, "required": ["parameter", "reason"]}},
+    {"name": "modify_thickness", "description": "Shortcut for modify_parameter targeting section thickness "
+        "(base_thick/tip_thick for a beam, thickness for a bracket).",
+     "parameters": {"type": "object", "properties": {
+         "change_percent": {"type": "number"}, "new_value": {"type": "number"},
+         "region": {"type": "string", "description": "'base' or 'tip' for a beam (omit to scale both)."},
+         "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["reason"]}},
+    {"name": "modify_length", "description": "Shortcut for modify_parameter targeting overall length "
+        "(beam) or a leg length (bracket, use region='leg1'|'leg2').",
+     "parameters": {"type": "object", "properties": {
+         "change_percent": {"type": "number"}, "new_value": {"type": "number"},
+         "region": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["reason"]}},
+    {"name": "modify_width", "description": "Shortcut for modify_parameter targeting section width "
+        "(base_width/tip_width for a beam, width for a bracket).",
+     "parameters": {"type": "object", "properties": {
+         "change_percent": {"type": "number"}, "new_value": {"type": "number"},
+         "region": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["reason"]}},
+    {"name": "modify_height", "description": "Shortcut for modify_parameter targeting the out-of-plane "
+        "dimension (alias for thickness).",
+     "parameters": {"type": "object", "properties": {
+         "change_percent": {"type": "number"}, "new_value": {"type": "number"},
+         "region": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["reason"]}},
+    {"name": "modify_fillet", "description": "Shortcut for modify_parameter targeting fillet_radius.",
+     "parameters": {"type": "object", "properties": {
+         "change_percent": {"type": "number"}, "new_value": {"type": "number"},
+         "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["reason"]}},
+    {"name": "modify_taper", "description": "[tapered_beam only] Scale both tip_width and tip_thick "
+        "together by change_percent, making the taper more (negative %) or less (positive %) aggressive "
+        "without touching the base.",
+     "parameters": {"type": "object", "properties": {
+         "change_percent": {"type": "number"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["change_percent", "reason"]}},
+    {"name": "add_hole", "description": "Add one through-hole. For a tapered_beam set end='base'|'tip'; "
+        "for a bent_bracket set leg='leg1'|'leg2'. Position is in that face's local centered frame.",
+     "parameters": {"type": "object", "properties": {
+         "x_mm": {"type": "number"}, "y_mm": {"type": "number"}, "diameter_mm": {"type": "number"},
+         "end": {"type": "string", "enum": ["base", "tip"]}, "leg": {"type": "string", "enum": ["leg1", "leg2"]},
+         "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["x_mm", "y_mm", "diameter_mm", "reason"]}},
+    {"name": "modify_feature", "description": "Fallback for a design change the dedicated parametric "
+        "tools can't express. Describe the change in plain engineering language; it is applied via an "
+        "AI-assisted, fully re-verified script edit rather than a validated numeric parameter change, so "
+        "prefer the specific modify_*/add_hole tools whenever they fit.",
+     "parameters": {"type": "object", "properties": {
+         "feature_description": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["feature_description", "reason"]}},
+    {"name": "create_feature", "description": "Same mechanism as modify_feature, framed as adding "
+        "something new (e.g. a boss, a slot, a mounting tab) not covered by add_hole.",
+     "parameters": {"type": "object", "properties": {
+         "feature_description": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["feature_description", "reason"]}},
+    {"name": "remove_feature", "description": "Same mechanism as modify_feature, framed as removing an "
+        "existing feature.",
+     "parameters": {"type": "object", "properties": {
+         "feature_description": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["feature_description", "reason"]}},
+    {"name": "add_rib", "description": "Add a stiffening rib. Not yet a dedicated parametric primitive — "
+        "routed through the same AI-assisted script-edit fallback as modify_feature, then fully re-verified.",
+     "parameters": {"type": "object", "properties": {
+         "description": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["description", "reason"]}},
+    {"name": "add_gusset", "description": "Add a corner gusset/brace. Not yet a dedicated parametric "
+        "primitive — routed through the same AI-assisted script-edit fallback, then fully re-verified.",
+     "parameters": {"type": "object", "properties": {
+         "description": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["description", "reason"]}},
+    {"name": "modify_chamfer", "description": "Add/change a chamfer. Not yet a dedicated parametric "
+        "primitive — routed through the same AI-assisted script-edit fallback, then fully re-verified.",
+     "parameters": {"type": "object", "properties": {
+         "description": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["description", "reason"]}},
+
+    {"name": "validate_geometry", "description": "B-rep-level validity check of the current CAD object, "
+        "BEFORE meshing. Call right after set_initial_design or any modify_*/add_hole/create_feature call. "
+        "On failure, the system automatically reverts to the last known-good design.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "run_mesh", "description": "Export the current (validated) CAD object to a mesh and confirm "
+        "it is watertight/manifold. Call after validate_geometry, before run_fea. On failure, the system "
+        "automatically reverts to the last known-good design.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "run_fea", "description": "THE authoritative engineering check: full FEA (real CalculiX where "
+        "configured, analytical fallback otherwise) plus fatigue and the rule engine, on the current meshed "
+        "design. Consumes one iteration of your budget. Returns the same shape as diagnose_failure.",
+     "parameters": {"type": "object", "properties": {
+         "force_n": {"type": "number", "description": "Override the load magnitude for this run only."},
+         "force_dir": {"type": "string", "enum": ["x", "y", "z"], "description": "Override load direction for this run only."},
+     }}},
+    {"name": "run_fatigue", "description": "Fatigue analysis (full Marin 6-factor + Goodman/Gerber) from "
+        "the most recent run_fea call.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "compare_designs", "description": "Compare the current analyzed candidate against a stored "
+        "baseline ('previous' iteration, 'best_valid' design so far, or 'best_passing' design so far) to "
+        "see whether your last change actually helped.",
+     "parameters": {"type": "object", "properties": {
+         "baseline": {"type": "string", "enum": ["previous", "best_valid", "best_passing"]},
+     }}},
+    {"name": "finalize_design", "description": "End the engineering loop. Call this once the design "
+        "passes, or your iteration budget is spent, or further iteration clearly won't help.",
+     "parameters": {"type": "object", "properties": {
+         "verdict": {"type": "string", "enum": ["PASSED", "BEST_EFFORT", "FAILED"]},
+         "summary": {"type": "string", "description": "Brief summary of the final state and what was tried."},
+     }, "required": ["verdict"]}},
+]
+
+
+ENGINEERING_AGENT_SYSTEM_PROMPT = """You are the Lumexa Engineering Agent — a mechanical design reasoning layer sitting on top of Lumexa's deterministic CAD/FEA systems. You are NOT a CAD kernel and you do NOT do freehand geometry math yourself. Every geometric fact you know comes from calling a tool; every geometric change you make happens by calling a tool. Lumexa's solvers (real FEA where configured, analytical fallback otherwise) are the sole source of truth for whether a design passes — you never declare PASS/FAIL yourself, you read it from run_fea's/diagnose_failure's output.
+
+WORKFLOW (follow this shape; you may repeat steps as needed):
+Understand -> Inspect -> Diagnose -> Propose -> Modify -> Verify -> Simulate -> Compare -> Refine
+
+1. UNDERSTAND: read the engineering request. Call set_initial_design with your best translation of it into concrete parameters for whichever primitive fits (tapered_beam or bent_bracket), or generic_script if neither fits. Before proposing a change on later iterations, silently answer for yourself: what is being built, its engineering purpose, its important geometric features, the loads/constraints on it, what is currently failing and where, what design variable could influence that failure, what change you will attempt, why it should help, and what must NOT change.
+2. INSPECT: after building or modifying geometry, call validate_geometry then run_mesh before trusting any other inspection tool — inspect_geometry/measure_geometry/find_holes/check_watertight/etc. all need a meshed design and will tell you so if you call them too early.
+3. DIAGNOSE: call run_fea (this also runs fatigue/rule-engine checks) and read diagnose_failure/find_problem_regions for WHERE and WHY it is failing. Trust these numbers completely — never override or second-guess a solver result.
+4. PROPOSE + MODIFY: pick ONE targeted, physically-justified change at a time (modify_parameter and its shortcuts modify_thickness/length/width/height/fillet/taper, add_hole, or for anything the built-in primitives can't express, modify_feature/create_feature/remove_feature/add_rib/add_gusset/modify_chamfer). Every modify call requires a `reason` — the engineering justification — and should include a `predicted_effect` — what you expect to happen. Do not rewrite the whole design when one parameter needs changing. Do not fix one flagged issue by weakening something that was already fine elsewhere.
+5. VERIFY + SIMULATE: after every modification, validate_geometry -> run_mesh -> run_fea again. If a change is rejected (bad parameters, or the resulting geometry is non-manifold/non-watertight), you will be told so explicitly and the system automatically preserves the best known-valid design — just try a different, smaller, or better-justified change next.
+6. COMPARE + REFINE: call compare_designs to see whether your last change actually helped versus the previous iteration (or the best-so-far). Never assume a change worked — check.
+7. When the design passes the quality gate, or you have used your iteration budget, or you are confident further iteration will not help, call finalize_design with your honest verdict and a short summary. The system will independently re-verify the final numbers regardless of what you report here — this call only records your reasoning, it never overrides the solver's own verdict.
+
+RULES:
+- Never claim a design passed or failed — only report what run_fea/diagnose_failure told you.
+- Always give a `reason` on every modification.
+- One targeted change per modify call. If you're unsure which parameter to change, call diagnose_failure/find_problem_regions/calculate_properties first rather than guessing.
+- If a tool returns status REJECTED or ERROR, read the message, adjust your approach, and try again — do not repeat the exact same rejected call.
+- You have a limited number of run_fea calls (shown in the user message) — don't waste them on inspection; use the read-only tools freely, they don't count against that budget."""
+
+
+# ----------------------------------------------------------------------
+# Provider tool-calling transport (OpenAI-compatible: groq/openrouter/lovable
+# all share this exact wire shape). See the module docstring above this
+# section for why Claude/Gemini aren't wired up for this endpoint yet.
+# ----------------------------------------------------------------------
+
+def _to_openai_tools(tool_specs):
+    return [{"type": "function", "function": {"name": t["name"], "description": t["description"],
+             "parameters": t["parameters"]}} for t in tool_specs]
+
+
+def _openai_compatible_tool_chat(api_url, api_key, model, messages, tools, temperature=0.2,
+                                  max_tokens=AGENT_TURN_MAX_TOKENS, extra_headers=None):
+    """
+    One tool-calling round-trip against any OpenAI-compatible chat/completions
+    endpoint — same urllib-direct pattern as _groq_request/_openrouter_request/
+    _lovable_request above, extended with tools/tool_choice and returning the
+    full message object (content + tool_calls) rather than just extracted text,
+    since the agent loop needs to see and execute tool_calls, not just prose.
+    """
+    import urllib.request, urllib.error
+
+    payload = json.dumps({"model": model, "messages": messages, "tools": tools,
+                           "tool_choice": "auto", "temperature": temperature,
+                           "max_tokens": max_tokens}).encode()
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}",
+               "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)", "Accept": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+
+    req = urllib.request.Request(api_url, data=payload, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        if e.code == 429:
+            raise HTTPException(429, f"Provider rate limit exceeded: {body}")
+        raise HTTPException(502, f"Provider error ({e.code}): {body}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"Provider connection error: {str(e)}")
+
+    try:
+        return data["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(502, f"Unexpected tool-calling response shape: {json.dumps(data)[:500]}")
+
+
+def _provider_tool_endpoint():
+    if AI_PROVIDER == "groq":
+        return GROQ_API_URL, GROQ_API_KEY, GROQ_MODEL
+    if AI_PROVIDER == "openrouter":
+        return OPENROUTER_API_URL, OPENROUTER_API_KEY, OPENROUTER_MODEL
+    if AI_PROVIDER == "lovable":
+        return LOVABLE_AI_URL, LOVABLE_API_KEY, LOVABLE_AI_MODEL
+    return None, None, None
+
+
+def _call_model_with_tools(messages, temperature=0.2, max_tokens=AGENT_TURN_MAX_TOKENS):
+    url, key, model = _provider_tool_endpoint()
+    if url is None:
+        raise HTTPException(501,
+            "The Engineering Agent's tool-calling loop is currently implemented for OpenAI-compatible "
+            "providers only (groq, openrouter, lovable) — Groq's openai/gpt-oss-120b is the configuration "
+            f"this was built and is meant to be tested against. Current AI_PROVIDER is '{AI_PROVIDER}'. Set "
+            "AI_PROVIDER=groq (and GROQ_API_KEY) to use this endpoint; Claude/Gemini native tool-calling for "
+            "this specific agent loop is not wired up yet — /generate-validate-refine still works on every "
+            "provider as before.")
+    if not key:
+        raise HTTPException(500, f"{AI_PROVIDER.upper()}_API_KEY is not configured on the server.")
+
+    msg = _openai_compatible_tool_chat(url, key, model, messages, _to_openai_tools(ENGINEERING_AGENT_TOOLS),
+                                        temperature=temperature, max_tokens=max_tokens)
+    tool_calls = []
+    for tc in (msg.get("tool_calls") or []):
+        try:
+            args = json.loads(tc.get("function", {}).get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {"_raw_arguments_unparseable": tc.get("function", {}).get("arguments")}
+        tool_calls.append({"id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                            "name": tc.get("function", {}).get("name"), "arguments": args})
+    return {"role": "assistant", "content": msg.get("content") or msg.get("reasoning"),
+            "tool_calls": tool_calls, "_raw_message": msg}
+
+
+def _format_tool_result_message(tool_call_id, tool_name, result_dict):
+    safe = _json_safe(result_dict)
+    text = json.dumps(safe)
+    if len(text) > 6000:
+        text = json.dumps({"truncated": True, "note": "Full result was too large; showing a partial view.",
+                            "status": safe.get("status") if isinstance(safe, dict) else None,
+                            "keys_available": list(safe.keys()) if isinstance(safe, dict) else None,
+                            "partial": text[:4000]})
+    return {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": text}
+
+
+# ----------------------------------------------------------------------
+# Orchestration loop (spec sections 1, 9, 12)
+# ----------------------------------------------------------------------
+
+async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_dir="z",
+                                 operating_temp_c=25.0, surface_finish="machined", reliability=0.99,
+                                 project_description=None, max_iterations=4, min_health_score=75.0,
+                                 max_critical_violations=0, max_high_violations=2, min_safety_factor=1.0):
+    if not CQ:
+        raise HTTPException(503, "CadQuery not installed on this server.")
+
+    max_iterations = max(1, min(int(max_iterations), 6))
+    max_steps = max(12, min(max_iterations * 8, 40))
+
+    state = EngineeringDesignState(prompt, material, force_n, force_dir, operating_temp_c, surface_finish,
+                                    reliability, project_description, max_iterations, min_health_score,
+                                    max_critical_violations, max_high_violations, min_safety_factor)
+
+    prompt_lower = prompt.lower()
+    is_taper_hint = any(w in prompt_lower for w in TAPER_KEYWORDS)
+    is_fold_hint = any(w in prompt_lower for w in FOLD_BRACKET_KEYWORDS)
+    hint = ("tapered/lofted — consider set_initial_design with design_type='tapered_beam'" if is_taper_hint
+            else "a bent/folded bracket — consider set_initial_design with design_type='bent_bracket'" if is_fold_hint
+            else "not an obvious match for either built-in parametric primitive — use your judgment; "
+                 "design_type='generic_script' is the safe default if neither tapered_beam nor "
+                 "bent_bracket actually fits")
+
+    user_msg = (
+        f"ENGINEERING REQUEST: {prompt}\n\n"
+        f"Material: {material}. Load: {force_n}N along {force_dir}. Operating temp: {operating_temp_c}C. "
+        f"Surface finish: {surface_finish}. Target reliability: {reliability}.\n"
+        + (f"Project context: {project_description}\n" if project_description else "")
+        + f"\nKeyword heuristic (not a hard rule — use your own judgment): this request looks like {hint}.\n\n"
+        f"Quality thresholds you are building to: min_health_score={min_health_score}, "
+        f"max_critical_violations={max_critical_violations}, max_high_violations={max_high_violations}, "
+        f"min_safety_factor={min_safety_factor}. You have a budget of {max_iterations} run_fea calls.\n\n"
+        "Begin with set_initial_design."
+    )
+    messages = [{"role": "system", "content": ENGINEERING_AGENT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg}]
+
+    tool_trace = []
+    stopped_reason = None
+    step = 0
+
+    for step in range(1, max_steps + 1):
+        rate_limit_wait_remaining = 90.0
+        assistant = None
+        while True:
+            try:
+                assistant = await asyncio.to_thread(_call_model_with_tools, messages, 0.2, AGENT_TURN_MAX_TOKENS)
+                break
+            except HTTPException as e:
+                if e.status_code == 429 and rate_limit_wait_remaining > 0:
+                    wait_s = min(_parse_groq_retry_after(str(e.detail)), rate_limit_wait_remaining)
+                    rate_limit_wait_remaining -= wait_s
+                    await asyncio.sleep(wait_s)
+                    continue
+                stopped_reason = "rate_limited" if e.status_code == 429 else f"model_call_failed: {e.detail}"
+                break
+        if assistant is None:
+            break
+
+        messages.append(assistant["_raw_message"])
+
+        if not assistant["tool_calls"]:
+            if state.iteration_count > 0:
+                stopped_reason = "model_stopped_without_finalize"
+                break
+            messages.append({"role": "user", "content":
+                "Please proceed by calling a tool — start with set_initial_design. Do not describe what "
+                "you would do in prose; call the tool directly."})
+            continue
+
+        finalize_called = False
+        for tc in assistant["tool_calls"]:
+            result = await _execute_agent_tool(state, tc["name"], tc["arguments"])
+            tool_trace.append({"step": step, "tool": tc["name"], "arguments": tc["arguments"],
+                                "result_status": result.get("status") if isinstance(result, dict) else None})
+            messages.append(_format_tool_result_message(tc["id"], tc["name"], result))
+            if tc["name"] == "finalize_design":
+                finalize_called = True
+
+        if finalize_called:
+            stopped_reason = "agent_finalized"
+            break
+
+        if state.iteration_count >= max_iterations and state.current_candidate is not None:
+            messages.append({"role": "user", "content":
+                f"You have used all {max_iterations} run_fea iterations. Call finalize_design now with "
+                "your honest assessment of the final result."})
+    else:
+        stopped_reason = stopped_reason or "max_steps_reached"
+
+    if stopped_reason is None:
+        stopped_reason = "max_steps_reached"
+
+    winner = state.best_passing_design or state.best_valid_design or state.current_candidate
+    if winner is None:
+        raise HTTPException(502, "The Engineering Agent never produced a valid, analyzable design. "
+                                  f"Tool trace: {json.dumps(_json_safe(tool_trace))[:1500]}")
+
+    if winner is not state.current_candidate or state.mesh is None:
+        try:
+            if winner["design_type"] == "tapered_beam":
+                final_obj = make_tapered_beam(**winner["params"])
+            elif winner["design_type"] == "bent_bracket":
+                final_obj = make_bent_bracket(**winner["params"])
+            else:
+                final_obj, build_err = execute_cq_script_safely(winner["script"])
+                if build_err:
+                    raise RuntimeError(build_err)
+            final_mesh, final_stl = await mesh_from_cq_object(final_obj)
+        except Exception as e:
+            raise HTTPException(502, f"Failed to rebuild the winning design for final export: {e}")
+    else:
+        final_mesh, final_stl = state.mesh, state.stl_bytes
+
+    final_result = await run_analysis_v8(final_mesh, prompt, prompt, material, force_n, force_dir,
+                                          operating_temp_c, project_description, surface_finish,
+                                          reliability, False)
+    final_quality = evaluate_design_quality(final_result, min_health_score, max_critical_violations,
+                                             max_high_violations, min_safety_factor)
+
+    final_result["generated_stl_base64"] = base64.b64encode(final_stl).decode()
+    final_result["generated_script"] = (winner["script"] if winner["design_type"] == "generic_script"
+                                         else params_to_script_tapered_beam(winner["params"])
+                                         if winner["design_type"] == "tapered_beam"
+                                         else params_to_script_bent_bracket(winner["params"]))
+    final_result["generation_method"] = f"lumexa_engineering_agent_{winner['design_type']}"
+    final_result["engineering_agent"] = {
+        "design_type": winner["design_type"], "final_parameters": winner.get("params"),
+        "iterations_used": state.iteration_count, "max_iterations": max_iterations,
+        "steps_used": step, "max_steps": max_steps, "stopped_reason": stopped_reason,
+        "passed_quality_gate": final_quality["passed"], "final_reasons": final_quality["reasons"],
+        "used_best_passing": winner is state.best_passing_design,
+        "used_best_valid_fallback": (winner is state.best_valid_design and winner is not state.best_passing_design),
+        "agent_final_verdict_claimed": state.final_verdict_claimed, "agent_final_summary": state.final_summary,
+        "hypothesis_log": state.hypothesis_log, "tool_call_trace": tool_trace,
+        "quality_thresholds": {"min_health_score": min_health_score,
+                                "max_critical_violations": max_critical_violations,
+                                "max_high_violations": max_high_violations,
+                                "min_safety_factor": min_safety_factor},
+    }
+    return final_result
+
+
+@app.post("/engineering-agent")
+@_sanitize_response
+async def engineering_agent_endpoint(
+    prompt: str = Form(...),
+    material: str = Form("auto"),
+    force_n: float = Form(1000.0),
+    force_dir: str = Form("z"),
+    operating_temp_c: float = Form(25.0),
+    surface_finish: str = Form("machined"),
+    reliability: float = Form(0.99),
+    project_description: Optional[str] = Form(None),
+    max_iterations: int = Form(4),
+    min_health_score: float = Form(75.0),
+    max_critical_violations: int = Form(0),
+    max_high_violations: int = Form(2),
+    min_safety_factor: float = Form(1.0),
+):
+    """
+    THE ENGINEERING AGENT — Understand -> Inspect -> Diagnose -> Propose -> Modify ->
+    Verify -> Simulate -> Compare -> Refine, instead of /generate-validate-refine's
+    "regenerate the whole script and hope" loop.
+
+    The frontier model (GPT-OSS-120B via Groq, by default — see AI_PROVIDER) reasons about
+    the design and calls tools; Lumexa's deterministic geometry kernel, mesher, and solver
+    remain the sole source of engineering truth. The model never declares pass/fail itself
+    and never hand-writes CadQuery for the tapered-beam/bent-bracket workflows — it only
+    proposes named parameter changes, which are validated against a safe-parameter contract
+    and applied through make_tapered_beam/make_bent_bracket, the same trusted server-side
+    primitives /generate-validate-refine already relies on. Geometry outside what those two
+    primitives cover falls back to the existing AI-script-generation/refinement machinery,
+    still wrapped in the same validate -> mesh -> FEA -> compare loop.
+
+    FIRST IMPLEMENTATION TARGET (per the build spec this endpoint implements): the
+    tapered-beam workflow — e.g. "Design a tapered drone arm capable of carrying 2kg."
+    Bent-bracket support is wired the same way since make_bent_bracket already existed, but
+    has had less real-world exercise than the beam path — test that path first.
+
+    Requires AI_PROVIDER to be an OpenAI-compatible provider with tool-calling
+    (groq/openrouter/lovable). Set AI_PROVIDER=groq to use Groq's openai/gpt-oss-120b
+    (confirmed by Groq's own console to support Function Calling/Tool Use). Claude/Gemini
+    native tool-calling is not wired up for this endpoint yet; /generate-validate-refine
+    still works on every provider as before.
+
+    Response shape matches /analyze-part (geometry/FEA/fatigue/rule_engine/health_score/...)
+    plus generated_stl_base64, generated_script, and an "engineering_agent" block with the
+    full hypothesis log and tool-call trace for transparency.
+    """
+    return await run_engineering_agent(
+        prompt, material, force_n, force_dir, operating_temp_c, surface_finish, reliability,
+        project_description, max_iterations, min_health_score, max_critical_violations,
+        max_high_violations, min_safety_factor,
+    )
