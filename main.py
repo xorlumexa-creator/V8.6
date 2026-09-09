@@ -2179,7 +2179,13 @@ def full_marin_fatigue(mat_key,sigma_a,sigma_m=None,surface="machined",
             "goodman_status":goodman_status,
             "cycles_to_failure":round(N,0) if N!=float("inf") else "infinite",
             "hours_to_failure":round(min(hours,1e9),1) if hours!=float("inf") else "infinite",
-            "status":overall_status}
+            "status":overall_status,
+            "note":("cycles_to_failure/hours_to_failure reflect only the pure alternating-stress "
+                    "S-N curve, which ignores mean stress entirely — 'infinite' there means the "
+                    "alternating component alone is below the endurance limit, NOT that the part is "
+                    "safe overall. status/goodman_status factor in mean stress too and are the "
+                    "governing verdict; a FAIL there overrides an 'infinite' cycle count."
+                    if goodman_status=="FAIL" and N==float("inf") else None)}
 
 def fracture_v8(mat_key,sigma,crack_mm=None,geometry=None):
     if crack_mm is None:
