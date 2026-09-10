@@ -1088,6 +1088,17 @@ OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
 # for that one endpoint.
 OPENROUTER_VISION_MODEL = os.environ.get("OPENROUTER_VISION_MODEL", OPENROUTER_MODEL)
 
+# Cerebras Cloud (cloud.cerebras.ai) — OpenAI-compatible, function-calling capable,
+# and (as of this writing) hosts gpt-oss-120b for free — the same model already used
+# via Groq above, just a different inference backend with a separate rate-limit pool.
+# Verify current card/limit terms at signup before relying on this; free-tier terms
+# across every provider in this file change often enough that hardcoding a promise
+# here would go stale.
+CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
+CEREBRAS_API_URL = "https://api.cerebras.ai/v1/chat/completions"
+CEREBRAS_MODEL = os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b")
+
+
 # Groq — OpenAI-compatible, custom LPU hardware, genuinely stable free tier
 # (unlike OpenRouter's free roster, which churned THREE times in one night on
 # this project — models delisted within hours to days of being set). Groq's
@@ -1116,19 +1127,23 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", GROQ_MODEL)
 
 # Which provider backs generation: "claude" (direct Anthropic API), "gemini"
-# (direct Google API), "groq" (Llama 4 via Groq, stable free tier),
+# (direct Google API), "groq" (gpt-oss-120b via Groq, stable free tier),
+# "cerebras" (OpenAI-compatible, also hosts gpt-oss-120b free as of this
+# writing — verify current card/limit terms at signup, they change often),
 # "openrouter" (OpenAI-compatible gateway, free models available but churn
-# heavily), or "lovable" (Gemini via the gateway). Defaults to whichever key
-# is actually configured — set AI_PROVIDER explicitly to force a choice if
-# more than one key happens to be set at once.
+# heavily and cap out at 50 requests/day unfunded), or "lovable" (Gemini via
+# the gateway). Defaults to whichever key is actually configured — set
+# AI_PROVIDER explicitly to force a choice if more than one key is set.
 AI_PROVIDER = os.environ.get(
     "AI_PROVIDER",
     "claude" if os.environ.get("ANTHROPIC_API_KEY")
     else "gemini" if os.environ.get("GOOGLE_API_KEY")
     else "groq" if os.environ.get("GROQ_API_KEY")
+    else "cerebras" if os.environ.get("CEREBRAS_API_KEY")
     else "openrouter" if os.environ.get("OPENROUTER_API_KEY")
     else "lovable"
 )
+
 
 def _groq_request(messages, temperature=0.15, max_tokens=3000, model=None):
     """Low-level call to Groq (OpenAI-compatible chat completions) — same
@@ -1180,6 +1195,56 @@ def _groq_request(messages, temperature=0.15, max_tokens=3000, model=None):
     if not content or not isinstance(content, str):
         # Same null-content edge case fixed in _openrouter_request/_lovable_request.
         raise HTTPException(502, f"Groq returned empty/null content. "
+                                  f"Raw response: {json.dumps(data)[:500]}")
+    return content
+
+
+def _cerebras_request(messages, temperature=0.15, max_tokens=3000, model=None):
+    """Low-level call to Cerebras Cloud (OpenAI-compatible chat completions) —
+    identical shape to _groq_request, different base URL/key/model. Added as a
+    free-tier, no-card-reported alternative to Groq for gpt-oss-120b specifically
+    (verify current terms at signup, they change often across every free provider
+    in this file)."""
+    import urllib.request, urllib.error
+
+    if not CEREBRAS_API_KEY:
+        raise HTTPException(500, "CEREBRAS_API_KEY is not configured on the server. "
+                                   "Set it as a secret/env var in your deployment.")
+
+    payload = json.dumps({
+        "model": model or CEREBRAS_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }).encode()
+
+    req = urllib.request.Request(
+        CEREBRAS_API_URL, data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {CEREBRAS_API_KEY}",
+            "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
+            "Accept": "application/json",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        if e.code == 429:
+            raise HTTPException(429, f"Cerebras rate limit exceeded: {body}")
+        raise HTTPException(502, f"Cerebras error ({e.code}): {body}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"Cerebras connection error: {str(e)}")
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(502, f"Unexpected Cerebras response shape: {json.dumps(data)[:500]}")
+
+    if not content or not isinstance(content, str):
+        raise HTTPException(502, f"Cerebras returned empty/null content. "
                                   f"Raw response: {json.dumps(data)[:500]}")
     return content
 
@@ -1539,6 +1604,12 @@ async def gemini_generate_script(prompt: str, previous_script: Optional[str] = N
     elif AI_PROVIDER == "groq":
         text = await asyncio.to_thread(
             _groq_request,
+            [{"role": "system", "content": system_prompt}] + turns,
+            temperature=0.15, max_tokens=GEN_MAX_TOKENS
+        )
+    elif AI_PROVIDER == "cerebras":
+        text = await asyncio.to_thread(
+            _cerebras_request,
             [{"role": "system", "content": system_prompt}] + turns,
             temperature=0.15, max_tokens=GEN_MAX_TOKENS
         )
@@ -3172,15 +3243,19 @@ def home():
             "engineering_agent_configured": AI_PROVIDER in ("groq", "openrouter", "lovable")},
         "new_in_v8_23":[
             "POST /engineering-agent  ★★ tool-calling reasoning agent: Understand -> "
-            "Inspect -> Diagnose -> Propose -> Modify -> Verify -> Simulate -> Compare -> "
+            "Inspect -> Diagnose -> Propose -> Modify -> Simulate -> Compare -> "
             "Refine, instead of /generate-validate-refine's regenerate-the-whole-script "
             "loop. The frontier model (GPT-OSS-120B via Groq by default) never writes "
             "CadQuery or declares pass/fail itself for the tapered-beam/bent-bracket "
             "workflows — it calls tools (inspect_geometry, diagnose_failure, "
-            "modify_parameter/modify_thickness/.../add_hole, validate_geometry, run_mesh, "
-            "run_fea, compare_designs, ...) that go through a safe parameter contract and "
-            "the same make_tapered_beam/make_bent_bracket/run_analysis_v8 machinery every "
-            "other endpoint already trusts. A monotonic-refinement guard automatically "
+            "modify_parameter/modify_thickness/.../add_hole, run_fea, compare_designs, "
+            "...) that go through a safe parameter contract and the same "
+            "make_tapered_beam/make_bent_bracket/run_analysis_v8 machinery every "
+            "other endpoint already trusts. Geometry is validated and meshed "
+            "automatically as part of every build/modify call (no separate "
+            "validate_geometry/run_mesh round-trip needed) — cuts model calls per "
+            "design iteration from 4 to 2, which matters a lot on rate-limited free "
+            "API tiers. A monotonic-refinement guard automatically "
             "reverts to the last known-valid design if a candidate crashes or comes back "
             "non-manifold/non-watertight. First implementation target (see the endpoint's "
             "own docstring): the tapered-beam workflow — test that before bent-bracket. "
@@ -4800,7 +4875,55 @@ def _resolve_bracket_parameter(parameter, region):
     return None
 
 
-def _rebuild_beam(state, new_params, change_desc, reason, predicted_effect=None):
+async def _auto_validate_and_mesh(state):
+    """Runs the B-rep validity check + mesh export + watertight/manifold check inline,
+    right after any geometry build/modification. Folded into every modify_*/
+    set_initial_design/add_hole/generic-script result so the agent doesn't need two
+    extra model round-trips (validate_geometry, run_mesh) per iteration just to reach
+    run_fea — cut from 4 model turns per design iteration to 2 (build/modify, run_fea).
+    On failure this performs the same revert-to-last-known-good the old standalone
+    validate_geometry/run_mesh tools used to."""
+    if state.obj is None:
+        return {"validated": False, "meshed": False}
+    brep_ok = True; brep_note = None
+    try:
+        val = state.obj.val()
+        if hasattr(val, "isValid"):
+            brep_ok = bool(val.isValid())
+            if not brep_ok:
+                brep_note = "OpenCASCADE's BRepCheck_Analyzer flagged this shape as an invalid B-rep."
+    except Exception as e:
+        brep_note = f"Could not run the B-rep validity check ({type(e).__name__}: {e}); proceeding to mesh export."
+    if not brep_ok:
+        reverted = _revert_to_last_known_good(state)
+        return {"status": "REJECTED", "valid_brep": False, "reason": brep_note, "reverted": reverted,
+                "current_params": state.params}
+    try:
+        mesh, stl_bytes = await mesh_from_cq_object(state.obj)
+    except Exception as e:
+        reverted = _revert_to_last_known_good(state)
+        return {"status": "REJECTED", "reason": f"STL export/mesh load failed: {type(e).__name__}: {e}",
+                "reverted": reverted, "current_params": state.params}
+    is_wt = bool(mesh.is_watertight); is_wind = bool(getattr(mesh, "is_winding_consistent", True))
+    if not is_wt or not is_wind:
+        defect_locs = _find_watertight_defect_locations(mesh)
+        reverted = _revert_to_last_known_good(state)
+        return {"status": "REJECTED", "watertight": is_wt, "manifold": is_wind, "defect_locations": defect_locs,
+                "reason": "Meshed geometry is non-manifold/non-watertight — rejected per monotonic refinement "
+                          "protection.", "reverted": reverted, "current_params": state.params}
+    state.mesh = mesh; state.stl_bytes = stl_bytes
+    if state.best_valid_design is None:
+        state.best_valid_design = {"design_type": state.design_type, "params": _copy_params(state.params),
+                                    "script": state.script, "health_score": -1, "passed": False,
+                                    "safety_factor": None, "max_von_mises_mpa": None, "mass_g": None,
+                                    "is_watertight": True, "violations": None, "reasons": [],
+                                    "iteration": state.iteration_count}
+    gc.collect()
+    return {"status": "OK", "validated": True, "meshed": True, "watertight": True,
+            "face_count": int(len(mesh.faces)), "vertex_count": int(len(mesh.vertices))}
+
+
+async def _rebuild_beam(state, new_params, change_desc, reason, predicted_effect=None):
     ok, err = _beam_param_contract(new_params, state.material)
     if not ok:
         return err
@@ -4816,12 +4939,15 @@ def _rebuild_beam(state, new_params, change_desc, reason, predicted_effect=None)
                   # 512MB instances have no headroom for stale shapes piling up across iterations
     state.pending_hypothesis = {"change": change_desc, "reason": reason,
                                  "predicted_effect": predicted_effect or "address the diagnosed issue"}
+    check = await _auto_validate_and_mesh(state)
+    if check.get("status") == "REJECTED":
+        return check
     return {"status": "OK", "change_applied": change_desc, "diff": _diff_params(old_params, new_params),
-            "message": "Geometry rebuilt from updated parameters. Call validate_geometry, then run_mesh, "
-                       "then run_fea to test this change."}
+            "validated": True, "meshed": True, "face_count": check.get("face_count"),
+            "message": "Geometry rebuilt, validated, and meshed successfully. Call run_fea to test this change."}
 
 
-def _rebuild_bracket(state, new_params, change_desc, reason, predicted_effect=None):
+async def _rebuild_bracket(state, new_params, change_desc, reason, predicted_effect=None):
     ok, err = _bracket_param_contract(new_params, state.material)
     if not ok:
         return err
@@ -4835,9 +4961,12 @@ def _rebuild_bracket(state, new_params, change_desc, reason, predicted_effect=No
     gc.collect()
     state.pending_hypothesis = {"change": change_desc, "reason": reason,
                                  "predicted_effect": predicted_effect or "address the diagnosed issue"}
+    check = await _auto_validate_and_mesh(state)
+    if check.get("status") == "REJECTED":
+        return check
     return {"status": "OK", "change_applied": change_desc, "diff": _diff_params(old_params, new_params),
-            "message": "Geometry rebuilt from updated parameters. Call validate_geometry, then run_mesh, "
-                       "then run_fea to test this change."}
+            "validated": True, "meshed": True, "face_count": check.get("face_count"),
+            "message": "Geometry rebuilt, validated, and meshed successfully. Call run_fea to test this change."}
 
 
 async def _agent_generic_script_modification(state, feature_description, reason, predicted_effect=None):
@@ -4875,10 +5004,13 @@ async def _agent_generic_script_modification(state, feature_description, reason,
     state.obj = obj; state.mesh = None; state.stl_bytes = None
     state.pending_hypothesis = {"change": f"generic_script_modification: {feature_description}", "reason": reason,
                                  "predicted_effect": predicted_effect or "address the described issue"}
-    return {"status": "OK", "crossed_over_to_generic_script": crossed_over,
-            "message": "Script modified and executed successfully via the AI-assisted generic path (this "
-                       "design is no longer tracked by discrete numeric parameters). Call validate_geometry, "
-                       "run_mesh, then run_fea."}
+    check = await _auto_validate_and_mesh(state)
+    if check.get("status") == "REJECTED":
+        return check
+    return {"status": "OK", "crossed_over_to_generic_script": crossed_over, "validated": True, "meshed": True,
+            "face_count": check.get("face_count"),
+            "message": "Script modified, validated, and meshed successfully via the AI-assisted generic path "
+                       "(this design is no longer tracked by discrete numeric parameters). Call run_fea next."}
 
 
 # ----------------------------------------------------------------------
@@ -4888,7 +5020,8 @@ async def _agent_generic_script_modification(state, feature_description, reason,
 def _require_mesh(state):
     if state.mesh is None:
         return {"status": "NOT_AVAILABLE",
-                "message": "No meshed/validated geometry yet. Call validate_geometry then run_mesh first."}
+                "message": "No meshed/validated geometry yet. Call set_initial_design (or a modify_*/add_hole "
+                           "tool) first — it validates and meshes automatically."}
     return None
 
 
@@ -5117,7 +5250,7 @@ async def _tool_set_initial_design(state, design_type, reason="",
                                     holes_base=None, holes_tip=None,
                                     leg1_length=None, leg2_length=None, width=None, thickness=None,
                                     bend_angle_deg=90.0, holes_leg1=None, holes_leg2=None):
-    if state.obj is not None:
+    if state.mesh is not None:
         return {"status": "REJECTED", "reason": "Initial design has already been set for this session. "
                 "Use modify_parameter/modify_feature/add_hole to change the existing design instead."}
     if design_type == "tapered_beam":
@@ -5168,8 +5301,12 @@ async def _tool_set_initial_design(state, design_type, reason="",
     else:
         return {"status": "REJECTED",
                 "reason": f"Unknown design_type '{design_type}'. Must be tapered_beam, bent_bracket, or generic_script."}
+    check = await _auto_validate_and_mesh(state)
+    if check.get("status") == "REJECTED":
+        return check
     return {"status": "OK", "design_type": state.design_type, "params": state.params,
-            "message": "Initial geometry constructed. Call validate_geometry, then run_mesh, then run_fea next."}
+            "validated": True, "meshed": True, "face_count": check.get("face_count"),
+            "message": "Initial geometry constructed, validated, and meshed successfully. Call run_fea next."}
 
 
 async def _tool_modify_parameter(state, parameter, change_percent=None, new_value=None, region=None,
@@ -5193,7 +5330,7 @@ async def _tool_modify_parameter(state, parameter, change_percent=None, new_valu
             new_params[f] = (round(float(new_value), 4) if (new_value is not None and len(fields) == 1)
                               else round(cur * (1 + (change_percent or 0) / 100.0), 4))
         desc = f"modify_parameter({parameter}" + (f",region={region}" if region else "") + ")"
-        return _rebuild_beam(state, new_params, desc, reason, predicted_effect)
+        return await _rebuild_beam(state, new_params, desc, reason, predicted_effect)
 
     elif state.design_type == "bent_bracket":
         fields = _resolve_bracket_parameter(parameter, region)
@@ -5207,7 +5344,7 @@ async def _tool_modify_parameter(state, parameter, change_percent=None, new_valu
             new_params[f] = (round(float(new_value), 4) if (new_value is not None and len(fields) == 1)
                               else round(cur * (1 + (change_percent or 0) / 100.0), 4))
         desc = f"modify_parameter({parameter}" + (f",region={region}" if region else "") + ")"
-        return _rebuild_bracket(state, new_params, desc, reason, predicted_effect)
+        return await _rebuild_bracket(state, new_params, desc, reason, predicted_effect)
 
     else:
         desc = (f"Adjust the parameter '{parameter}'" + (f" near {region}" if region else "")
@@ -5231,7 +5368,7 @@ async def _tool_modify_fillet(state, change_percent=None, new_value=None, region
     return await _tool_modify_parameter(state, "fillet_radius", change_percent, new_value, region, reason, predicted_effect)
 
 
-def _tool_modify_taper(state, change_percent, reason="", predicted_effect=None):
+async def _tool_modify_taper(state, change_percent, reason="", predicted_effect=None):
     if state.design_type != "tapered_beam":
         return {"status": "NOT_APPLICABLE", "reason": "modify_taper only applies to a tapered_beam design_type."}
     if not reason:
@@ -5239,7 +5376,7 @@ def _tool_modify_taper(state, change_percent, reason="", predicted_effect=None):
     new_params = _copy_params(state.params)
     new_params["tip_width"] = round(new_params["tip_width"] * (1 + change_percent / 100.0), 4)
     new_params["tip_thick"] = round(new_params["tip_thick"] * (1 + change_percent / 100.0), 4)
-    return _rebuild_beam(state, new_params, f"modify_taper({change_percent}%)", reason, predicted_effect)
+    return await _rebuild_beam(state, new_params, f"modify_taper({change_percent}%)", reason, predicted_effect)
 
 
 async def _tool_add_hole(state, x_mm, y_mm, diameter_mm, end=None, leg=None, reason="", predicted_effect=None):
@@ -5256,7 +5393,7 @@ async def _tool_add_hole(state, x_mm, y_mm, diameter_mm, end=None, leg=None, rea
         new_params = _copy_params(state.params)
         key = "holes_base" if end == "base" else "holes_tip"
         new_params[key] = list(new_params[key]) + [(x_mm, y_mm, diameter_mm)]
-        return _rebuild_beam(state, new_params, f"add_hole(end={end})", reason, predicted_effect)
+        return await _rebuild_beam(state, new_params, f"add_hole(end={end})", reason, predicted_effect)
     elif state.design_type == "bent_bracket":
         if leg not in ("leg1", "leg2"):
             return {"status": "REJECTED", "reason": "For a bent_bracket, 'leg' must be 'leg1' or 'leg2'."}
@@ -5268,7 +5405,7 @@ async def _tool_add_hole(state, x_mm, y_mm, diameter_mm, end=None, leg=None, rea
         new_params = _copy_params(state.params)
         key = "holes_leg1" if leg == "leg1" else "holes_leg2"
         new_params[key] = list(new_params[key]) + [(x_mm, y_mm, diameter_mm)]
-        return _rebuild_bracket(state, new_params, f"add_hole(leg={leg})", reason, predicted_effect)
+        return await _rebuild_bracket(state, new_params, f"add_hole(leg={leg})", reason, predicted_effect)
     else:
         desc = f"Add a through hole of diameter {diameter_mm}mm at approximately (x={x_mm}, y={y_mm}) in the relevant local face frame."
         return await _agent_generic_script_modification(state, desc, reason, predicted_effect)
@@ -5297,61 +5434,18 @@ async def _tool_modify_chamfer(state, description, reason="", predicted_effect=N
 # Tool implementations — validate / mesh / simulate / compare / finalize
 # ----------------------------------------------------------------------
 
-async def _tool_validate_geometry(state):
-    if state.obj is None:
-        return {"status": "REJECTED", "reason": "No geometry has been built yet. Call set_initial_design first."}
-    brep_ok = True; brep_note = None
-    try:
-        val = state.obj.val()
-        if hasattr(val, "isValid"):
-            brep_ok = bool(val.isValid())
-            if not brep_ok:
-                brep_note = "OpenCASCADE's BRepCheck_Analyzer flagged this shape as an invalid B-rep."
-    except Exception as e:
-        brep_note = f"Could not run the B-rep validity check ({type(e).__name__}: {e}); proceeding to mesh export."
-    if not brep_ok:
-        reverted = _revert_to_last_known_good(state)
-        return {"status": "REJECTED", "valid_brep": False, "reason": brep_note, "reverted": reverted,
-                "current_params": state.params}
-    return {"status": "OK", "valid_brep": True, "note": brep_note or "B-rep structurally valid.",
-            "message": "Proceed to run_mesh next."}
-
-
-async def _tool_run_mesh(state):
-    if state.obj is None:
-        return {"status": "REJECTED", "reason": "No geometry has been built yet. Call set_initial_design first."}
-    try:
-        mesh, stl_bytes = await mesh_from_cq_object(state.obj)
-    except Exception as e:
-        reverted = _revert_to_last_known_good(state)
-        return {"status": "REJECTED", "reason": f"STL export/mesh load failed: {type(e).__name__}: {e}",
-                "reverted": reverted, "current_params": state.params}
-    is_wt = bool(mesh.is_watertight); is_wind = bool(getattr(mesh, "is_winding_consistent", True))
-    if not is_wt or not is_wind:
-        defect_locs = _find_watertight_defect_locations(mesh)
-        reverted = _revert_to_last_known_good(state)
-        return {"status": "REJECTED", "watertight": is_wt, "manifold": is_wind, "defect_locations": defect_locs,
-                "reason": "Meshed geometry is non-manifold/non-watertight — rejected per monotonic refinement protection.",
-                "reverted": reverted, "current_params": state.params}
-    state.mesh = mesh; state.stl_bytes = stl_bytes
-    gc.collect()
-    if state.best_valid_design is None:
-        # Nothing valid recorded yet at all — record a placeholder (score -1, always
-        # superseded by any real post-FEA snapshot) purely so there's SOMETHING to
-        # revert to if a later candidate crashes before ever completing run_fea.
-        state.best_valid_design = {"design_type": state.design_type, "params": _copy_params(state.params),
-                                    "script": state.script, "health_score": -1, "passed": False,
-                                    "safety_factor": None, "max_von_mises_mpa": None, "mass_g": None,
-                                    "is_watertight": True, "violations": None, "reasons": [],
-                                    "iteration": state.iteration_count}
-    return {"status": "OK", "watertight": True, "manifold": True,
-            "face_count": int(len(mesh.faces)), "vertex_count": int(len(mesh.vertices)),
-            "message": "Mesh is valid. Call run_fea next for the authoritative engineering verdict."}
-
+# ----------------------------------------------------------------------
+# NOTE: validate_geometry and run_mesh used to be standalone tools here. They're
+# now folded automatically into every set_initial_design/modify_*/add_hole/
+# generic-script call via _auto_validate_and_mesh (see above) — cuts 2 of the 4
+# model round-trips a design iteration used to need. See that function for the
+# actual logic; kept here as a single reference point rather than duplicated.
 
 async def _tool_run_fea(state, force_n=None, force_dir=None):
     if state.mesh is None:
-        return {"status": "ERROR", "message": "No validated mesh available. Call validate_geometry and run_mesh first."}
+        return {"status": "ERROR", "message": "No validated mesh available yet. Call set_initial_design "
+                                                "(or a modify_*/add_hole tool) first — it validates and "
+                                                "meshes automatically."}
     if state.iteration_count >= state.max_iterations:
         return {"status": "ITERATION_LIMIT_REACHED",
                 "message": f"The configured max_iterations ({state.max_iterations}) analysis runs have "
@@ -5489,8 +5583,8 @@ AGENT_TOOL_HANDLERS = {
     "add_rib": _tool_add_rib,
     "add_gusset": _tool_add_gusset,
     "modify_chamfer": _tool_modify_chamfer,
-    "validate_geometry": _tool_validate_geometry,
-    "run_mesh": _tool_run_mesh,
+    # (validate_geometry and run_mesh were removed as standalone tools — folded
+    # into _auto_validate_and_mesh, called automatically by every build/modify tool)
     "run_fea": _tool_run_fea,
     "run_fatigue": _tool_run_fatigue,
     "compare_designs": _tool_compare_designs,
@@ -5553,7 +5647,8 @@ ENGINEERING_AGENT_TOOLS = [
 
     {"name": "inspect_geometry", "description": "Structured summary of the current meshed geometry: "
         "solid/watertight/manifold flags, bounding box, volume, detected features, hole count, minimum "
-        "wall thickness. Call validate_geometry then run_mesh first.",
+        "wall thickness. Geometry is validated and meshed automatically by set_initial_design/modify_* — "
+        "call one of those first if this comes back NOT_AVAILABLE.",
      "parameters": {"type": "object", "properties": {}}},
     {"name": "measure_geometry", "description": "Bounding box, volume, surface area, and full "
         "wall-thickness distribution of the current meshed geometry.",
@@ -5684,14 +5779,6 @@ ENGINEERING_AGENT_TOOLS = [
          "description": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
      }, "required": ["description", "reason"]}},
 
-    {"name": "validate_geometry", "description": "B-rep-level validity check of the current CAD object, "
-        "BEFORE meshing. Call right after set_initial_design or any modify_*/add_hole/create_feature call. "
-        "On failure, the system automatically reverts to the last known-good design.",
-     "parameters": {"type": "object", "properties": {}}},
-    {"name": "run_mesh", "description": "Export the current (validated) CAD object to a mesh and confirm "
-        "it is watertight/manifold. Call after validate_geometry, before run_fea. On failure, the system "
-        "automatically reverts to the last known-good design.",
-     "parameters": {"type": "object", "properties": {}}},
     {"name": "run_fea", "description": "THE authoritative engineering check: full FEA (real CalculiX where "
         "configured, analytical fallback otherwise) plus fatigue and the rule engine, on the current meshed "
         "design. Consumes one iteration of your budget. Returns the same shape as diagnose_failure.",
@@ -5720,17 +5807,18 @@ ENGINEERING_AGENT_TOOLS = [
 ENGINEERING_AGENT_SYSTEM_PROMPT = """You are the Lumexa Engineering Agent — a mechanical design reasoning layer sitting on top of Lumexa's deterministic CAD/FEA systems. You are NOT a CAD kernel and you do NOT do freehand geometry math yourself. Every geometric fact you know comes from calling a tool; every geometric change you make happens by calling a tool. Lumexa's solvers (real FEA where configured, analytical fallback otherwise) are the sole source of truth for whether a design passes — you never declare PASS/FAIL yourself, you read it from run_fea's/diagnose_failure's output.
 
 WORKFLOW (follow this shape; you may repeat steps as needed):
-Understand -> Inspect -> Diagnose -> Propose -> Modify -> Verify -> Simulate -> Compare -> Refine
+Understand -> Inspect -> Diagnose -> Propose -> Modify (auto-verified) -> Simulate -> Compare -> Refine
 
 1. UNDERSTAND: read the engineering request. Call set_initial_design with your best translation of it into concrete parameters for whichever primitive fits (tapered_beam or bent_bracket), or generic_script if neither fits. Before proposing a change on later iterations, silently answer for yourself: what is being built, its engineering purpose, its important geometric features, the loads/constraints on it, what is currently failing and where, what design variable could influence that failure, what change you will attempt, why it should help, and what must NOT change.
-2. INSPECT: after building or modifying geometry, call validate_geometry then run_mesh before trusting any other inspection tool — inspect_geometry/measure_geometry/find_holes/check_watertight/etc. all need a meshed design and will tell you so if you call them too early.
+2. INSPECT: set_initial_design and every modify_*/add_hole/create_feature call automatically validate the B-rep and mesh it for you as part of that same call (status OK means it's already meshed and ready) — you do NOT need to call separate validate/mesh steps. If a build/modify call comes back REJECTED for a geometry reason, the system has already reverted to the last known-good design for you. Once meshed, inspect_geometry/measure_geometry/find_holes/check_watertight/etc. are available for closer inspection if you want it, but are optional, read-only, and don't cost you an iteration.
 3. DIAGNOSE: call run_fea (this also runs fatigue/rule-engine checks) and read diagnose_failure/find_problem_regions for WHERE and WHY it is failing. Trust these numbers completely — never override or second-guess a solver result. Exception: if failure_modes leads with "SOLVER OUTPUT NUMERICALLY SUSPECT", the solver itself flagged that iteration's stress/deflection numbers as an implausible artifact (not a real structural finding) — don't treat it as a confirmed FAIL or try to "fix" it with a large parameter change; a small, unrelated tweak and re-running run_fea is enough to get past a one-off slicing artifact.
 4. PROPOSE + MODIFY: pick ONE targeted, physically-justified change at a time (modify_parameter and its shortcuts modify_thickness/length/width/height/fillet/taper, add_hole, or for anything the built-in primitives can't express, modify_feature/create_feature/remove_feature/add_rib/add_gusset/modify_chamfer). Every modify call requires a `reason` — the engineering justification — and should include a `predicted_effect` — what you expect to happen. Do not rewrite the whole design when one parameter needs changing. Do not fix one flagged issue by weakening something that was already fine elsewhere.
-5. VERIFY + SIMULATE: after every modification, validate_geometry -> run_mesh -> run_fea again. If a change is rejected (bad parameters, or the resulting geometry is non-manifold/non-watertight), you will be told so explicitly and the system automatically preserves the best known-valid design — just try a different, smaller, or better-justified change next.
+5. SIMULATE: call run_fea right after each modify call (it's already validated/meshed by step 4 — no separate verify step needed). If a change was rejected instead (bad parameters, or the resulting geometry came back non-manifold/non-watertight), you were told so explicitly and the system already reverted to the best known-valid design — just try a different, smaller, or better-justified change next.
 6. COMPARE + REFINE: call compare_designs to see whether your last change actually helped versus the previous iteration (or the best-so-far). Never assume a change worked — check.
 7. When the design passes the quality gate, or you have used your iteration budget, or you are confident further iteration will not help, call finalize_design with your honest verdict and a short summary. The system will independently re-verify the final numbers regardless of what you report here — this call only records your reasoning, it never overrides the solver's own verdict.
 
 RULES:
+- You have a limited number of model calls available for this run — every call you make (including read-only inspection) counts against it, so don't waste calls on redundant inspection once a design is already meshed; go straight to run_fea unless you have a specific reason to inspect first.
 - Never claim a design passed or failed — only report what run_fea/diagnose_failure told you.
 - Always give a `reason` on every modification.
 - One targeted change per modify call. If you're unsure which parameter to change, call diagnose_failure/find_problem_regions/calculate_properties first rather than guessing.
@@ -5793,6 +5881,8 @@ def _provider_tool_endpoint():
         return OPENROUTER_API_URL, OPENROUTER_API_KEY, OPENROUTER_MODEL
     if AI_PROVIDER == "lovable":
         return LOVABLE_AI_URL, LOVABLE_API_KEY, LOVABLE_AI_MODEL
+    if AI_PROVIDER == "cerebras":
+        return CEREBRAS_API_URL, CEREBRAS_API_KEY, CEREBRAS_MODEL
     return None, None, None
 
 
@@ -5801,11 +5891,10 @@ def _call_model_with_tools(messages, temperature=0.2, max_tokens=AGENT_TURN_MAX_
     if url is None:
         raise HTTPException(501,
             "The Engineering Agent's tool-calling loop is currently implemented for OpenAI-compatible "
-            "providers only (groq, openrouter, lovable) — Groq's openai/gpt-oss-120b is the configuration "
-            f"this was built and is meant to be tested against. Current AI_PROVIDER is '{AI_PROVIDER}'. Set "
-            "AI_PROVIDER=groq (and GROQ_API_KEY) to use this endpoint; Claude/Gemini native tool-calling for "
-            "this specific agent loop is not wired up yet — /generate-validate-refine still works on every "
-            "provider as before.")
+            "providers only (groq, openrouter, lovable, cerebras). Current AI_PROVIDER is "
+            f"'{AI_PROVIDER}'. Set AI_PROVIDER to one of those (plus its matching API key) to use this "
+            "endpoint; Claude/Gemini native tool-calling for this specific agent loop is not wired up "
+            "yet — /generate-validate-refine still works on every provider as before.")
     if not key:
         raise HTTPException(500, f"{AI_PROVIDER.upper()}_API_KEY is not configured on the server.")
 
