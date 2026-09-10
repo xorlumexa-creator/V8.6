@@ -2027,18 +2027,41 @@ def wall_thickness_v8(mesh, n_base=8000, n_targeted=4000):
             all_norms=np.vstack([normals1,normals2])
         else:
             all_pts=pts1;all_norms=normals1
+        # FIX: mesh.ray.intersects_location() needs an rtree-based spatial index
+        # under the hood — confirmed live across many real runs on this deployment
+        # ("No module named 'rtree'" despite it being listed in requirements.txt).
+        # Rather than keep gambling on a system/build fix for a package outside
+        # our control, estimate thickness via a directional nearest-neighbor
+        # search over the same sample cloud instead of true ray-surface
+        # intersection. Needs only scipy (already a hard dependency here), and
+        # is actually cheaper per-point than ray casting was. Coarser than true
+        # ray casting — limited by sample density rather than exact geometry —
+        # but most sensitive exactly where it matters most: two sample points
+        # from opposite faces of a genuinely THIN wall are likely to land among
+        # each other's nearest neighbors precisely because the wall is thin, so
+        # min_mm/critical_zones (what the rule engine actually acts on) degrade
+        # gracefully; mean_mm/max_mm on thick sections are the least-accurate
+        # part of this estimate. "A working coarse estimate" beats "unavailable".
+        from scipy.spatial import cKDTree
+        tree = cKDTree(all_pts)
+        K = min(40, len(all_pts))
+        all_dists, all_idxs = tree.query(all_pts, k=K)
+
         all_t=[];thin=[];crit=[]
         for i in range(len(all_pts)):
             pt=all_pts[i];n=all_norms[i]
-            locs,_,_=mesh.ray.intersects_location(
-                ray_origins=[pt+n*0.02],ray_directions=[-n])
-            if len(locs):
-                dists=np.linalg.norm(locs-pt,axis=1);dists=dists[dists>0.02]
-                if len(dists):
-                    t=float(np.min(dists));all_t.append(t)
-                    pos={"x":round(float(pt[0]),2),"y":round(float(pt[1]),2),"z":round(float(pt[2]),2)}
-                    if t<1.0: crit.append({"thickness_mm":round(t,3),"position":pos,"severity":"CRITICAL"})
-                    elif t<2.0: thin.append({"thickness_mm":round(t,3),"position":pos,"severity":"WARNING"})
+            best=None
+            for d,j in zip(all_dists[i],all_idxs[i]):
+                if j==i or d<0.02:
+                    continue
+                direction=(all_pts[j]-pt)/d
+                if np.dot(direction,n) < -0.4:  # roughly opposite-facing (>~114deg from outward normal)
+                    best = d if best is None else min(best,d)
+            if best is not None:
+                t=float(best);all_t.append(t)
+                pos={"x":round(float(pt[0]),2),"y":round(float(pt[1]),2),"z":round(float(pt[2]),2)}
+                if t<1.0: crit.append({"thickness_mm":round(t,3),"position":pos,"severity":"CRITICAL"})
+                elif t<2.0: thin.append({"thickness_mm":round(t,3),"position":pos,"severity":"WARNING"})
         if not all_t:
             fb=float(min(mesh.bounding_box.extents))*0.12
             return {"min_mm":round(fb,3),"mean_mm":round(fb*2,3),"thin_2mm_pct":0.0,
@@ -2057,7 +2080,7 @@ def wall_thickness_v8(mesh, n_base=8000, n_targeted=4000):
                 "thin_2mm_pct":round(float(np.sum(arr<2.0)/len(arr)*100),1),
                 "thin_1mm_pct":round(float(np.sum(arr<1.0)/len(arr)*100),1),
                 "thin_zones":dedup(thin),"critical_zones":dedup(crit,1.0),
-                "method":"dual_pass_v8","samples_used":len(all_t)}
+                "method":"dual_pass_v8_kdtree","samples_used":len(all_t)}
     except Exception as e:
         return {"error":str(e),"min_mm":None,"thin_zones":[],"critical_zones":[]}
 
