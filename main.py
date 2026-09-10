@@ -2055,7 +2055,21 @@ def wall_thickness_v8(mesh, n_base=8000, n_targeted=4000):
                 if j==i or d<0.02:
                     continue
                 direction=(all_pts[j]-pt)/d
-                if np.dot(direction,n) < -0.4:  # roughly opposite-facing (>~114deg from outward normal)
+                # FIX: confirmed live — the direction-only check above fires near
+                # end-caps/corners, where a point on one face can have a VERY
+                # close neighbor on a DIFFERENT, roughly-PERPENDICULAR adjacent
+                # face (e.g. a side wall right next to the end cap at the base/
+                # tip of a beam). That neighbor's direction can look "roughly
+                # backward" from the query point's normal even though it isn't
+                # the opposite wall at all — this reported a beam's actual
+                # 6-10mm-thick section as 0.02mm at exactly the two ends
+                # (z near 0 and z near length), which is a corner artifact, not
+                # a real thin wall. A genuine thin wall means the CANDIDATE's
+                # own surface also faces roughly the opposite way — an adjacent
+                # perpendicular face's normal does not — so require both the
+                # direction-to-candidate AND the candidate's own normal to be
+                # roughly antiparallel to this point's normal before accepting it.
+                if np.dot(direction,n) < -0.4 and np.dot(all_norms[j],n) < -0.6:
                     best = d if best is None else min(best,d)
             if best is not None:
                 t=float(best);all_t.append(t)
@@ -6097,21 +6111,28 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
         raise HTTPException(502, "The Engineering Agent never produced a valid, analyzable design. "
                                   f"Tool trace: {json.dumps(_json_safe(tool_trace))[:1500]}")
 
-    if winner is not state.current_candidate or state.mesh is None:
-        try:
-            if winner["design_type"] == "tapered_beam":
-                final_obj = make_tapered_beam(**winner["params"])
-            elif winner["design_type"] == "bent_bracket":
-                final_obj = make_bent_bracket(**winner["params"])
-            else:
-                final_obj, build_err = execute_cq_script_safely(winner["script"])
-                if build_err:
-                    raise RuntimeError(build_err)
-            final_mesh, final_stl = await mesh_from_cq_object(final_obj)
-        except Exception as e:
-            raise HTTPException(502, f"Failed to rebuild the winning design for final export: {e}")
-    else:
-        final_mesh, final_stl = state.mesh, state.stl_bytes
+    # FIX: confirmed live — the old "reuse state.mesh if winner is state.current_candidate"
+    # shortcut assumed state.mesh always reflects whatever design `winner` points to. It
+    # doesn't: a modify_* call can succeed (updating state.obj/state.mesh) and then the loop
+    # can get cut off (rate-limited, wall-clock budget) BEFORE run_fea ever confirms that
+    # change with a new snapshot. When that happens, `winner` still correctly points at the
+    # last CONFIRMED snapshot, but state.mesh had already moved on to the unconfirmed next
+    # candidate — so the response reported one set of parameters while actually returning the
+    # analysis/STL of a different, later, never-verified geometry. Rebuilding deterministically
+    # from winner's own stored params every time is cheap for these primitives and makes this
+    # class of mismatch impossible rather than merely unlikely.
+    try:
+        if winner["design_type"] == "tapered_beam":
+            final_obj = make_tapered_beam(**winner["params"])
+        elif winner["design_type"] == "bent_bracket":
+            final_obj = make_bent_bracket(**winner["params"])
+        else:
+            final_obj, build_err = execute_cq_script_safely(winner["script"])
+            if build_err:
+                raise RuntimeError(build_err)
+        final_mesh, final_stl = await mesh_from_cq_object(final_obj)
+    except Exception as e:
+        raise HTTPException(502, f"Failed to rebuild the winning design for final export: {e}")
 
     final_result = await run_analysis_v8(final_mesh, prompt, prompt, material, force_n, force_dir,
                                           operating_temp_c, project_description, surface_finish,
