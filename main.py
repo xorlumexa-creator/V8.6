@@ -1098,6 +1098,54 @@ CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
 CEREBRAS_API_URL = "https://api.cerebras.ai/v1/chat/completions"
 CEREBRAS_MODEL = os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b")
 
+# NVIDIA NIM (build.nvidia.com) — OpenAI-compatible, one endpoint/key serves every
+# model in NVIDIA's catalog (Nemotron, Kimi K2/K3, DeepSeek V4, and 90+ others) —
+# just change NVIDIA_MODEL to switch models, no code change needed. Confirmed via
+# NVIDIA's own catalog page (build.nvidia.com/models) as of this writing:
+#   nvidia/nemotron-3-ultra-550b-a55b     (verify it shows a live Playground/API
+#                                          tab, not just downloadable weights)
+#   moonshotai/kimi-k3                    (confirmed live free endpoint)
+#   deepseek-ai/deepseek-v4-pro-0813      (confirmed live — NOT the bare
+#                                          "deepseek-v4-pro", that ID is deprecated)
+#   deepseek-ai/deepseek-v4-flash-0731    (confirmed live free endpoint)
+# Free-tier limits aren't published as a fixed table (same situation as every
+# other free provider in this file) and are shared account-wide across whichever
+# of the above models you call — check your own account's actual limits rather
+# than assume headroom.
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
+NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+
+# Optional "strategic advisor" second model for the Engineering Agent — called
+# SPARINGLY (once up front, then once per FAILED run_fea — not per tool call)
+# for the high-level "understand this / why did it fail / what's the smallest
+# valid fix" reasoning, while GPT-OSS-120B (via whichever AI_PROVIDER is
+# configured) keeps driving the actual tool-calling loop as it already does.
+# Reuses OpenRouter's existing endpoint/key — it's the same account either
+# way, just a different model string — so no new API key is needed if
+# OPENROUTER_API_KEY is already set.
+#
+# Rate-limit math behind why this is SPARING rather than per-step, confirmed
+# against each provider's own published limits: Groq's gpt-oss-120b gets its
+# own 1,000 requests/day (per-model, per-org — not shared with anything else),
+# while OpenRouter's free ":free" models share ONE 50-requests/day pool
+# ACROSS EVERY free model called from that account (rising to 1,000/day only
+# after a $10 lifetime credit purchase). Calling the advisor on every tool
+# call would blow through that shared 50/day budget in a single run; calling
+# it 2-4 times per run keeps a full day's testing comfortably inside it.
+#
+# Leave this blank to disable the advisor entirely — the agent then behaves
+# exactly as it did before this was added (GPT-OSS-120B alone, unchanged).
+#
+# IMPORTANT — verify this exact model string yourself before relying on it:
+# sources disagree on whether "Nemotron 3 Ultra" (550B/55B active) specifically
+# has a free tier on OpenRouter, versus the smaller "Nemotron 3 Super" (120B/
+# 12B active) definitely having one. Check openrouter.ai/models yourself and
+# use whichever one actually shows a live ":free" tag — a wrong model string
+# here just makes the advisor calls fail silently (see _call_advisor below),
+# so the main loop keeps working either way, but you won't get the benefit.
+NEMOTRON_ADVISOR_MODEL = os.environ.get("NEMOTRON_ADVISOR_MODEL", "")
+
 
 # Groq — OpenAI-compatible, custom LPU hardware, genuinely stable free tier
 # (unlike OpenRouter's free roster, which churned THREE times in one night on
@@ -1138,6 +1186,7 @@ AI_PROVIDER = os.environ.get(
     "AI_PROVIDER",
     "claude" if os.environ.get("ANTHROPIC_API_KEY")
     else "gemini" if os.environ.get("GOOGLE_API_KEY")
+    else "nvidia" if os.environ.get("NVIDIA_API_KEY")
     else "groq" if os.environ.get("GROQ_API_KEY")
     else "cerebras" if os.environ.get("CEREBRAS_API_KEY")
     else "openrouter" if os.environ.get("OPENROUTER_API_KEY")
@@ -1245,6 +1294,56 @@ def _cerebras_request(messages, temperature=0.15, max_tokens=3000, model=None):
 
     if not content or not isinstance(content, str):
         raise HTTPException(502, f"Cerebras returned empty/null content. "
+                                  f"Raw response: {json.dumps(data)[:500]}")
+    return content
+
+
+def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None):
+    """Low-level call to NVIDIA's NIM catalog (build.nvidia.com, OpenAI-compatible
+    chat completions) — identical shape to _groq_request/_cerebras_request,
+    different base URL/key. `model` (or NVIDIA_MODEL) picks which of NVIDIA's
+    90+ catalog models actually answers this call — Nemotron, Kimi K3, DeepSeek
+    V4, etc. all go through this exact same function."""
+    import urllib.request, urllib.error
+
+    if not NVIDIA_API_KEY:
+        raise HTTPException(500, "NVIDIA_API_KEY is not configured on the server. "
+                                   "Set it as a secret/env var in your deployment.")
+
+    payload = json.dumps({
+        "model": model or NVIDIA_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }).encode()
+
+    req = urllib.request.Request(
+        NVIDIA_API_URL, data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {NVIDIA_API_KEY}",
+            "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
+            "Accept": "application/json",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        if e.code == 429:
+            raise HTTPException(429, f"NVIDIA NIM rate limit exceeded: {body}")
+        raise HTTPException(502, f"NVIDIA NIM error ({e.code}): {body}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"NVIDIA NIM connection error: {str(e)}")
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(502, f"Unexpected NVIDIA NIM response shape: {json.dumps(data)[:500]}")
+
+    if not content or not isinstance(content, str):
+        raise HTTPException(502, f"NVIDIA NIM returned empty/null content. "
                                   f"Raw response: {json.dumps(data)[:500]}")
     return content
 
@@ -1610,6 +1709,12 @@ async def gemini_generate_script(prompt: str, previous_script: Optional[str] = N
     elif AI_PROVIDER == "cerebras":
         text = await asyncio.to_thread(
             _cerebras_request,
+            [{"role": "system", "content": system_prompt}] + turns,
+            temperature=0.15, max_tokens=GEN_MAX_TOKENS
+        )
+    elif AI_PROVIDER == "nvidia":
+        text = await asyncio.to_thread(
+            _nvidia_request,
             [{"role": "system", "content": system_prompt}] + turns,
             temperature=0.15, max_tokens=GEN_MAX_TOKENS
         )
@@ -3213,11 +3318,23 @@ def summarize_analysis_for_refinement(result: dict, quality: dict) -> str:
     return "\n".join(lines)
 
 async def mesh_from_cq_object(obj):
-    """Export a CadQuery object to STL and load as a trimesh mesh. Returns (mesh, stl_bytes)."""
+    """Export a CadQuery object to STL and load as a trimesh mesh. Returns (mesh, stl_bytes).
+
+    FIX: this used to call cq.exporters.export(obj, tmp) with zero tessellation
+    control, which uses CadQuery/OCCT's default linear/angular deflection — an
+    ABSOLUTE distance tolerance, not scaled to the size of the feature being
+    tessellated. A 1.5-2mm fillet gets the same coarse triangulation budget as
+    a 200mm flat face under that default, which is a plausible real contributor
+    to the sliver triangles behind the Gmsh "invalid exterior boundary mesh"
+    and CalculiX "nonpositive jacobian" failures seen on every tapered-beam
+    test so far (on top of the Humphrey-smoothing mitigation already added on
+    the analysis_service side). Tightening this is the direct, low-risk lever
+    CadQuery already exposes for exactly this — no architectural change needed.
+    """
     with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as t:
         tmp = t.name
     try:
-        cq.exporters.export(obj, tmp)
+        cq.exporters.export(obj, tmp, tolerance=0.01, angularTolerance=0.05)
         mesh = trimesh.load(tmp)
         if hasattr(mesh, "geometry"):
             mesh = trimesh.util.concatenate(list(mesh.geometry.values()))
@@ -3270,15 +3387,26 @@ def home():
             "solid_tet_fem_available": bool(ANALYSIS_SERVICE_URL),
             "blender_available":BLENDER,
             "dxf_export_available": EZDXF,
-            "ai_generation_configured": bool(LOVABLE_API_KEY or ANTHROPIC_API_KEY or GOOGLE_API_KEY or GROQ_API_KEY or OPENROUTER_API_KEY),
+            "ai_generation_configured": bool(LOVABLE_API_KEY or ANTHROPIC_API_KEY or GOOGLE_API_KEY
+                                              or GROQ_API_KEY or CEREBRAS_API_KEY or NVIDIA_API_KEY
+                                              or OPENROUTER_API_KEY),
             "ai_provider": AI_PROVIDER,
             "ai_model": (CLAUDE_MODEL if AI_PROVIDER == "claude"
                          else GEMINI_MODEL if AI_PROVIDER == "gemini"
                          else GROQ_MODEL if AI_PROVIDER == "groq"
+                         else CEREBRAS_MODEL if AI_PROVIDER == "cerebras"
+                         else NVIDIA_MODEL if AI_PROVIDER == "nvidia"
                          else OPENROUTER_MODEL if AI_PROVIDER == "openrouter"
                          else LOVABLE_AI_MODEL),
-            "engineering_agent_configured": AI_PROVIDER in ("groq", "openrouter", "lovable")},
+            "engineering_agent_configured": AI_PROVIDER in ("groq", "openrouter", "lovable", "cerebras", "nvidia")},
         "new_in_v8_23":[
+            "Optional second-model 'strategic advisor' for the Engineering Agent: set "
+            "NEMOTRON_ADVISOR_MODEL (e.g. to a Nemotron/Kimi/DeepSeek model via OpenRouter, reusing "
+            "OPENROUTER_API_KEY) and it gets consulted sparingly — once up front for engineering "
+            "strategy, once per actual solver FAILURE for root-cause/smallest-fix guidance — while "
+            "GPT-OSS-120B keeps driving the actual tool-calling loop unchanged. Advisory only: its "
+            "input is added as context, never overrides a solver result, and any failure/misconfig "
+            "silently falls back to today's single-model behavior. Left blank, nothing changes.",
             "POST /engineering-agent  ★★ tool-calling reasoning agent: Understand -> "
             "Inspect -> Diagnose -> Propose -> Modify -> Simulate -> Compare -> "
             "Refine, instead of /generate-validate-refine's regenerate-the-whole-script "
@@ -3299,7 +3427,7 @@ def home():
             "Geometry outside those two primitives falls back to the existing AI "
             "script-generation/refinement path, still wrapped in the same verify loop. "
             "Requires AI_PROVIDER to be an OpenAI-compatible tool-calling provider "
-            "(groq/openrouter/lovable) — see engineering_agent_configured above.",
+            "(groq/openrouter/lovable/cerebras/nvidia) — see engineering_agent_configured above.",
         ],
         "new_in_v8_3":[
             "AI generation can now route through the direct Anthropic Claude API "
@@ -4472,10 +4600,11 @@ async def analyze_assembly(
 # parameter contract on that particular path.
 #
 # Tool-calling is currently implemented for OpenAI-compatible providers
-# (groq/openrouter/lovable — identical wire format) since that's this
-# deployment's configuration (GROQ_API_KEY + openai/gpt-oss-120b, confirmed
-# by Groq's own console to support "Function Calling / Tool Use" — see the
-# AI_PROVIDER setup comment above). Claude/Gemini native tool-calling for
+# (groq/openrouter/lovable/cerebras/nvidia — identical wire format). Nemotron 3
+# Ultra, Kimi K3, and DeepSeek V4 are all reachable via AI_PROVIDER=nvidia +
+# NVIDIA_MODEL (one endpoint/key, NVIDIA_MODEL just picks which of their 90+
+# catalog models actually answers — see the NVIDIA_API_KEY setup comment
+# above for confirmed-live model IDs). Claude/Gemini native tool-calling for
 # this specific endpoint is not wired up yet; every other endpoint is
 # unaffected and still works on any configured provider as before.
 # ══════════════════════════════════════════════════════════════════════════
@@ -4750,7 +4879,7 @@ def _revert_to_last_known_good(state):
         return False
 
 
-def _snapshot_current(state, quality, result):
+def _snapshot_current(state, quality, result, critical_region=None):
     fea = result.get("analytical_fea", {}) or {}
     return {
         "iteration": state.iteration_count,
@@ -4765,6 +4894,7 @@ def _snapshot_current(state, quality, result):
         "is_watertight": (result.get("geometry", {}) or {}).get("is_watertight"),
         "violations": (result.get("rule_engine", {}) or {}).get("total_violations"),
         "reasons": quality["reasons"],
+        "critical_region": critical_region,
     }
 
 
@@ -4775,6 +4905,69 @@ def _summarize_snapshot(snap):
             "health_score": snap.get("health_score"), "safety_factor": snap.get("safety_factor"),
             "max_von_mises_mpa": snap.get("max_von_mises_mpa"), "mass_g": snap.get("mass_g"),
             "is_watertight": snap.get("is_watertight"), "violations": snap.get("violations")}
+
+
+def _build_failure_region(result, state, crit, axis, pos_mm):
+    """
+    Turns the FEA critical section's 1D position into a proper spatial 'failure
+    object' — bbox, centroid, nearby features — instead of just a coarse
+    near_base/near_tip label. Built entirely from data already computed
+    elsewhere (state.params' known section geometry, plus zone data other
+    analysis functions already produced), not from a new CalculiX per-node
+    field readout or a new OCCT face-query capability — those are real,
+    separately-scoped pieces of work, most valuable once geometry has more
+    than two sections/features to disambiguate between. This is the honest,
+    buildable-today slice of that idea: precise where the data already
+    supports it, and says so plainly where it doesn't.
+    """
+    if state is None or state.design_type != "tapered_beam" or not state.params or axis != "z":
+        return None  # bent_bracket/generic_script: no known-geometry interpolation to build a bbox from yet
+
+    p = state.params
+    length = p.get("length") or 0
+    if length <= 0:
+        return None
+    frac = max(0.0, min(1.0, pos_mm / length))
+    width_at_z = p["base_width"] + (p["tip_width"] - p["base_width"]) * frac
+    thick_at_z = p["base_thick"] + (p["tip_thick"] - p["base_thick"]) * frac
+    band = max(length * 0.03, 2.0)  # a few-mm slice around the critical position, not a single point
+
+    nearby = []
+    fillet_r = p.get("fillet_radius") or 0
+    if fillet_r > 0 and pos_mm < band * 2:
+        nearby.append(f"root fillet (radius {fillet_r}mm)")
+    if pos_mm > length - band * 2 and fillet_r > 0:
+        nearby.append("tip transition")
+    for hx, hy, hd in (p.get("holes_base") or []):
+        if pos_mm < band * 3:
+            nearby.append(f"base hole (d={hd}mm at x={hx},y={hy})")
+    for hx, hy, hd in (p.get("holes_tip") or []):
+        if pos_mm > length - band * 3:
+            nearby.append(f"tip hole (d={hd}mm at x={hx},y={hy})")
+
+    # Cross-reference zones other analysis functions already computed (sharp
+    # corners, thin walls) that fall within this same Z band — same data
+    # find_problem_regions already surfaces, just correlated here by position.
+    for corner in (result.get("sharp_corner_analysis", {}) or {}).get("all_zones", []) or []:
+        cz = (corner.get("position") or {}).get("z")
+        if cz is not None and abs(cz - pos_mm) < band and corner.get("severity") in ("HIGH", "CRITICAL"):
+            nearby.append(f"sharp corner (Kf={corner.get('Kf')}) at z={round(cz,1)}mm")
+    for zone in (result.get("wall_thickness", {}) or {}).get("critical_zones", []) or []:
+        cz = (zone.get("position") or {}).get("z")
+        if cz is not None and abs(cz - pos_mm) < band:
+            nearby.append(f"thin section ({zone.get('thickness_mm')}mm) at z={round(cz,1)}mm")
+
+    return {
+        "bbox_mm": {"xmin": round(-width_at_z/2, 2), "xmax": round(width_at_z/2, 2),
+                    "ymin": round(-thick_at_z/2, 2), "ymax": round(thick_at_z/2, 2),
+                    "zmin": round(pos_mm - band, 2), "zmax": round(pos_mm + band, 2)},
+        "centroid_mm": [0.0, 0.0, round(pos_mm, 2)],
+        "nearby_features": nearby if nearby else ["no declared feature (hole/fillet) near this position"],
+        "note": "bbox interpolated from this iteration's known base/tip section geometry, not a "
+                "per-node CalculiX field readout — precise for this parametric shape, but won't "
+                "generalize to arbitrary geometry without extending the CalculiX result parser "
+                "to expose real per-node coordinates.",
+    }
 
 
 def build_engineering_diagnosis(result, state=None):
@@ -4833,6 +5026,7 @@ def build_engineering_diagnosis(result, state=None):
                           "deflection numbers as unreliable, not a confirmed structural failure"] + failure_modes
 
     critical_region = None
+    failure_region = None
     if crit.get("position_mm") is not None:
         axis = crit.get("axis", "z"); pos_mm = crit.get("position_mm")
         critical_region = f"{axis}-axis @ {pos_mm}mm"
@@ -4841,6 +5035,7 @@ def build_engineering_diagnosis(result, state=None):
             if length > 0:
                 frac = pos_mm / length
                 critical_region = "near_base_fixed_support" if frac < 0.5 else "near_tip_load_application"
+        failure_region = _build_failure_region(result, state, crit, axis, pos_mm)
     elif rules:
         crit_rules = [r for r in rules if r.get("severity") in ("CRITICAL", "HIGH") and r.get("position")]
         if crit_rules:
@@ -4851,6 +5046,7 @@ def build_engineering_diagnosis(result, state=None):
         "safety_factor": fea.get("safety_factor"),
         "max_von_mises_mpa": (fea.get("stress", {}) or {}).get("von_mises_mpa"),
         "critical_region": critical_region,
+        "failure_region": failure_region,
         "failure_modes": failure_modes if failure_modes else (["none detected"] if status == "PASS" else ["unspecified"]),
         "health_score": hs.get("score"),
         "fatigue_status": (result.get("fatigue_analysis", {}) or {}).get("status"),
@@ -5504,7 +5700,8 @@ async def _tool_run_fea(state, force_n=None, force_dir=None):
     quality = evaluate_design_quality(result, state.min_health_score, state.max_critical_violations,
                                        state.max_high_violations, state.min_safety_factor)
     state.last_quality = quality
-    snap = _snapshot_current(state, quality, result)
+    diagnosis = build_engineering_diagnosis(result, state)
+    snap = _snapshot_current(state, quality, result, critical_region=diagnosis.get("critical_region"))
     state.previous_design = state.current_candidate
     state.current_candidate = snap
     _update_best_valid(state, snap)
@@ -5515,15 +5712,22 @@ async def _tool_run_fea(state, force_n=None, force_dir=None):
         ph = state.pending_hypothesis
         prev_sf = (state.previous_design or {}).get("safety_factor")
         cur_sf = snap.get("safety_factor")
+        prev_region = (state.previous_design or {}).get("critical_region")
+        cur_region = snap.get("critical_region")
         if quality["passed"]:
             verdict = "PASSED"
         elif prev_sf is not None and cur_sf is not None:
             verdict = "IMPROVED" if cur_sf > prev_sf else "WORSE" if cur_sf < prev_sf else "UNCHANGED"
         else:
             verdict = "UNKNOWN"
+        improvement_pct = (round((cur_sf - prev_sf) / prev_sf * 100, 1)
+                            if (prev_sf not in (None, 0) and cur_sf is not None) else None)
         state.hypothesis_log.append({"iteration": state.iteration_count, "change": ph["change"],
                                       "reason": ph["reason"], "predicted_effect": ph["predicted_effect"],
                                       "safety_factor_before": prev_sf, "safety_factor_after": cur_sf,
+                                      "safety_factor_improvement_pct": improvement_pct,
+                                      "same_region_as_previous_failure": (
+                                          (prev_region == cur_region) if (prev_region and cur_region) else None),
                                       "health_score_after": snap["health_score"], "verdict": verdict})
         state.pending_hypothesis = None
     else:
@@ -5531,10 +5735,11 @@ async def _tool_run_fea(state, force_n=None, force_dir=None):
                                       "reason": "initial engineering interpretation of the request",
                                       "predicted_effect": None, "safety_factor_before": None,
                                       "safety_factor_after": snap.get("safety_factor"),
+                                      "safety_factor_improvement_pct": None,
+                                      "same_region_as_previous_failure": None,
                                       "health_score_after": snap["health_score"],
                                       "verdict": "PASSED" if quality["passed"] else "BASELINE"})
 
-    diagnosis = build_engineering_diagnosis(result, state)
     return {**diagnosis, "quality_gate_passed": quality["passed"], "quality_gate_reasons": quality["reasons"],
             "iterations_used": state.iteration_count, "max_iterations": state.max_iterations}
 
@@ -5864,9 +6069,9 @@ RULES:
 
 
 # ----------------------------------------------------------------------
-# Provider tool-calling transport (OpenAI-compatible: groq/openrouter/lovable
-# all share this exact wire shape). See the module docstring above this
-# section for why Claude/Gemini aren't wired up for this endpoint yet.
+# Provider tool-calling transport (OpenAI-compatible: groq/openrouter/lovable/
+# cerebras/nvidia all share this exact wire shape). See the module docstring
+# above this section for why Claude/Gemini aren't wired up for this endpoint yet.
 # ----------------------------------------------------------------------
 
 def _to_openai_tools(tool_specs):
@@ -5920,6 +6125,8 @@ def _provider_tool_endpoint():
         return LOVABLE_AI_URL, LOVABLE_API_KEY, LOVABLE_AI_MODEL
     if AI_PROVIDER == "cerebras":
         return CEREBRAS_API_URL, CEREBRAS_API_KEY, CEREBRAS_MODEL
+    if AI_PROVIDER == "nvidia":
+        return NVIDIA_API_URL, NVIDIA_API_KEY, NVIDIA_MODEL
     return None, None, None
 
 
@@ -5928,7 +6135,7 @@ def _call_model_with_tools(messages, temperature=0.2, max_tokens=AGENT_TURN_MAX_
     if url is None:
         raise HTTPException(501,
             "The Engineering Agent's tool-calling loop is currently implemented for OpenAI-compatible "
-            "providers only (groq, openrouter, lovable, cerebras). Current AI_PROVIDER is "
+            "providers only (groq, openrouter, lovable, cerebras, nvidia). Current AI_PROVIDER is "
             f"'{AI_PROVIDER}'. Set AI_PROVIDER to one of those (plus its matching API key) to use this "
             "endpoint; Claude/Gemini native tool-calling for this specific agent loop is not wired up "
             "yet — /generate-validate-refine still works on every provider as before.")
@@ -5963,6 +6170,107 @@ def _format_tool_result_message(tool_call_id, tool_name, result_dict):
 # ----------------------------------------------------------------------
 # Orchestration loop (spec sections 1, 9, 12)
 # ----------------------------------------------------------------------
+
+def _call_advisor(situation_text, max_tokens=800):
+    """The optional 'strategic advisor' second model (see NEMOTRON_ADVISOR_MODEL
+    above). Returns its text response, or None if the advisor isn't configured
+    or the call fails for any reason — a missing/broken advisor NEVER breaks
+    the main agent loop, it just means gpt-oss-120b reasons on its own like it
+    always has. This is advisory input only: it gets appended to the
+    conversation as context, never executes anything itself and never
+    overrides an actual solver result."""
+    if not NEMOTRON_ADVISOR_MODEL or not OPENROUTER_API_KEY:
+        return None
+    try:
+        return _openrouter_request(
+            [{"role": "system", "content":
+                "You are a senior mechanical engineering advisor reviewing an automated design "
+                "iteration. You do not have tools and cannot change anything yourself — you give "
+                "concise, physically-grounded strategic guidance that another AI (which DOES have "
+                "tools) will read and act on. Be specific and brief: 3-6 sentences. Never invent "
+                "numbers you weren't given."},
+             {"role": "user", "content": situation_text}],
+            temperature=0.3, max_tokens=max_tokens, model=NEMOTRON_ADVISOR_MODEL,
+        )
+    except HTTPException as e:
+        print(f"[engineering-agent] advisor call failed ({NEMOTRON_ADVISOR_MODEL}): {e.detail} "
+              f"— continuing without it")
+        return None
+
+
+def render_mesh_snapshot_png(mesh, view="iso", size_px=800):
+    """
+    Lightweight, pure-CPU mesh snapshot renderer — no OpenGL, no headless
+    browser, no display server. Deliberately cruder than a proper WebGL/
+    ray-traced render (flat per-face lambertian shading, matplotlib's own
+    antialiasing) in exchange for being reliable on a memory-constrained
+    free-tier container: a headless-Chromium-based renderer (the approach
+    earthtojake/text-to-cad's cadgen skill uses for its mandatory snapshot-
+    review policy) would add a real further OOM risk on top of everything
+    else this deployment has already fought — Chromium alone typically wants
+    200-500MB of RAM just to run.
+
+    Adopts that project's core PRINCIPLE, not its mechanism: a rendered
+    snapshot is DIAGNOSTIC, not authoritative. It's for a human (or a future
+    vision-capable model call, once one is configured) to glance at before
+    trusting a design purely on its numbers — it never overrides an actual
+    solver result, and nothing in this codebase treats it as one.
+
+    Returns PNG bytes, or raises on failure (caller decides how to degrade —
+    see its use in run_engineering_agent, which never lets a render failure
+    break the actual result).
+    """
+    import matplotlib
+    matplotlib.use("Agg")  # pure-CPU raster backend — no display/GPU needed at all
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    import io
+
+    fig = plt.figure(figsize=(size_px / 100, size_px / 100), dpi=100)
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_axis_off()
+
+    verts = mesh.vertices
+    faces = mesh.faces
+    tris = verts[faces]  # (F, 3, 3)
+
+    # Simple fixed-direction lambertian shading per face, computed once from
+    # already-available face normals — cheap, deterministic, no lighting/
+    # material system to get wrong; good enough to read shape, proportions,
+    # and obvious topology problems (which is the actual job here).
+    normals = mesh.face_normals
+    light_dir = np.array([0.5, -0.5, 0.8]); light_dir = light_dir / np.linalg.norm(light_dir)
+    brightness = np.clip(normals @ light_dir, 0.15, 1.0)  # 0.15 ambient floor, never fully black
+    base_color = np.array([0.65, 0.70, 0.78])
+    face_colors = np.clip(base_color[None, :] * brightness[:, None], 0, 1)
+
+    coll = Poly3DCollection(tris, facecolor=face_colors, edgecolor=(0, 0, 0, 0.15), linewidths=0.3)
+    ax.add_collection3d(coll)
+
+    bounds = mesh.bounds
+    center = bounds.mean(axis=0)
+    extent = float(np.max(bounds[1] - bounds[0])) / 2.0 or 1.0
+    ax.set_xlim(center[0] - extent, center[0] + extent)
+    ax.set_ylim(center[1] - extent, center[1] + extent)
+    ax.set_zlim(center[2] - extent, center[2] + extent)
+    try:
+        ax.set_box_aspect((1, 1, 1))
+    except Exception:
+        pass  # older matplotlib without set_box_aspect — proportions degrade gracefully, not fatally
+
+    # Two opposed-ish views by default cover most of a part the way
+    # text-to-cad's "two opposed isometrics" packet does, without needing a
+    # multi-image packet for every single result.
+    views = {"iso": (25, -60), "top": (90, -90), "front": (0, -90), "side": (0, 0)}
+    elev, azim = views.get(view, views["iso"])
+    ax.view_init(elev=elev, azim=azim)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.05)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
 
 async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_dir="z",
                                  operating_temp_c=25.0, surface_finish="machined", reliability=0.99,
@@ -6000,6 +6308,55 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
     )
     messages = [{"role": "system", "content": ENGINEERING_AGENT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg}]
+
+    advisor_calls = []
+    cfd_assessment = {"recommended": False, "reasoning": None,
+                       "note": "No advisor configured (NEMOTRON_ADVISOR_MODEL unset) — CFD need was "
+                               "not assessed. This does not mean CFD isn't needed, just that nothing "
+                               "checked."}
+    advisor_intro = await asyncio.to_thread(
+        _call_advisor,
+        f"A user has requested this part be designed: {prompt}\n"
+        f"Material: {material}. Load: {force_n}N along {force_dir}. "
+        f"Quality thresholds: min_health_score={min_health_score}, min_safety_factor={min_safety_factor}.\n"
+        "In 3-6 sentences: what is this part's engineering purpose, what design strategy would you "
+        "start with, and what's the single biggest risk to watch for?\n\n"
+        "Then, on its own final line, state exactly: 'CFD_NEEDED: yes' or 'CFD_NEEDED: no', followed "
+        "by a short reason — e.g. 'CFD_NEEDED: yes - propeller wash creates a real aerodynamic load on "
+        "this arm, not just the static tip force given'. Only say yes if fluid flow (aerodynamics, "
+        "cooling airflow, internal fluid/gas flow) is actually part of this part's function — a plain "
+        "structural bracket or arm evaluated only under a static point load should be 'no'. This "
+        "system does not have a working CFD solver yet, so say so plainly if you believe CFD IS "
+        "warranted here — don't let that absence change your answer."
+    )
+    if advisor_intro:
+        advisor_calls.append({"checkpoint": "initial_understanding", "response": advisor_intro})
+        messages.append({"role": "user", "content":
+            f"ENGINEERING ADVISOR (a second model's strategic read on this request — advisory only, "
+            f"you still make the actual tool calls and the solver results are still the only "
+            f"authoritative truth):\n{advisor_intro}"})
+
+        # Parse the tagged CFD_NEEDED line the advisor was asked for. Defensive by
+        # design — a model not following the exact format is treated as "couldn't
+        # determine", never silently coerced to a false negative or a fabricated yes.
+        import re
+        m = re.search(r"CFD_NEEDED:\s*(yes|no)\s*-?\s*(.*)", advisor_intro, re.IGNORECASE)
+        if m:
+            recommended = m.group(1).strip().lower() == "yes"
+            reason = m.group(2).strip() or None
+            cfd_assessment = {
+                "recommended": recommended,
+                "reasoning": reason,
+                "note": ("CFD analysis was assessed as valuable for this part, but OpenFOAM is not "
+                         "yet integrated into this system — this is a known, honestly-flagged gap, "
+                         "not a result." if recommended else
+                         "Advisor assessed this part as not needing fluid-flow analysis; only "
+                         "structural/thermal/fatigue checks apply."),
+            }
+        else:
+            cfd_assessment = {"recommended": None, "reasoning": None,
+                               "note": "Advisor was asked to assess CFD need but didn't return a "
+                                       "parseable answer — treat as unknown, not as 'no'."}
 
     tool_trace = []
     stopped_reason = None
@@ -6087,6 +6444,31 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
             messages.append(_format_tool_result_message(tc["id"], tc["name"], result))
             if tc["name"] == "finalize_design":
                 finalize_called = True
+            if (tc["name"] == "run_fea" and isinstance(result, dict)
+                    and result.get("status") == "FAIL" and not result.get("numerically_suspect")):
+                # Sparingly-called checkpoint (see NEMOTRON_ADVISOR_MODEL) — only on an
+                # actual solver FAIL, not on every run_fea call, and skipped entirely
+                # when the solver already flagged its own output as a numerical
+                # artifact (advising on a phantom failure wastes one of a scarce
+                # daily budget of calls for no benefit).
+                advisor_diag = await asyncio.to_thread(
+                    _call_advisor,
+                    f"Design iteration {state.iteration_count} just failed. Current parameters: "
+                    f"{state.params}. Solver diagnosis: status={result.get('status')}, "
+                    f"safety_factor={result.get('safety_factor')}, "
+                    f"critical_region={result.get('critical_region')}, "
+                    f"failure_modes={result.get('failure_modes')}. Recent change history: "
+                    f"{state.hypothesis_log[-3:]}. In 3-6 sentences: what is the most likely root "
+                    f"cause, and what is the SMALLEST parameter change that would address it without "
+                    f"changing anything the user didn't ask to change?"
+                )
+                if advisor_diag:
+                    advisor_calls.append({"checkpoint": f"iteration_{state.iteration_count}_failure",
+                                           "response": advisor_diag})
+                    messages.append({"role": "user", "content":
+                        f"ENGINEERING ADVISOR (a second model's diagnosis — advisory only, weigh it "
+                        f"but you decide the actual tool call; the solver result above remains the "
+                        f"authoritative truth):\n{advisor_diag}"})
 
         gc.collect()  # end of this step's tool-call batch — a natural point to release
                       # whatever the last modify/mesh/FEA cycle allocated before the next
@@ -6141,6 +6523,17 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
                                              max_high_violations, min_safety_factor)
 
     final_result["generated_stl_base64"] = base64.b64encode(final_stl).decode()
+    try:
+        snapshot_png = render_mesh_snapshot_png(final_mesh, view="iso")
+        final_result["generated_snapshot_base64"] = base64.b64encode(snapshot_png).decode()
+        final_result["generated_snapshot_note"] = (
+            "Diagnostic only, not authoritative — a quick visual sanity check (proportions, obvious "
+            "topology problems) for a human to glance at, same principle as any other unbenchmarked "
+            "estimate in this file. Never treat this image as confirming or overriding a solver result."
+        )
+    except Exception as e:
+        final_result["generated_snapshot_base64"] = None
+        final_result["generated_snapshot_note"] = f"Snapshot rendering failed ({type(e).__name__}: {e}) — not fatal, every other result field is unaffected."
     final_result["generated_script"] = (winner["script"] if winner["design_type"] == "generic_script"
                                          else params_to_script_tapered_beam(winner["params"])
                                          if winner["design_type"] == "tapered_beam"
@@ -6155,6 +6548,7 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
         "used_best_valid_fallback": (winner is state.best_valid_design and winner is not state.best_passing_design),
         "agent_final_verdict_claimed": state.final_verdict_claimed, "agent_final_summary": state.final_summary,
         "hypothesis_log": state.hypothesis_log, "tool_call_trace": tool_trace,
+        "advisor_calls": advisor_calls, "cfd_assessment": cfd_assessment,
         "quality_thresholds": {"min_health_score": min_health_score,
                                 "max_critical_violations": max_critical_violations,
                                 "max_high_violations": max_high_violations,
@@ -6201,8 +6595,10 @@ async def engineering_agent_endpoint(
     has had less real-world exercise than the beam path — test that path first.
 
     Requires AI_PROVIDER to be an OpenAI-compatible provider with tool-calling
-    (groq/openrouter/lovable). Set AI_PROVIDER=groq to use Groq's openai/gpt-oss-120b
-    (confirmed by Groq's own console to support Function Calling/Tool Use). Claude/Gemini
+    (groq/openrouter/lovable/cerebras/nvidia). Set AI_PROVIDER=nvidia + NVIDIA_MODEL to use
+    any model in NVIDIA's NIM catalog (Nemotron 3 Ultra, Kimi K3, DeepSeek V4, and 90+
+    others all share one endpoint/key — see the NVIDIA_API_KEY setup comment for confirmed-
+    live model IDs), or AI_PROVIDER=groq for Groq's openai/gpt-oss-120b. Claude/Gemini
     native tool-calling is not wired up for this endpoint yet; /generate-validate-refine
     still works on every provider as before.
 

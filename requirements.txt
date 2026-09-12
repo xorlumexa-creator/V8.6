@@ -4,5 +4,6 @@ python-multipart
 trimesh
 numpy
 scipy
+matplotlib
 cadquery
 ezdxf
