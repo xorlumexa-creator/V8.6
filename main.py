@@ -1235,6 +1235,15 @@ def _groq_request(messages, temperature=0.15, max_tokens=3000, model=None):
         raise HTTPException(502, f"Groq error ({e.code}): {body}")
     except urllib.error.URLError as e:
         raise HTTPException(502, f"Groq connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        # FIX: confirmed live (on the near-identical _openrouter_request below) — a
+        # response that times out mid-read, or comes back with a non-JSON body, raises
+        # something urllib.error.HTTPError/URLError doesn't catch (json.JSONDecodeError,
+        # a raw socket.timeout/TimeoutError not wrapped in URLError, etc.), which used
+        # to propagate uncaught and crash the entire request with a bare HTTP 500.
+        raise HTTPException(502, f"Groq request failed unexpectedly: {type(e).__name__}: {e}")
 
     try:
         content = data["choices"][0]["message"]["content"]
@@ -1286,6 +1295,10 @@ def _cerebras_request(messages, temperature=0.15, max_tokens=3000, model=None):
         raise HTTPException(502, f"Cerebras error ({e.code}): {body}")
     except urllib.error.URLError as e:
         raise HTTPException(502, f"Cerebras connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Cerebras request failed unexpectedly: {type(e).__name__}: {e}")
 
     try:
         content = data["choices"][0]["message"]["content"]
@@ -1336,6 +1349,10 @@ def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None):
         raise HTTPException(502, f"NVIDIA NIM error ({e.code}): {body}")
     except urllib.error.URLError as e:
         raise HTTPException(502, f"NVIDIA NIM connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"NVIDIA NIM request failed unexpectedly: {type(e).__name__}: {e}")
 
     try:
         content = data["choices"][0]["message"]["content"]
@@ -1348,7 +1365,7 @@ def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None):
     return content
 
 
-def _openrouter_request(messages, temperature=0.15, max_tokens=3000, model=None):
+def _openrouter_request(messages, temperature=0.15, max_tokens=3000, model=None, timeout=60):
     """
     Low-level call to OpenRouter (OpenAI-compatible chat completions) — same
     request/response shape as _lovable_request, different base URL/key/model.
@@ -1376,7 +1393,7 @@ def _openrouter_request(messages, temperature=0.15, max_tokens=3000, model=None)
         }
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="ignore")
@@ -1385,6 +1402,17 @@ def _openrouter_request(messages, temperature=0.15, max_tokens=3000, model=None)
         raise HTTPException(502, f"OpenRouter error ({e.code}): {body}")
     except urllib.error.URLError as e:
         raise HTTPException(502, f"OpenRouter connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        # FIX: confirmed live — a Nemotron 3 Ultra advisor call (large model, free/shared
+        # queue) timed out mid-read at almost exactly this function's 60s timeout, raising
+        # something urllib.error.URLError doesn't catch. That propagated all the way up
+        # through _call_advisor's narrower except HTTPException, past FastAPI's normal JSON
+        # error handling, and crashed the entire /engineering-agent request with a bare
+        # HTTP 500 plaintext body — for a call that was only ever supposed to be a
+        # best-effort advisory extra, never something that could break the main loop.
+        raise HTTPException(502, f"OpenRouter request failed unexpectedly: {type(e).__name__}: {e}")
 
     try:
         content = data["choices"][0]["message"]["content"]
@@ -1454,6 +1482,10 @@ def _gemini_request(system, messages, temperature=0.15, max_tokens=3000, model=N
         raise HTTPException(502, f"Gemini API error ({e.code}): {body}")
     except urllib.error.URLError as e:
         raise HTTPException(502, f"Gemini API connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Gemini API request failed unexpectedly: {type(e).__name__}: {e}")
 
     try:
         parts = data["candidates"][0]["content"]["parts"]
@@ -1501,6 +1533,10 @@ def _gemini_vision_request(system, prompt_text, img_b64, mime_type,
         raise HTTPException(502, f"Gemini API error ({e.code}): {body}")
     except urllib.error.URLError as e:
         raise HTTPException(502, f"Gemini API connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Gemini API request failed unexpectedly: {type(e).__name__}: {e}")
 
     try:
         parts = data["candidates"][0]["content"]["parts"]
@@ -1544,6 +1580,10 @@ def _lovable_request(messages, temperature=0.15, max_tokens=3000, model=None):
         raise HTTPException(502, f"Lovable AI error ({e.code}): {body}")
     except urllib.error.URLError as e:
         raise HTTPException(502, f"Lovable AI connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Lovable AI request failed unexpectedly: {type(e).__name__}: {e}")
 
     try:
         content = data["choices"][0]["message"]["content"]
@@ -1600,6 +1640,10 @@ def _claude_request(system, messages, temperature=0.15, max_tokens=3000, model=N
         raise HTTPException(502, f"Claude API error ({e.code}): {body}")
     except urllib.error.URLError as e:
         raise HTTPException(502, f"Claude API connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Claude API request failed unexpectedly: {type(e).__name__}: {e}")
 
     try:
         return "".join(b["text"] for b in data["content"] if b.get("type") == "text")
@@ -6109,6 +6153,16 @@ def _openai_compatible_tool_chat(api_url, api_key, model, messages, tools, tempe
         raise HTTPException(502, f"Provider error ({e.code}): {body}")
     except urllib.error.URLError as e:
         raise HTTPException(502, f"Provider connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        # FIX: confirmed live via the near-identical bug in _openrouter_request — a call
+        # that times out mid-read or returns a non-JSON body raises something neither
+        # HTTPError nor URLError catches, and this function drives EVERY step of the main
+        # agent loop (whichever provider is configured), not just the advisor — so this
+        # gap could crash an /engineering-agent request on its primary model call, not
+        # only the sparingly-used advisor path where it was actually first observed.
+        raise HTTPException(502, f"Provider request failed unexpectedly: {type(e).__name__}: {e}")
 
     try:
         return data["choices"][0]["message"]
@@ -6191,10 +6245,19 @@ def _call_advisor(situation_text, max_tokens=800):
                 "numbers you weren't given."},
              {"role": "user", "content": situation_text}],
             temperature=0.3, max_tokens=max_tokens, model=NEMOTRON_ADVISOR_MODEL,
+            timeout=30,  # fail fast rather than burn most of a minute on a slow/overloaded
+                         # advisor model — this is a best-effort extra, not worth a long wait
         )
     except HTTPException as e:
         print(f"[engineering-agent] advisor call failed ({NEMOTRON_ADVISOR_MODEL}): {e.detail} "
               f"— continuing without it")
+        return None
+    except Exception as e:
+        # Defense in depth on top of the fix now in _openrouter_request itself — this
+        # function's entire design promise is "can never break the main loop", so it
+        # catches broadly here too rather than relying on the callee alone.
+        print(f"[engineering-agent] advisor call raised unexpectedly ({NEMOTRON_ADVISOR_MODEL}): "
+              f"{type(e).__name__}: {e} — continuing without it")
         return None
 
 
