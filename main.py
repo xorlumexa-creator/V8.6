@@ -6501,9 +6501,17 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
             tool_elapsed = round(time.time() - tool_started, 2)
             print(f"[engineering-agent] step {step}: tool={tc['name']} took {tool_elapsed}s "
                   f"-> {result.get('status') if isinstance(result, dict) else '?'}")
+            # FIX: confirmed live — a chain of REJECTED set_initial_design attempts was
+            # only showing result_status here, never the actual reason, so diagnosing why
+            # each attempt failed meant separately re-deriving the safe-parameter-contract
+            # math by hand. Every REJECTED/ERROR result already carries a human-readable
+            # reason/message; surface it directly instead of just the status label.
+            detail = None
+            if isinstance(result, dict):
+                detail = result.get("reason") or result.get("message")
             tool_trace.append({"step": step, "tool": tc["name"], "arguments": tc["arguments"],
                                 "result_status": result.get("status") if isinstance(result, dict) else None,
-                                "elapsed_s": tool_elapsed})
+                                "detail": detail, "elapsed_s": tool_elapsed})
             messages.append(_format_tool_result_message(tc["id"], tc["name"], result))
             if tc["name"] == "finalize_design":
                 finalize_called = True
@@ -6553,8 +6561,29 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
 
     winner = state.best_passing_design or state.best_valid_design or state.current_candidate
     if winner is None:
-        raise HTTPException(502, "The Engineering Agent never produced a valid, analyzable design. "
-                                  f"Tool trace: {json.dumps(_json_safe(tool_trace))[:1500]}")
+        # FIX: confirmed live — every set_initial_design attempt got REJECTED (the safe
+        # parameter contract correctly caught infeasible geometry every time), so nothing
+        # was ever built to analyze. This used to raise a raw HTTPException with the whole
+        # tool trace dumped as an escaped JSON string inside the error detail — technically
+        # informative but painful to actually read. A design the agent never managed to
+        # build is a legitimate engineering outcome (same as an analyzed design that FAILs
+        # FEA), not a server malfunction — so this now returns a normal, structured 200
+        # response like every other result in this file, not an exception.
+        last_rejection = next((t for t in reversed(tool_trace) if t.get("result_status") == "REJECTED"), None)
+        return {
+            "status": "NO_VALID_DESIGN",
+            "summary": f"The Engineering Agent never produced geometry that passed the safe parameter "
+                       f"contract, across {len(tool_trace)} tool call(s). No FEA/analysis was possible "
+                       f"since nothing was ever successfully built.",
+            "last_rejection_reason": (last_rejection or {}).get("detail"),
+            "engineering_agent": {
+                "design_type": None, "final_parameters": None, "iterations_used": state.iteration_count,
+                "max_iterations": max_iterations, "steps_used": step, "max_steps": max_steps,
+                "stopped_reason": stopped_reason, "passed_quality_gate": False,
+                "advisor_calls": advisor_calls, "cfd_assessment": cfd_assessment,
+                "hypothesis_log": state.hypothesis_log, "tool_call_trace": tool_trace,
+            },
+        }
 
     # FIX: confirmed live — the old "reuse state.mesh if winner is state.current_candidate"
     # shortcut assumed state.mesh always reflects whatever design `winner` points to. It
