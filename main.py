@@ -1030,6 +1030,13 @@ RULES FOR REFINEMENT:
   or reduce unsupported span, rather than changing the material.
 - If the previous script raised a Python error, fix the root cause (typo, wrong API call,
   bad chaining) — do not just simplify the part away.
+- If told the mesh is STILL not watertight AFTER automatic tessellation repair was already
+  attempted, this is a REAL geometric defect, not a triangulation artifact — most often a
+  boolean union/cut that leaves a gap or self-intersection (e.g. two solids that only
+  partially overlap before a .union(), or a .cut() bore that exits through a corner instead
+  of a flat face). Rebuild the affected boolean operation with fully-overlapping/fully-
+  enclosed operands rather than adding fillets or changing wall thickness — those don't fix
+  a topology gap.
 - Do not regress: don't reintroduce a problem that was already fixed in a prior round,
   and don't fix one flagged issue by weakening a different area that was previously fine
   (e.g. don't thin a wall or shrink a cross-section elsewhere while raising a wall
@@ -3172,11 +3179,71 @@ def step_from_cq(obj):
 # CORE ANALYSIS PIPELINE v8.0
 # ═══════════════════════════════════════════════════════════════════
 
+def _repair_watertight_mesh(mesh):
+    """Attempt cheap, best-effort repairs on a mesh straight off CadQuery's STL
+    export before judging or using it for anything.
+
+    CadQuery/OCCT's STL tessellation routinely leaves tiny gaps and near-but-
+    not-quite-coincident duplicate vertices at the seams between adjacent
+    tessellated patches — most visibly at fillet-to-flat-face boundaries. This
+    is a known tessellation artifact, not necessarily a real defect in the
+    underlying B-rep solid (mesh_from_cq_object's own tolerance-tightening fix
+    above notes the same class of artifact causing Gmsh/CalculiX meshing
+    failures downstream). trimesh.load()'s default vertex-merge tolerance is
+    often too tight to close these seams on its own.
+
+    Without this step, the is_watertight check below — which drives the
+    /generate-validate-refine quality gate — was flagging these tessellation
+    artifacts as "non-manifold geometry" with nothing for the AI to actually
+    change about the design. Confirmed live: three refinement iterations in a
+    row producing an IDENTICAL health score and IDENTICAL "not watertight"
+    reason, because there was no real design defect to fix.
+
+    Each repair step is independently try/excepted — analysis_service.py's
+    _repair_mesh_for_meshing hit real trimesh-version API renames doing the
+    same kind of repair, so one incompatible call here shouldn't skip the rest.
+    Only ever changes what gets reported/analyzed; a genuine defect (e.g. an
+    actual gap from a failed boolean union) will still fail to repair and
+    should still fail the gate — this only clears the false positives.
+
+    Returns (mesh, was_repaired: bool) — was_repaired is True only if the mesh
+    started non-watertight AND ended up watertight after these steps, so
+    callers/feedback text can distinguish "needed no repair" from "tessellation
+    artifact, auto-fixed" from "still broken after repair, likely a real defect"."""
+    if mesh.is_watertight:
+        return mesh, False
+    try:
+        mesh.merge_vertices()
+    except Exception:
+        pass
+    try:
+        mesh.remove_duplicate_faces()
+    except Exception:
+        pass
+    try:
+        mesh.remove_degenerate_faces()
+    except Exception:
+        pass
+    try:
+        trimesh.repair.fill_holes(mesh)
+    except Exception:
+        try:
+            mesh.fill_holes()  # older/newer trimesh convenience alias
+        except Exception:
+            pass
+    try:
+        trimesh.repair.fix_normals(mesh)
+    except Exception:
+        pass
+    return mesh, bool(mesh.is_watertight)
+
+
 async def run_analysis_v8(mesh, filename, part_name, mat_key,
                            force_n=1000, force_dir="z", T_op=25.0,
                            proj=None, surface_finish="machined",
                            reliability=0.99, run_topo=False,
                            topo_volfrac=0.5):
+    mesh, was_auto_repaired = _repair_watertight_mesh(mesh)
     vol=sf(mesh.volume);exts=[sf(e) for e in mesh.extents]
     se=sorted(exts);asp=se[2]/se[0] if se[0]>0 else 0;is_wt=bool(mesh.is_watertight)
     if mat_key=="auto": mat_key=detect_material(mesh)
@@ -3251,7 +3318,8 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
         "geometry":{
             "dimensions_mm":{"x":round(exts[0],3),"y":round(exts[1],3),"z":round(exts[2],3)},
             "volume_mm3":round(vol,3),"surface_area_mm2":round(sf(mesh.area),3),
-            "is_watertight":is_wt,"vertex_count":int(len(mesh.vertices)),
+            "is_watertight":is_wt,"watertight_auto_repair_attempted":was_auto_repaired,
+            "vertex_count":int(len(mesh.vertices)),
             "face_count":int(len(mesh.faces)),"aspect_ratio":round(asp,3),
             "center_of_mass":cog_d,"cog_offset_pct":round(cog_pct,2),
             "bounds":{"min":{"x":round(float(bnds[0][0]),3),"y":round(float(bnds[0][1]),3),"z":round(float(bnds[0][2]),3)},
@@ -3335,7 +3403,13 @@ def evaluate_design_quality(result: dict, min_health_score: float = 75.0,
     if fat_status == "FAIL":
         reasons.append("Fatigue analysis status is FAIL.")
     if not is_wt:
-        reasons.append("Mesh is not watertight (manifold geometry required for manufacturing).")
+        was_repaired = (result.get("geometry", {}) or {}).get("watertight_auto_repair_attempted", False)
+        if was_repaired:
+            reasons.append("Mesh is STILL not watertight even after automatic tessellation "
+                            "repair — this is a real geometry defect (likely a boolean union/cut "
+                            "leaving a gap), not an export artifact. See REFINEMENT MODE guidance.")
+        else:
+            reasons.append("Mesh is not watertight (manifold geometry required for manufacturing).")
 
     return {
         "passed": len(reasons) == 0,
