@@ -1183,6 +1183,28 @@ NEMOTRON_ADVISOR_MODEL = os.environ.get("NEMOTRON_ADVISOR_MODEL", "")
 # ":free"-suffix model list the way OpenRouter has — every model here is
 # usage-priced, with the free tier being a rate-limited allowance on top.
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+# Optional additional Groq keys (e.g. from separate free-tier accounts) so a
+# rate-limited key automatically falls through to the next one instead of
+# failing the request. Accepts GROQ_API_KEY_2, GROQ_API_KEY_3, ... (numbered,
+# checked in order until one is unset) as well as a single comma-separated
+# GROQ_API_KEYS env var — use whichever is more convenient to set on Render.
+def _load_groq_keys():
+    keys = [GROQ_API_KEY] if GROQ_API_KEY else []
+    for extra in os.environ.get("GROQ_API_KEYS", "").split(","):
+        extra = extra.strip()
+        if extra and extra not in keys:
+            keys.append(extra)
+    i = 2
+    while True:
+        k = os.environ.get(f"GROQ_API_KEY_{i}", "").strip()
+        if not k:
+            break
+        if k not in keys:
+            keys.append(k)
+        i += 1
+    return keys
+
+GROQ_API_KEYS = _load_groq_keys()
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 # Confirm vision support on Groq's hosted GPT-OSS before relying on it for
@@ -1211,13 +1233,27 @@ AI_PROVIDER = os.environ.get(
 )
 
 
+# Remembers which key in GROQ_API_KEYS last succeeded, so the next call tries
+# that one first instead of always starting from index 0 (which would waste a
+# round trip re-hitting an already-exhausted key on every single request once
+# it's rate-limited). Plain module-level int: worst case under concurrent
+# requests is one extra wasted attempt, not a correctness issue.
+_groq_key_state = {"index": 0}
+
+
 def _groq_request(messages, temperature=0.15, max_tokens=3000, model=None):
     """Low-level call to Groq (OpenAI-compatible chat completions) — same
     request/response shape as _lovable_request/_openrouter_request, different
-    base URL/key/model."""
+    base URL/key/model.
+
+    Tries each configured Groq key (GROQ_API_KEY plus any GROQ_API_KEY_2,
+    GROQ_API_KEY_3, ... / GROQ_API_KEYS) in turn, falling through to the next
+    key only on a 429 (rate limit) — any other error (auth, bad request,
+    connection failure) still fails immediately rather than masking a real
+    problem by silently retrying."""
     import urllib.request, urllib.error
 
-    if not GROQ_API_KEY:
+    if not GROQ_API_KEYS:
         raise HTTPException(500, "GROQ_API_KEY is not configured on the server. "
                                    "Set it as a secret/env var in your deployment.")
 
@@ -1228,39 +1264,53 @@ def _groq_request(messages, temperature=0.15, max_tokens=3000, model=None):
         "max_tokens": max_tokens,
     }).encode()
 
-    req = urllib.request.Request(
-        GROQ_API_URL, data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            # Groq's API sits behind Cloudflare. urllib's default User-Agent
-            # ("Python-urllib/3.x") is a well-known bot-detection trigger —
-            # confirmed live: this exact call was returning Cloudflare error
-            # 1010 ("banned based on your browser's signature") before this
-            # header was added, not an actual Groq auth/key problem.
-            "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
-            "Accept": "application/json",
-        }
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="ignore")
-        if e.code == 429:
-            raise HTTPException(429, f"Groq rate limit exceeded: {body}")
-        raise HTTPException(502, f"Groq error ({e.code}): {body}")
-    except urllib.error.URLError as e:
-        raise HTTPException(502, f"Groq connection error: {str(e)}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        # FIX: confirmed live (on the near-identical _openrouter_request below) — a
-        # response that times out mid-read, or comes back with a non-JSON body, raises
-        # something urllib.error.HTTPError/URLError doesn't catch (json.JSONDecodeError,
-        # a raw socket.timeout/TimeoutError not wrapped in URLError, etc.), which used
-        # to propagate uncaught and crash the entire request with a bare HTTP 500.
-        raise HTTPException(502, f"Groq request failed unexpectedly: {type(e).__name__}: {e}")
+    n = len(GROQ_API_KEYS)
+    start = _groq_key_state["index"] % n
+    last_exc = None
+
+    for offset in range(n):
+        idx = (start + offset) % n
+        key = GROQ_API_KEYS[idx]
+        req = urllib.request.Request(
+            GROQ_API_URL, data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {key}",
+                # Groq's API sits behind Cloudflare. urllib's default User-Agent
+                # ("Python-urllib/3.x") is a well-known bot-detection trigger —
+                # confirmed live: this exact call was returning Cloudflare error
+                # 1010 ("banned based on your browser's signature") before this
+                # header was added, not an actual Groq auth/key problem.
+                "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
+                "Accept": "application/json",
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+            _groq_key_state["index"] = idx
+            break
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="ignore")
+            if e.code == 429:
+                last_exc = HTTPException(429, f"Groq rate limit exceeded on all "
+                                                f"{n} configured key(s): {body}")
+                continue  # try the next key, if any
+            raise HTTPException(502, f"Groq error ({e.code}): {body}")
+        except urllib.error.URLError as e:
+            raise HTTPException(502, f"Groq connection error: {str(e)}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            # FIX: confirmed live (on the near-identical _openrouter_request below) — a
+            # response that times out mid-read, or comes back with a non-JSON body, raises
+            # something urllib.error.HTTPError/URLError doesn't catch (json.JSONDecodeError,
+            # a raw socket.timeout/TimeoutError not wrapped in URLError, etc.), which used
+            # to propagate uncaught and crash the entire request with a bare HTTP 500.
+            raise HTTPException(502, f"Groq request failed unexpectedly: {type(e).__name__}: {e}")
+    else:
+        # every configured key hit a 429 — nothing left to fall back to
+        raise last_exc
 
     try:
         content = data["choices"][0]["message"]["content"]
