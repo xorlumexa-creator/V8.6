@@ -1116,22 +1116,6 @@ NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
 
-# Puter.js's OpenAI-compatible endpoint — technically a real backend path (unlike a
-# plain <script> browser integration), confirmed via developer.puter.com: create a
-# personal auth token at puter.com/dashboard#account ("API token" section), use it
-# as the API key here. IMPORTANT caveat before relying on this: Puter's "unlimited
-# free" claim is about MANY DIFFERENT BROWSER USERS each bringing their own account
-# (that's what makes it free for the app developer in the intended use case) — a
-# backend service like this one has no individual end-users, so every call here
-# authenticates as ONE personal Puter account and draws against whatever that one
-# account's undocumented usage allowance actually is. Puter does not publish a rate
-# limit for this pattern. Treat this as "worth trying, cheap to remove if it turns
-# out tight" rather than "genuinely unlimited for us" — very different claim than
-# it sounds.
-PUTER_API_KEY = os.environ.get("PUTER_API_KEY", "")  # your personal auth token, not a normal API key
-PUTER_API_URL = "https://api.puter.com/puterai/openai/v1/chat/completions"
-PUTER_MODEL = os.environ.get("PUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
-
 # Optional "strategic advisor" second model for the Engineering Agent — called
 # SPARINGLY (once up front, then once per FAILED run_fea — not per tool call)
 # for the high-level "understand this / why did it fail / what's the smallest
@@ -1213,24 +1197,31 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", GROQ_MODEL)
 
 # Which provider backs generation: "claude" (direct Anthropic API), "gemini"
-# (direct Google API), "groq" (gpt-oss-120b via Groq, stable free tier),
-# "cerebras" (OpenAI-compatible, also hosts gpt-oss-120b free as of this
-# writing — verify current card/limit terms at signup, they change often),
-# "openrouter" (OpenAI-compatible gateway, free models available but churn
+# (direct Google API), "groq" (gpt-oss-120b via Groq — this deployment's primary/
+# intended provider), "cerebras" (OpenAI-compatible, also hosts gpt-oss-120b free
+# as of this writing — verify current card/limit terms at signup, they change
+# often), "openrouter" (OpenAI-compatible gateway, free models available but churn
 # heavily and cap out at 50 requests/day unfunded), or "lovable" (Gemini via
 # the gateway). Defaults to whichever key is actually configured — set
 # AI_PROVIDER explicitly to force a choice if more than one key is set.
+#
+# .strip().lower() on the whole expression: a value like "Groq" or " groq" (a
+# typo made once in this deployment's history, via Render's dashboard) would
+# otherwise match NONE of the string comparisons below or anywhere else this
+# variable is checked, and silently fall through to whatever the last provider
+# in a given if/elif chain happens to be — a confusing failure mode with no
+# error message pointing at the real cause. Normalizing here means a typo'd
+# value still selects the intended provider instead of failing silently.
 AI_PROVIDER = os.environ.get(
     "AI_PROVIDER",
     "claude" if os.environ.get("ANTHROPIC_API_KEY")
     else "gemini" if os.environ.get("GOOGLE_API_KEY")
     else "nvidia" if os.environ.get("NVIDIA_API_KEY")
-    else "puter" if os.environ.get("PUTER_API_KEY")
     else "groq" if os.environ.get("GROQ_API_KEY")
     else "cerebras" if os.environ.get("CEREBRAS_API_KEY")
     else "openrouter" if os.environ.get("OPENROUTER_API_KEY")
     else "lovable"
-)
+).strip().lower()
 
 
 # Remembers which key in GROQ_API_KEYS last succeeded, so the next call tries
@@ -1420,75 +1411,6 @@ def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None):
         raise
     except Exception as e:
         raise HTTPException(502, f"NVIDIA NIM request failed unexpectedly: {type(e).__name__}: {e}")
-
-
-def _puter_request(messages, temperature=0.15, max_tokens=3000, model=None, timeout=45):
-    """Low-level call to Puter's OpenAI-compatible endpoint — identical shape to
-    _nvidia_request, different base URL/key. The 'API key' here is actually a
-    personal Puter auth token (puter.com/dashboard#account -> API token ->
-    Create token), not a normal per-request-billed API key — see PUTER_API_KEY's
-    setup comment above for the important caveat about what 'free' actually
-    means for a backend service using this. Shorter default timeout than the
-    other providers (45s not 60s) since this is a less-established, third-party-
-    proxied path with no published reliability numbers to go on yet."""
-    import urllib.request, urllib.error
-
-    if not PUTER_API_KEY:
-        raise HTTPException(500, "PUTER_API_KEY is not configured on the server. Create a personal "
-                                   "auth token at puter.com/dashboard#account and set it as a secret/"
-                                   "env var — see PUTER_API_KEY's setup comment for details.")
-
-    payload = json.dumps({
-        "model": model or PUTER_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }).encode()
-
-    req = urllib.request.Request(
-        PUTER_API_URL, data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {PUTER_API_KEY}",
-            "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
-            "Accept": "application/json",
-        }
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="ignore")
-        if e.code == 429:
-            raise HTTPException(429, f"Puter rate limit exceeded (this is the undocumented "
-                                       f"per-account limit flagged in PUTER_API_KEY's setup comment "
-                                       f"— you've now found out empirically what it is): {body}")
-        raise HTTPException(502, f"Puter error ({e.code}): {body}")
-    except urllib.error.URLError as e:
-        raise HTTPException(502, f"Puter connection error: {str(e)}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(502, f"Puter request failed unexpectedly: {type(e).__name__}: {e}")
-
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        raise HTTPException(502, f"Unexpected Puter response shape: {json.dumps(data)[:500]}")
-
-    if not content or not isinstance(content, str):
-        raise HTTPException(502, f"Puter returned empty/null content. Raw response: {json.dumps(data)[:500]}")
-    return content
-
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        raise HTTPException(502, f"Unexpected NVIDIA NIM response shape: {json.dumps(data)[:500]}")
-
-    if not content or not isinstance(content, str):
-        raise HTTPException(502, f"NVIDIA NIM returned empty/null content. "
-                                  f"Raw response: {json.dumps(data)[:500]}")
-    return content
 
 
 def _openrouter_request(messages, temperature=0.15, max_tokens=3000, model=None, timeout=60):
@@ -1885,12 +1807,6 @@ async def gemini_generate_script(prompt: str, previous_script: Optional[str] = N
     elif AI_PROVIDER == "nvidia":
         text = await asyncio.to_thread(
             _nvidia_request,
-            [{"role": "system", "content": system_prompt}] + turns,
-            temperature=0.15, max_tokens=GEN_MAX_TOKENS
-        )
-    elif AI_PROVIDER == "puter":
-        text = await asyncio.to_thread(
-            _puter_request,
             [{"role": "system", "content": system_prompt}] + turns,
             temperature=0.15, max_tokens=GEN_MAX_TOKENS
         )
@@ -3565,17 +3481,16 @@ def home():
             "dxf_export_available": EZDXF,
             "ai_generation_configured": bool(LOVABLE_API_KEY or ANTHROPIC_API_KEY or GOOGLE_API_KEY
                                               or GROQ_API_KEY or CEREBRAS_API_KEY or NVIDIA_API_KEY
-                                              or PUTER_API_KEY or OPENROUTER_API_KEY),
+                                              or OPENROUTER_API_KEY),
             "ai_provider": AI_PROVIDER,
             "ai_model": (CLAUDE_MODEL if AI_PROVIDER == "claude"
                          else GEMINI_MODEL if AI_PROVIDER == "gemini"
                          else GROQ_MODEL if AI_PROVIDER == "groq"
                          else CEREBRAS_MODEL if AI_PROVIDER == "cerebras"
                          else NVIDIA_MODEL if AI_PROVIDER == "nvidia"
-                         else PUTER_MODEL if AI_PROVIDER == "puter"
                          else OPENROUTER_MODEL if AI_PROVIDER == "openrouter"
                          else LOVABLE_AI_MODEL),
-            "engineering_agent_configured": AI_PROVIDER in ("groq", "openrouter", "lovable", "cerebras", "nvidia", "puter")},
+            "engineering_agent_configured": AI_PROVIDER in ("groq", "openrouter", "lovable", "cerebras", "nvidia")},
         "new_in_v8_23":[
             "Optional second-model 'strategic advisor' for the Engineering Agent: set "
             "NEMOTRON_ADVISOR_MODEL (e.g. to a Nemotron/Kimi/DeepSeek model via OpenRouter, reusing "
@@ -6314,8 +6229,6 @@ def _provider_tool_endpoint():
         return CEREBRAS_API_URL, CEREBRAS_API_KEY, CEREBRAS_MODEL
     if AI_PROVIDER == "nvidia":
         return NVIDIA_API_URL, NVIDIA_API_KEY, NVIDIA_MODEL
-    if AI_PROVIDER == "puter":
-        return PUTER_API_URL, PUTER_API_KEY, PUTER_MODEL
     return None, None, None
 
 
@@ -6324,7 +6237,7 @@ def _call_model_with_tools(messages, temperature=0.2, max_tokens=AGENT_TURN_MAX_
     if url is None:
         raise HTTPException(501,
             "The Engineering Agent's tool-calling loop is currently implemented for OpenAI-compatible "
-            "providers only (groq, openrouter, lovable, cerebras, nvidia, puter). Current AI_PROVIDER is "
+            "providers only (groq, openrouter, lovable, cerebras, nvidia). Current AI_PROVIDER is "
             f"'{AI_PROVIDER}'. Set AI_PROVIDER to one of those (plus its matching API key) to use this "
             "endpoint; Claude/Gemini native tool-calling for this specific agent loop is not wired up "
             "yet — /generate-validate-refine still works on every provider as before.")

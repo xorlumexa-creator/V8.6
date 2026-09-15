@@ -2,20 +2,18 @@ services:
   - type: web
     name: lumexa-backend
     runtime: docker
-    dockerfilePath: ./deploy-main/Dockerfile
-    dockerContext: ./deploy-main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     plan: free
     healthCheckPath: /
     envVars:
+      - key: AI_PROVIDER
+        value: groq
       - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_API_KEY_2
+        sync: false
+      - key: ANALYSIS_SERVICE_URL
         sync: false
       - key: ALLOWED_ORIGINS
         value: https://your-frontend-domain.com
-
-  - type: web
-    name: lumexa-analysis
-    runtime: docker
-    dockerfilePath: ./deploy-analysis/Dockerfile
-    dockerContext: ./deploy-analysis
-    plan: free
-    healthCheckPath: /
