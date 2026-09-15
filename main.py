@@ -397,11 +397,16 @@ def run_calculix_fem(mesh, mat_key, force_n=1000, force_dir="z"):
             f"{ANALYSIS_SERVICE_URL}/run-fem", data=payload,
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         )
-        # Real solid-tet FEM is genuinely slow on constrained hardware —
-        # matching the same 300s ceiling the old in-process ccx subprocess
-        # call used, so this isn't a NEW bottleneck, just moved to a
-        # different process.
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        # Set to 90s: Railway (1GB RAM, documented 5-min request timeout) removes
+        # the platform-proxy-timeout problem that forced a tight 25s cutoff on
+        # Render's free tier — a real solid-tet solve at full fidelity (0.08
+        # mesh_size_factor, 80000 max_tets, restored in analysis_service.py) can
+        # need more than 25s. Kept well under Railway's actual 300s ceiling
+        # anyway, not raised all the way back to 300s, so a live/competition
+        # demo still has a predictable worst-case wait before falling over to
+        # the analytical path rather than hanging for minutes if something
+        # genuinely goes wrong.
+        with urllib.request.urlopen(req, timeout=90) as resp:
             raw = resp.read()
             data = json.loads(raw)
         elapsed = round(time.time() - t0, 1)
