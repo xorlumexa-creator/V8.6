@@ -1041,7 +1041,40 @@ RULES FOR REFINEMENT:
   partially overlap before a .union(), or a .cut() bore that exits through a corner instead
   of a flat face). Rebuild the affected boolean operation with fully-overlapping/fully-
   enclosed operands rather than adding fillets or changing wall thickness — those don't fix
-  a topology gap.
+  a topology gap. Copy this exact overshoot/overlap pattern for whichever boolean op is
+  suspected:
+
+    # DANGEROUS — cutting tool ends EXACTLY flush with the far face. This leaves a
+    # coincident/zero-thickness face where they meet -> non-manifold mesh.
+    bore = cq.Workplane("XY").circle(hole_r).extrude(wall_thickness)     # BAD
+    result = housing.cut(bore)
+
+    # SAFE — cutting tool starts before the near face and ends after the far face,
+    # overshooting BOTH by a real margin (>= 1.0mm or 10% of wall_thickness).
+    overshoot = max(1.0, wall_thickness * 0.1)
+    bore = (cq.Workplane("XY")
+            .workplane(offset=-overshoot)
+            .circle(hole_r)
+            .extrude(wall_thickness + 2 * overshoot))
+    result = housing.cut(bore)
+
+    # DANGEROUS — second solid starts EXACTLY at the first solid's face, so they
+    # only touch (tangent), never truly interpenetrate -> non-manifold seam on union.
+    boss = cq.Workplane("XY").workplane(offset=base_height).circle(r).extrude(h)  # BAD
+    result = base.union(boss)
+
+    # SAFE — sink the second solid INTO the first by a real overlap margin before
+    # unioning, so the two volumes genuinely share interior volume, not just a face.
+    overlap = max(0.5, base_height * 0.05)
+    boss = (cq.Workplane("XY")
+            .workplane(offset=base_height - overlap)
+            .circle(r)
+            .extrude(h + overlap))
+    result = base.union(boss)
+
+  This overshoot/overlap margin is the fix — not a fillet, not a wall-thickness change,
+  not a different hole position. Apply it only to the boolean operation actually
+  producing the non-manifold result; leave every other operation untouched.
 - Do not regress: don't reintroduce a problem that was already fixed in a prior round,
   and don't fix one flagged issue by weakening a different area that was previously fine
   (e.g. don't thin a wall or shrink a cross-section elsewhere while raising a wall
@@ -3936,7 +3969,7 @@ async def generate_validate_refine(
     surface_finish:str=Form("machined"),
     reliability:float=Form(0.99),
     project_description:Optional[str]=Form(None),
-    max_iterations:int=Form(3),
+    max_iterations:int=Form(6),
     min_health_score:float=Form(75.0),
     max_critical_violations:int=Form(0),
     max_high_violations:int=Form(2),
