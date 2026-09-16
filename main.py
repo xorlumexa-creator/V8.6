@@ -1923,6 +1923,7 @@ Return JSON only (no markdown):
         raise HTTPException(502, f"AI provider returned non-JSON for vision estimate: {text[:300]}")
 
 import ast
+import traceback
 
 # Modules the generated script is allowed to import. Anything else is rejected.
 CQ_ALLOWED_IMPORTS = {"cadquery", "cq", "math", "numpy", "np"}
@@ -2136,7 +2137,25 @@ def execute_cq_script_safely(script: str):
     try:
         exec(compile(tree, "<ai_script>", "exec"), namespace)
     except Exception as e:
-        return None, f"Script execution failed: {type(e).__name__}: {str(e)}"
+        # FIX: was returning only f"{type(e).__name__}: {str(e)}" — e.g. just
+        # "AttributeError: 'Edge' object has no attribute 'center'" with zero
+        # indication of WHERE in a 60-100 line chained-CadQuery script that
+        # happened. Confirmed live: the refinement loop burned all 3 attempts
+        # hitting what was plausibly the same mistake each time, because the
+        # model had no way to locate which operation to fix — it could only
+        # guess. Extracting the failing line from the AI's own script (filtering
+        # traceback frames to filename "<ai_script>" so this harness's own
+        # exec()-call frame doesn't leak in) turns an unlocatable error into an
+        # actionable one.
+        tb_lines = script.splitlines()
+        script_frames = [f for f in traceback.extract_tb(e.__traceback__)
+                          if f.filename == "<ai_script>"]
+        location = ""
+        if script_frames:
+            ln = script_frames[-1].lineno
+            src = tb_lines[ln - 1].strip() if ln and 0 < ln <= len(tb_lines) else None
+            location = f" [line {ln}: `{src}`]" if src else f" [line {ln}]"
+        return None, f"Script execution failed: {type(e).__name__}: {str(e)}{location}"
 
     obj = namespace.get("result")
     if obj is None:
