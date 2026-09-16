@@ -3342,7 +3342,7 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
         "geometry":{
             "dimensions_mm":{"x":round(exts[0],3),"y":round(exts[1],3),"z":round(exts[2],3)},
             "volume_mm3":round(vol,3),"surface_area_mm2":round(sf(mesh.area),3),
-            "is_watertight":is_wt,"watertight_auto_repair_attempted":was_auto_repaired,
+            "is_watertight":is_wt,"watertight_auto_repair_succeeded":was_auto_repaired,
             "vertex_count":int(len(mesh.vertices)),
             "face_count":int(len(mesh.faces)),"aspect_ratio":round(asp,3),
             "center_of_mass":cog_d,"cog_offset_pct":round(cog_pct,2),
@@ -3427,13 +3427,20 @@ def evaluate_design_quality(result: dict, min_health_score: float = 75.0,
     if fat_status == "FAIL":
         reasons.append("Fatigue analysis status is FAIL.")
     if not is_wt:
-        was_repaired = (result.get("geometry", {}) or {}).get("watertight_auto_repair_attempted", False)
-        if was_repaired:
-            reasons.append("Mesh is STILL not watertight even after automatic tessellation "
-                            "repair — this is a real geometry defect (likely a boolean union/cut "
-                            "leaving a gap), not an export artifact. See REFINEMENT MODE guidance.")
-        else:
-            reasons.append("Mesh is not watertight (manifold geometry required for manufacturing).")
+        # FIX: this used to branch on a "was_repaired" flag read from
+        # watertight_auto_repair_attempted — but that field is actually "did
+        # repair SUCCEED", not "was repair attempted", and repair (in
+        # _repair_watertight_mesh, above) runs unconditionally before is_wt is
+        # ever computed. So reaching this branch at all already means repair
+        # was attempted AND failed — the was_repaired==True case could never
+        # fire, and the AI was always getting the generic message instead of
+        # the actionable one below. Confirmed live: a real non-manifold defect
+        # (Gmsh: "Wrong topology of boundary mesh for parametrization") still
+        # only produced the generic reason text.
+        reasons.append("Mesh is STILL not watertight even after automatic tessellation "
+                        "repair — this is a real geometry defect (likely a boolean union/cut "
+                        "leaving a gap or self-intersection), not an export artifact. "
+                        "See REFINEMENT MODE guidance.")
 
     return {
         "passed": len(reasons) == 0,
