@@ -2226,6 +2226,27 @@ def execute_cq_script_safely(script: str):
                        f"CadQuery Workplane/Shape. Make sure the final expression returns "
                        f"a cq.Workplane.")
 
+    # FIX: defensively call OCCT's own .clean() on the final solid before it's ever
+    # tessellated to STL. A boolean union/cut chain — especially one using the
+    # deliberate overshoot/overlap margins the refinement prompt now teaches, to
+    # avoid non-manifold gaps — can leave the resulting BREP with redundant/coincident
+    # topology that OCCT doesn't auto-simplify. That later tessellates into thin
+    # overlapping facets that Gmsh's discrete-direct meshing correctly rejects
+    # ("Invalid boundary mesh (overlapping facets)"), even though the mesh still
+    # passes a basic watertight check — confirmed live, same run, same part.
+    # .clean() simplifies the solid at the BREP level, before tessellation ever
+    # happens, which is the right layer to fix this at — a mesh-level repair pass
+    # afterward is patching an already-lossy triangulated approximation instead.
+    # Applied unconditionally to every script's result, not just when the AI
+    # remembers to call it itself. Best-effort: if .clean() itself raises on some
+    # pathological shape, fall back to the uncleaned object rather than failing
+    # the whole script over a cleanup step.
+    if hasattr(obj, "clean"):
+        try:
+            obj = obj.clean()
+        except Exception:
+            pass
+
     return obj, None
 
 # ═══════════════════════════════════════════════════════════════════
