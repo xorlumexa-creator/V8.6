@@ -939,6 +939,23 @@ is not a matter of tuning, it's a part that doesn't do what was asked. Do
 not submit a script with any unchecked box; if you can't fit a requirement
 in, go back and add it rather than leaving it off the list.
 
+For every circular hole or bore feature specifically (bearing bores,
+mounting holes, clearance holes — anything cut as a round hole), add ONE
+extra line directly under that checklist item, in EXACTLY this format:
+    # FEATURE: type=hole count=<N> diameter_mm=<D>
+For example, "2x bearing bore, 22mm dia" becomes:
+    # [ ] 2x bearing bore, 22mm dia, coaxial, on opposite end faces
+    # FEATURE: type=hole count=2 diameter_mm=22
+And "4x M6 mounting hole" (M6 clearance hole is 6.5mm) becomes:
+    # [ ] 4x M6 mounting hole, near bottom corners
+    # FEATURE: type=hole count=4 diameter_mm=6.5
+Emit one FEATURE line per distinct hole/bore requirement, right after its
+checklist line. This IS checked automatically against the real solid after
+your script runs, separately from your own self-check above — if the count
+doesn't genuinely match, the design is a hard fail no matter how good the
+rest of it looks, so only write a FEATURE line for a hole you have ACTUALLY
+cut in the code below, at that diameter.
+
 STRICT RULES:
 - Import only: cadquery as cq, math, numpy as np
 - Assign final shape to variable named: result
@@ -1262,12 +1279,26 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 # expected there (GPT-OSS models are primarily text-focused).
 GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", GROQ_MODEL)
 
+# Atria Dawn Preview — Shanghai AI Lab's 744B-param MoE, released mid-Sept 2026,
+# OpenAI-compatible free-preview API. Wired in as an OPT-IN alternate provider
+# for A/B testing against Groq, NOT the default and NOT part of the auto-detect
+# chain below — at the time this was added it was still reported (by one
+# tracking source) as unstable with broken structured output, which is exactly
+# what this pipeline depends on, so it should only ever run when someone
+# deliberately sets AI_PROVIDER=atria to test it, never by accident because a
+# key happened to be present. Re-evaluate that caution once there's a longer
+# track record.
+ATRIA_API_KEY = os.environ.get("ATRIA_API_KEY", "").strip()
+ATRIA_API_URL = "https://api.atria-asi.ai/v1/chat/completions"
+ATRIA_MODEL = os.environ.get("ATRIA_MODEL", "Atria-Dawn-Preview")
+
 # Which provider backs generation: "claude" (direct Anthropic API), "gemini"
 # (direct Google API), "groq" (gpt-oss-120b via Groq — this deployment's primary/
 # intended provider), "cerebras" (OpenAI-compatible, also hosts gpt-oss-120b free
 # as of this writing — verify current card/limit terms at signup, they change
 # often), "openrouter" (OpenAI-compatible gateway, free models available but churn
-# heavily and cap out at 50 requests/day unfunded), or "lovable" (Gemini via
+# heavily and cap out at 50 requests/day unfunded), "atria" (Atria Dawn Preview —
+# opt-in only, see note above, never auto-selected), or "lovable" (Gemini via
 # the gateway). Defaults to whichever key is actually configured — set
 # AI_PROVIDER explicitly to force a choice if more than one key is set.
 #
@@ -1378,6 +1409,64 @@ def _groq_request(messages, temperature=0.15, max_tokens=3000, model=None):
         # Same null-content edge case fixed in _openrouter_request/_lovable_request.
         raise HTTPException(502, f"Groq returned empty/null content. "
                                   f"Raw response: {json.dumps(data)[:500]}")
+    return content
+
+
+def _atria_request(messages, temperature=0.15, max_tokens=3000, model=None):
+    """Low-level call to Atria Dawn Preview (OpenAI-compatible chat completions)
+    — same request/response shape as _groq_request, different base URL/key/
+    model, single key only (no multi-key rotation — this is an opt-in A/B
+    provider, not a primary path expected to need it).
+
+    Kept deliberately defensive in the SAME places _groq_request already had
+    to be fixed for real (empty/null content, non-JSON error bodies, a bare
+    socket timeout not wrapped by urllib) — Atria's own reported issue is
+    broken structured output, which shows up exactly as these failure modes,
+    so this should catch it cleanly and report it rather than crash."""
+    import urllib.request, urllib.error
+
+    if not ATRIA_API_KEY:
+        raise HTTPException(500, "ATRIA_API_KEY is not configured on the server. "
+                                   "Set it as a secret/env var to use AI_PROVIDER=atria.")
+
+    payload = json.dumps({
+        "model": model or ATRIA_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }).encode()
+
+    req = urllib.request.Request(
+        ATRIA_API_URL, data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {ATRIA_API_KEY}",
+            "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
+            "Accept": "application/json",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        raise HTTPException(502 if e.code != 429 else 429, f"Atria error ({e.code}): {body}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"Atria connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Atria request failed unexpectedly: {type(e).__name__}: {e}")
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(502, f"Unexpected Atria response shape: {json.dumps(data)[:500]}")
+
+    if not content or not isinstance(content, str):
+        raise HTTPException(502, f"Atria returned empty/null content — matches the "
+                                  f"'structured output broken' behavior reported for this "
+                                  f"preview model elsewhere. Raw response: {json.dumps(data)[:500]}")
     return content
 
 
@@ -1864,6 +1953,12 @@ async def gemini_generate_script(prompt: str, previous_script: Optional[str] = N
             [{"role": "system", "content": system_prompt}] + turns,
             temperature=0.15, max_tokens=GEN_MAX_TOKENS
         )
+    elif AI_PROVIDER == "atria":
+        text = await asyncio.to_thread(
+            _atria_request,
+            [{"role": "system", "content": system_prompt}] + turns,
+            temperature=0.15, max_tokens=GEN_MAX_TOKENS
+        )
     elif AI_PROVIDER == "cerebras":
         text = await asyncio.to_thread(
             _cerebras_request,
@@ -2269,6 +2364,104 @@ def execute_cq_script_safely(script: str):
             pass
 
     return obj, None
+
+
+def _parse_required_hole_features(script: str):
+    """Extract machine-checkable hole/bore requirements the AI declared in its
+    own REQUIREMENTS CHECKLIST comment (see GEMINI_CADQUERY_SYSTEM's FEATURE:
+    line format — added alongside that checklist specifically so this function
+    has something reliable to parse). Returns a list of {count, diameter_mm}.
+    Never raises: a script with no FEATURE lines, or malformed ones, just
+    yields an empty list, meaning no deterministic check runs against it —
+    this fails OPEN by design, since a parsing miss should never itself
+    become a false rejection of a design that might otherwise be fine.
+    """
+    import re
+    out = []
+    try:
+        pattern = re.compile(
+            r'#\s*FEATURE:\s*type=hole\s+count=(\d+)\s+diameter_mm=([\d.]+)',
+            re.IGNORECASE)
+        for m in pattern.finditer(script):
+            out.append({"count": int(m.group(1)), "diameter_mm": float(m.group(2))})
+    except Exception:
+        pass
+    return out
+
+
+def _count_cylindrical_faces_by_diameter(obj):
+    """Best-effort count of cylindrical faces in the actual solid, bucketed by
+    rounded diameter (mm). This reads real B-Rep geometry via CadQuery/OCCT
+    (Face.geomType() / Face.radius()) — not the mesh, not the AI's own claim
+    about what it built. Used only to CONFIRM a claimed hole/bore is genuinely
+    present: any failure here (unexpected CadQuery/OCP API shape on whatever
+    version is actually installed — this was written without a local CadQuery
+    install to test against) is swallowed and yields an empty dict, which the
+    caller treats as 'nothing to check against' rather than a false failure.
+    Fails open, same as the parser above — a broken check must never be worse
+    than no check.
+    """
+    buckets = {}
+    try:
+        shape = obj.val() if hasattr(obj, "val") else obj
+        faces = shape.Faces() if hasattr(shape, "Faces") else []
+        for f in faces:
+            try:
+                if f.geomType() != "CYLINDER":
+                    continue
+                d = round(f.radius() * 2.0)
+                buckets[d] = buckets.get(d, 0) + 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return buckets
+
+
+def _check_required_hole_features(script: str, obj):
+    """Deterministic check, added specifically because an AI's own checklist
+    claim ('[x] bore added') is not proof — only the actual geometry is.
+    Confirmed live this session: a script can claim a required bore is done
+    while the solid genuinely has zero matching cylindrical faces. For every
+    hole/bore the script's FEATURE: lines declare, confirms the real solid
+    has at least that many cylindrical faces within +-1.5mm of that diameter.
+
+    Deliberately checks 'at least N nearby', not an exact match — a boolean
+    cut can legitimately split one physical hole's wall into more than one
+    cylindrical face (union/cut seams, tessellation), which would make exact
+    matching noisy and risk rejecting perfectly good parts. But a hole that
+    was never cut at all ALWAYS contributes exactly zero faces near its
+    diameter regardless of that noise — so even this loose a check reliably
+    catches the one failure mode it's aimed at (a feature silently missing),
+    without being strict enough to falsely reject a good design over a
+    face-count quirk it was never meant to police.
+
+    Returns None if there's nothing to flag (including if nothing could be
+    checked at all — fails open), else a feedback string for the refinement
+    loop to hand back to the AI, same mechanism as every other failure
+    reason in this pipeline.
+    """
+    required = _parse_required_hole_features(script)
+    if not required:
+        return None
+    buckets = _count_cylindrical_faces_by_diameter(obj)
+    problems = []
+    for req in required:
+        target_d = req["diameter_mm"]
+        nearby = sum(c for d, c in buckets.items() if abs(d - target_d) <= 1.5)
+        if nearby < req["count"]:
+            problems.append(
+                f"- Required {req['count']}x hole/bore at ~{target_d:.1f}mm diameter, "
+                f"but the actual solid only has {nearby} matching cylindrical face(s). "
+                f"Your checklist claimed this was done — it is NOT actually present "
+                f"in the geometry."
+            )
+    if not problems:
+        return None
+    return ("REQUIRED FEATURE(S) MISSING FROM GEOMETRY (verified automatically against "
+            "the real solid, not just your own checklist):\n" + "\n".join(problems) +
+            "\n\nFix this by actually cutting the missing hole(s)/bore(s) into the "
+            "solid — do not just mark the checklist item done without doing it.")
 
 # ═══════════════════════════════════════════════════════════════════
 # RETAINED v7.0 ANALYSIS FUNCTIONS (all upgraded algorithms)
@@ -4087,6 +4280,19 @@ async def generate_validate_refine(
             feedback=(f"Your script FAILED TO EXECUTE with this error:\n{err}\n\n"
                       f"Fix the root cause and return a complete, runnable script."
                       f"{_diagnose_cq_error(err)}")
+            continue
+
+        # 2.5) Deterministic feature check — confirms hole/bore requirements the
+        # script's own FEATURE: lines claim are actually present in the real
+        # solid (see _check_required_hole_features docstring for why the AI's
+        # checklist alone isn't proof). Placed before analysis so a design
+        # that's already known to be missing a required feature doesn't spend
+        # an analysis-service round trip (and Railway memory) on a design
+        # that's going to be rejected anyway.
+        feature_problem=_check_required_hole_features(script, obj)
+        if feature_problem:
+            iterations.append({"iteration":i,"stage":"missing_features","error":feature_problem,"script":script})
+            feedback=feature_problem
             continue
 
         # 3) Analyze
