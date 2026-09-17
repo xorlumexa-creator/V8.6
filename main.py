@@ -918,6 +918,27 @@ TAPER_KEYWORDS = ("taper","tapered","tapering","drone arm","connecting rod",
 GEMINI_CADQUERY_SYSTEM = """You are a CadQuery expert mechanical engineer.
 Generate Python CadQuery code to create the described 3D part.
 
+MANDATORY FIRST STEP — REQUIREMENTS CHECKLIST:
+Before writing any geometry code, write a Python comment block enumerating EVERY
+explicitly stated requirement from the prompt as a checklist — every hole/bore
+(with count, diameter, and rough position), every named dimension, every
+fillet/chamfer instruction, every material/wall-thickness call-out. One line
+per item, e.g.:
+    # REQUIREMENTS:
+    # [ ] 2x bearing bore, 22mm dia, coaxial, on opposite end faces
+    # [ ] 4x M6 mounting hole, near bottom corners
+    # [ ] wall thickness 4mm
+    # [ ] fillet all internal corners 3mm
+Then write the geometry code. Before finishing, go back through this exact
+checklist line by line and confirm your code actually creates each item —
+mark each one [x] once you've verified it's really there in the code below it,
+not just planned. A named requirement that never appears anywhere in your
+code (e.g. a bore the prompt asked for that never got cut) is a hard
+failure — worse than an imperfect fillet radius, because a missing feature
+is not a matter of tuning, it's a part that doesn't do what was asked. Do
+not submit a script with any unchecked box; if you can't fit a requirement
+in, go back and add it rather than leaving it off the list.
+
 STRICT RULES:
 - Import only: cadquery as cq, math, numpy as np
 - Assign final shape to variable named: result
