@@ -1446,7 +1446,14 @@ def _atria_request(messages, temperature=0.15, max_tokens=3000, model=None):
         }
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        # 150s, not Groq's 60s: confirmed live — a 60s cap (copied from
+        # _groq_request without adjusting) killed a real request before it
+        # could finish. Groq's custom inference hardware is unusually fast;
+        # Atria is a much larger (744B) model on unproven free-preview infra,
+        # so it needs real headroom to show whether it's slow-but-working or
+        # genuinely not responding — those are different findings, and a
+        # too-tight timeout can't tell them apart.
+        with urllib.request.urlopen(req, timeout=150) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="ignore")
