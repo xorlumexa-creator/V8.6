@@ -35,6 +35,11 @@
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
+# v8.24: CAD kernel is now build123d (CadQuery removed). Every generated design is analysed
+# by SimScale (cloud FEA, when configured); a failed analysis is fed back to the LLM (Nemotron
+# via NVIDIA NIM, AI_PROVIDER=nvidia) as structured refinement feedback. CalculiX service and the
+# analytical model remain as automatic fallbacks.
+
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -49,11 +54,15 @@ from scipy.sparse.linalg import spsolve
 from scipy.spatial import ConvexHull
 from collections import defaultdict
 
+# CAD kernel: build123d (OpenCASCADE, like CadQuery, but with a cleaner algebra-style
+# Python API that LLMs write more reliably). Install: pip install build123d
 try:
-    import cadquery as cq
-    CQ = True
+    import build123d as b3d
+    from build123d import export_stl as _b3d_export_stl, export_step as _b3d_export_step
+    B3D = True
 except ImportError:
-    CQ = False
+    b3d = None
+    B3D = False
 
 # CALCULIX/GMSH are no longer checked or imported HERE — that whole
 # dependency chain (and its multi-hundred-MB footprint) moved to the
@@ -161,7 +170,7 @@ class SafeJSONResponse(JSONResponse):
         return super().render(_json_safe(content))
 
 
-app = FastAPI(title="Lumexa v8.23 Enterprise (split architecture)", version="8.23.0",
+app = FastAPI(title="Lumexa v8.24 Enterprise (build123d + SimScale)", version="8.24.0",
               default_response_class=SafeJSONResponse)
 # NOTE: allow_origins=["*"] combined with allow_credentials=True is an invalid/unsafe
 # CORS configuration — browsers reject wildcard origins when credentials are allowed,
@@ -435,6 +444,659 @@ def run_calculix_fem(mesh, mat_key, force_n=1000, force_dir="z"):
     except Exception as e:
         return None, {"attempted": True, "reason": f"{type(e).__name__}: {e}",
                        "elapsed_s": round(time.time()-t0,1)}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SIMSCALE CLOUD FEA — primary analyzer whenever it is configured.
+#
+# Every design the LLM produces is exported as a STEP B-rep, pushed to SimScale,
+# meshed and solved there (linear static), and the peak von Mises stress / its
+# location / tip deflection come back as the `fea` dict that the rest of this
+# file already consumes (health score, quality gate, refinement feedback,
+# engineering-agent diagnosis). If SimScale is not configured, or any stage
+# fails, run_analysis_v8 falls back to the CalculiX analysis service and then to
+# the analytical model — and says so in result["simscale_diagnostic"].
+#
+# HOW THE SIMULATION IS DEFINED — "template simulation" approach
+# --------------------------------------------------------------
+# Instead of building SimScale's very large StaticAnalysis object graph
+# (materials, numerics, result control, mesher settings...) in code — which is
+# version-sensitive and easy to get subtly wrong — you create ONE linear-static
+# simulation + ONE mesh operation by hand in the SimScale workbench (one Fixed
+# support BC, one Force BC, any material, standard mesher). This code clones
+# that setup for every design and only swaps the things that change per design:
+#   * geometry            -> the newly uploaded STEP
+#   * material assignment -> the new body
+#   * Fixed support faces -> the end face(s) at the MIN end of the longest axis
+#   * Force faces         -> the end face(s) at the MAX end, force_n along force_dir
+# Because the load is a pure force BC on a single linear-elastic material,
+# stress does not depend on Young's modulus; displacement scales as 1/E. So the
+# template's material is only a scaffold: displacement is rescaled to the
+# requested material (SIMSCALE_TEMPLATE_MATERIAL tells us what the template
+# used) and the safety factor always uses the REQUESTED material's yield.
+#
+# Env vars:
+#   SIMSCALE_API_KEY                      required (X-API-KEY)
+#   SIMSCALE_API_URL                      default https://api.simscale.com
+#   SIMSCALE_TEMPLATE_PROJECT_ID          project that holds the template (needs "Allow API access")
+#   SIMSCALE_TEMPLATE_SIMULATION_ID       the linear-static template simulation
+#   SIMSCALE_TEMPLATE_MESH_OPERATION_ID   the template mesh operation
+#   SIMSCALE_TEMPLATE_MATERIAL            MATERIALS key the template uses (default aluminum_6061)
+#   SIMSCALE_TIMEOUT_S                    total wall-clock budget per analysis (default 480)
+#   SIMSCALE_POLL_S                       polling interval (default 6)
+#   SIMSCALE_ENABLED=0                    force-disable without removing the key
+# ═══════════════════════════════════════════════════════════════════
+import re
+import copy
+import zipfile
+import io
+
+
+def _env_flag(name, default=True):
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+SIMSCALE_API_KEY = os.environ.get("SIMSCALE_API_KEY", "").strip()
+SIMSCALE_API_URL = os.environ.get("SIMSCALE_API_URL", "https://api.simscale.com").strip().rstrip("/")
+SIMSCALE_ENABLED = bool(SIMSCALE_API_KEY) and _env_flag("SIMSCALE_ENABLED", True)
+SIMSCALE_TEMPLATE_PROJECT_ID = os.environ.get("SIMSCALE_TEMPLATE_PROJECT_ID", "").strip()
+SIMSCALE_TEMPLATE_SIMULATION_ID = os.environ.get("SIMSCALE_TEMPLATE_SIMULATION_ID", "").strip()
+SIMSCALE_TEMPLATE_MESH_OPERATION_ID = os.environ.get("SIMSCALE_TEMPLATE_MESH_OPERATION_ID", "").strip()
+SIMSCALE_TEMPLATE_MATERIAL = os.environ.get("SIMSCALE_TEMPLATE_MATERIAL", "aluminum_6061").strip()
+SIMSCALE_TIMEOUT_S = float(os.environ.get("SIMSCALE_TIMEOUT_S", "480"))
+SIMSCALE_POLL_S = float(os.environ.get("SIMSCALE_POLL_S", "6"))
+
+# One SimScale analysis at a time per process: keeps us inside plan concurrency
+# limits and stops parallel requests from racing on the same template project.
+_simscale_lock = threading.Lock()
+
+# ── PyVista (optional; OFF by default) ──────────────────────────────────────
+# PyVista sits on VTK, which is heavy: importing it costs a large chunk of RAM (see
+# /pyvista-selftest for the real numbers on YOUR instance) — on a 512 MB Render free
+# instance that already holds OpenCascade + scipy/trimesh it can push the process over the
+# limit. So nothing is imported unless you switch it on:
+#   USE_PYVISTA=1        read SimScale result files with PyVista (more formats than meshio,
+#                        handles cell-data-only results); meshio stays as the fallback
+#   PYVISTA_RENDER=1     additionally render a von Mises stress picture (off-screen) that is
+#                        returned as result["simscale_stress_image_base64"] (PNG)
+#   PYVISTA_GL_BACKEND   osmesa (default: software GL, needs libosmesa6) | egl | auto
+USE_PYVISTA = _env_flag("USE_PYVISTA", False)
+PYVISTA_RENDER = _env_flag("PYVISTA_RENDER", False)
+PYVISTA_GL_BACKEND = os.environ.get("PYVISTA_GL_BACKEND", "osmesa").strip().lower()
+_pv = {"mod": None, "err": None}
+
+
+def _pyvista():
+    """Lazy PyVista import (VTK is only loaded the first time a feature needs it). The GL
+    backend must be chosen BEFORE vtk is imported, hence the env var here."""
+    if _pv["mod"] is None and _pv["err"] is None:
+        try:
+            if PYVISTA_GL_BACKEND == "osmesa":
+                os.environ.setdefault("VTK_DEFAULT_OPENGL_WINDOW", "vtkOSOpenGLRenderWindow")
+            elif PYVISTA_GL_BACKEND == "egl":
+                os.environ.setdefault("VTK_DEFAULT_OPENGL_WINDOW", "vtkEGLRenderWindow")
+            import pyvista as pv
+            pv.OFF_SCREEN = True
+            _pv["mod"] = pv
+        except Exception as e:
+            _pv["err"] = f"{type(e).__name__}: {str(e)[:300]}"
+    return _pv["mod"]
+
+
+def _rss_mb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except Exception:
+        pass
+    return None
+
+
+class _SimScaleError(Exception):
+    """`stage` says where it failed. `design_related` is True only when SimScale
+    itself reports that the GEOMETRY is the problem (import / meshing / solve
+    failure) — that is worth telling the LLM. Auth, plan, network, config and
+    timeout failures are NOT design problems and are never blamed on the part."""
+    def __init__(self, stage, message, design_related=False):
+        super().__init__(message)
+        self.stage = stage
+        self.design_related = design_related
+
+
+def _ss_client():
+    try:
+        import simscale_sdk as sim
+    except ImportError as e:
+        raise _SimScaleError(
+            "sdk", "simscale-sdk is not installed (pip install "
+                   "git+https://github.com/SimScaleGmbH/simscale-python-sdk.git)") from e
+    cfg = sim.Configuration()
+    cfg.host = SIMSCALE_API_URL + "/v0"
+    cfg.api_key = {"X-API-KEY": SIMSCALE_API_KEY}
+    return sim, sim.ApiClient(cfg)
+
+
+def _ss_reason(obj):
+    for attr in ("failure_reason", "failureReason", "error", "message", "details"):
+        v = getattr(obj, attr, None)
+        if v:
+            return str(v)[:500]
+    return "no failure reason reported by SimScale"
+
+
+def _ss_wait(fetch, stage, deadline, ok=("FINISHED",), bad=("FAILED", "CANCELED", "CANCELLED"),
+             design_related=True):
+    """Poll `fetch()` until its .status is terminal. Raises _SimScaleError on
+    FAILED/CANCELED (design_related per caller) or when the deadline passes."""
+    last = ""
+    while True:
+        obj = fetch()
+        last = str(getattr(obj, "status", "") or "").upper()
+        if last in ok:
+            return obj
+        if last in bad:
+            raise _SimScaleError(stage, f"{stage} {last}: {_ss_reason(obj)}", design_related=design_related)
+        if time.time() > deadline:
+            raise _SimScaleError(stage, f"timed out waiting for {stage} (last status {last or 'unknown'}). "
+                                        f"Raise SIMSCALE_TIMEOUT_S or call the async endpoint.", False)
+        time.sleep(SIMSCALE_POLL_S)
+
+
+def _ss_format_exception(e):
+    """SimScale SDK ApiException -> one readable line (with a plan/permission hint on 401/403)."""
+    status = getattr(e, "status", None)
+    if status is not None:
+        body = str(getattr(e, "body", "") or "")[:300]
+        hint = ""
+        if status in (401, 403):
+            hint = (" — check SIMSCALE_API_KEY, that your SimScale plan includes API access, and that the "
+                    "project has 'Allow API access' enabled")
+        return f"HTTP {status} {getattr(e, 'reason', '')}: {body}{hint}"
+    return f"{type(e).__name__}: {str(e)[:400]}"
+
+
+def _ss_mappings(sim, api_client, project_id, geometry_id, klass):
+    """Entity names (in SimScale's own order) for one entity class ('face', 'body', ...)."""
+    geo_api = sim.GeometriesApi(api_client)
+    try:
+        m = geo_api.get_geometry_mappings(project_id, geometry_id, _class=klass, limit=1000)
+    except TypeError:
+        m = geo_api.get_geometry_mappings(project_id, geometry_id, _class=klass)
+    items = list(getattr(m, "embedded", None) or [])
+    return [getattr(i, "name", None) for i in items if getattr(i, "name", None)]
+
+
+def _ss_pick_end_faces(shape, axis, exts):
+    """Indices (into shape.faces()) of the faces closing the MIN end and the MAX end
+    of the part along `axis`: planar faces perpendicular to the axis, sitting at the
+    part's extreme. Falls back to 'faces starting/ending within the outer 3%' when
+    the ends are not flat (rounded / drilled tips)."""
+    bb = shape.bounding_box()
+    lo = [bb.min.X, bb.min.Y, bb.min.Z][axis]
+    hi = [bb.max.X, bb.max.Y, bb.max.Z][axis]
+    span = max(hi - lo, 1e-9)
+    tol = max(span * 1e-3, 1e-4)
+    faces = list(shape.faces())
+    lo_idx, hi_idx = [], []
+    for i, f in enumerate(faces):
+        fb = f.bounding_box()
+        fmin = [fb.min.X, fb.min.Y, fb.min.Z][axis]
+        fmax = [fb.max.X, fb.max.Y, fb.max.Z][axis]
+        if fmax - fmin <= tol:
+            if abs(fmin - lo) <= tol:
+                lo_idx.append(i)
+            elif abs(fmax - hi) <= tol:
+                hi_idx.append(i)
+    if not lo_idx or not hi_idx:
+        band = span * 0.03
+        for i, f in enumerate(faces):
+            fb = f.bounding_box()
+            fmin = [fb.min.X, fb.min.Y, fb.min.Z][axis]
+            fmax = [fb.max.X, fb.max.Y, fb.max.Z][axis]
+            if not lo_idx and fmax <= lo + band:
+                lo_idx.append(i)
+            if not hi_idx and fmin >= hi - band:
+                hi_idx.append(i)
+    return lo_idx, hi_idx, len(faces)
+
+
+def _ss_set_force(sim, bc, fx, fy, fz):
+    try:
+        comp = lambda v: sim.ConstantFunction(value=float(v))
+        vec = sim.ComponentVectorFunction(x=comp(fx), y=comp(fy), z=comp(fz))
+        bc.force = sim.DimensionalVectorFunctionForce(value=vec, unit="N")
+    except Exception as e:
+        raise _SimScaleError("setup", f"could not write the force vector into the template's Force BC "
+                                      f"({type(e).__name__}: {e}) — the SDK class layout differs from what "
+                                      f"_ss_set_force expects; adjust that one function.")
+
+
+def _ss_patch_model(sim, template_model, body_names, fixed_names, load_names, force_xyz):
+    """Deep-copy the template's model and re-point it at the new geometry."""
+    model = copy.deepcopy(template_model)
+    TR = sim.TopologicalReference
+    report = {"materials_reassigned": 0, "fixed_support_bcs": 0, "force_bcs": 0}
+    for mat in (getattr(model, "materials", None) or []):
+        if hasattr(mat, "topological_reference"):
+            mat.topological_reference = TR(entities=list(body_names))
+            report["materials_reassigned"] += 1
+    for bc in (getattr(model, "boundary_conditions", None) or []):
+        cls = type(bc).__name__.lower()
+        if "fixedsupport" in cls:
+            bc.topological_reference = TR(entities=list(fixed_names))
+            report["fixed_support_bcs"] += 1
+        elif "forceload" in cls or cls in ("forcebc", "force"):
+            bc.topological_reference = TR(entities=list(load_names))
+            _ss_set_force(sim, bc, *force_xyz)
+            report["force_bcs"] += 1
+    if not report["fixed_support_bcs"] or not report["force_bcs"]:
+        raise _SimScaleError(
+            "setup", f"the template simulation must contain one 'Fixed support' and one 'Force' boundary "
+                     f"condition (found {report}). Re-create the template in the SimScale workbench.")
+    return model, report
+
+
+_VM_RE = re.compile(r"mises|sieq|vmis|equiv.*stress", re.I)
+_STRESS_TENSOR_RE = re.compile(r"stress|sigma|sief", re.I)
+_DISP_RE = re.compile(r"displacement|^u$|^d$|^depl", re.I)
+
+
+def _ss_analyse_arrays(pts, point_data, fname):
+    """Peak von Mises / displacement from per-point arrays (SI units in, raw SI numbers out).
+    Understands a scalar von Mises field or a 6/9-component stress tensor. Returns None when
+    neither stress nor displacement is found."""
+    out = {"vm": None, "vm_xyz": None, "disp": None, "_vm_array": None,
+           "points_extent": float(np.ptp(pts, axis=0).max()) if len(pts) else 0.0, "file": fname}
+    for name, arr in point_data.items():
+        try:
+            a = np.asarray(arr, dtype=float)
+        except (TypeError, ValueError):
+            continue
+        if "strain" in name.lower():
+            continue
+        vm = None
+        if _VM_RE.search(name) and a.ndim == 1:
+            vm = np.abs(a)
+        elif _STRESS_TENSOR_RE.search(name) and a.ndim == 2 and a.shape[1] in (6, 9):
+            if a.shape[1] == 6:
+                sxx, syy, szz, sxy, syz, sxz = (a[:, i] for i in range(6))
+            else:
+                sxx, syy, szz, sxy, syz, sxz = a[:, 0], a[:, 4], a[:, 8], a[:, 1], a[:, 5], a[:, 2]
+            vm = np.sqrt(0.5 * ((sxx - syy) ** 2 + (syy - szz) ** 2 + (szz - sxx) ** 2)
+                         + 3.0 * (sxy ** 2 + syz ** 2 + sxz ** 2))
+        if vm is not None and len(vm) == len(pts):
+            i = int(np.argmax(vm))
+            if out["vm"] is None or vm[i] > out["vm"]:
+                out["vm"], out["vm_xyz"], out["_vm_array"] = float(vm[i]), pts[i].tolist(), vm
+        if _DISP_RE.search(name) and out["disp"] is None and a.ndim >= 1 and len(a) == len(pts):
+            out["disp"] = float(np.linalg.norm(a.reshape(len(a), -1), axis=1).max())
+    return out if (out["vm"] is not None or out["disp"] is not None) else None
+
+
+def _ss_fields_via_pyvista(path):
+    """Read a result file with PyVista. Also handles results stored as CELL data (converted to
+    point data) and multi-block files. Keeps the mesh (`_pv_mesh`) so it can be rendered."""
+    pv = _pyvista()
+    if pv is None:
+        raise RuntimeError(f"pyvista unavailable ({_pv['err']})")
+    mesh = pv.read(path)
+    if isinstance(mesh, pv.MultiBlock):
+        mesh = mesh.combine()
+    pts = np.asarray(mesh.points, dtype=float)
+    out = _ss_analyse_arrays(pts, {k: mesh.point_data[k] for k in mesh.point_data.keys()}, os.path.basename(path))
+    if out is None or out["vm"] is None:
+        try:
+            conv = mesh.cell_data_to_point_data()
+            out2 = _ss_analyse_arrays(np.asarray(conv.points, dtype=float),
+                                      {k: conv.point_data[k] for k in conv.point_data.keys()},
+                                      os.path.basename(path))
+            if out2 is not None and (out is None or out2["vm"] is not None):
+                out, mesh = out2, conv
+        except Exception:
+            pass
+    if out is not None:
+        out["_pv_mesh"] = mesh
+    return out
+
+
+def _ss_fields_from_file(path):
+    """PyVista first when USE_PYVISTA=1, otherwise (or if it fails) meshio."""
+    fname = os.path.basename(path)
+    pv_err = None
+    if USE_PYVISTA:
+        try:
+            r = _ss_fields_via_pyvista(path)
+            if r:
+                return r
+        except Exception as e:
+            pv_err = f"pyvista: {type(e).__name__}: {str(e)[:120]}"
+    try:
+        import meshio
+        m = meshio.read(path)
+    except Exception as e:
+        raise RuntimeError((pv_err + "; " if pv_err else "") + f"meshio: {type(e).__name__}: {str(e)[:120]}")
+    return _ss_analyse_arrays(np.asarray(m.points, dtype=float), dict(m.point_data or {}), fname)
+
+
+def _ss_render_stress_png(fields, tmpdir, force=False):
+    """Off-screen PNG of the von Mises field (surface only, hotspot marked). Returns
+    (png_bytes | None, status). Never raises — a picture must never fail an analysis."""
+    if not (PYVISTA_RENDER or force):
+        return None, "not requested (PYVISTA_RENDER=0)"
+    mesh, vm = fields.get("_pv_mesh"), fields.get("_vm_array")
+    if mesh is None or vm is None:
+        return None, "no PyVista mesh / stress array to draw (USE_PYVISTA=1 needed)"
+    pv = _pyvista()
+    if pv is None:
+        return None, f"pyvista unavailable ({_pv['err']})"
+    pl = None
+    try:
+        vm_mpa = np.asarray(vm, dtype=float)
+        vm_mpa = vm_mpa / 1e6 if float(vm_mpa.max()) > 1e5 else vm_mpa
+        m = mesh.copy(deep=False)                          # attach the array BEFORE extracting the skin so it
+        m.point_data["von_mises_mpa"] = vm_mpa             # is carried onto the surface points
+        surf = m.extract_surface()                         # skin only: far less memory than the volume mesh
+        pl = pv.Plotter(off_screen=True, window_size=(960, 640))
+        pl.set_background("white")
+        pl.add_mesh(surf, scalars="von_mises_mpa", cmap="turbo", show_edges=False,
+                    scalar_bar_args={"title": "von Mises [MPa]", "color": "black"})
+        hot = fields.get("vm_xyz")
+        if hot:
+            pl.add_mesh(pv.PolyData(np.array([hot], dtype=float)), color="black", point_size=16,
+                        render_points_as_spheres=True)
+        pl.add_text(f"Peak {float(vm_mpa.max()):.1f} MPa", position="upper_left", font_size=12, color="black")
+        pl.camera_position = "iso"
+        path = os.path.join(tmpdir, "stress.png")
+        img = pl.screenshot(path, return_img=True)
+        if img is not None and float(np.asarray(img).std()) < 1.0:
+            return None, ("render produced a blank image — GL backend problem. Try PYVISTA_GL_BACKEND="
+                          "egl or auto (libosmesa6 / libegl1 must be installed in the image).")
+        with open(path, "rb") as f:
+            return f.read(), "ok"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {str(e)[:200]}"
+    finally:
+        try:
+            if pl is not None:
+                pl.close()
+        except Exception:
+            pass
+
+
+def _ss_fetch_results(sim, api_client, project_id, simulation_id, run_id, tmpdir):
+    """Download the run's result items and pull peak stress/displacement out of them.
+    Returns (fields_dict, listing). This is the most SimScale-version-sensitive step:
+    if it cannot find a parsable solution field it raises with the full item listing
+    so you can see what SimScale actually returned."""
+    runs_api = sim.SimulationRunsApi(api_client)
+    res = runs_api.get_simulation_run_results(project_id, simulation_id, run_id)
+    items = list(getattr(res, "embedded", None) or [])
+    listing = [{"type": str(getattr(i, "type", None)), "category": str(getattr(i, "category", None)),
+                "name": str(getattr(i, "name", None))} for i in items]
+    if not USE_PYVISTA:
+        try:
+            import meshio  # noqa: F401
+        except ImportError:
+            raise _SimScaleError("results", "run FINISHED but `meshio` is not installed, so the result fields "
+                                            "cannot be read (pip install meshio h5py) — or set USE_PYVISTA=1.")
+    import urllib.request
+    best = None
+    tried = []
+    for idx, it in enumerate(items):
+        dl = getattr(it, "download", None)
+        url = getattr(dl, "url", None) if dl is not None else None
+        if not url:
+            continue
+        kind = (str(getattr(it, "type", "")) + " " + str(getattr(it, "category", ""))).lower()
+        if not any(k in kind for k in ("solution", "field", "volume", "surface")):
+            continue
+        try:
+            data = None
+            for headers in ({"X-API-KEY": SIMSCALE_API_KEY}, {}):
+                try:
+                    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as r:
+                        data = r.read()
+                    break
+                except Exception:
+                    continue
+            if data is None:
+                tried.append(f"item {idx}: download failed")
+                continue
+            base = os.path.join(tmpdir, f"res_{idx}")
+            os.makedirs(base, exist_ok=True)
+            paths = []
+            if zipfile.is_zipfile(io.BytesIO(data)):
+                with zipfile.ZipFile(io.BytesIO(data)) as z:
+                    z.extractall(base)
+                for root, _, files in os.walk(base):
+                    paths += [os.path.join(root, f) for f in files]
+            else:
+                p = os.path.join(base, "result.bin")
+                with open(p, "wb") as f:
+                    f.write(data)
+                paths = [p]
+            for p in paths:
+                if not p.lower().endswith((".vtu", ".vtk", ".vtp", ".med", ".xdmf", ".msh", ".case", ".bin")):
+                    continue
+                try:
+                    f = _ss_fields_from_file(p)
+                except Exception as e:
+                    tried.append(f"{os.path.basename(p)}: {type(e).__name__}: {str(e)[:120]}")
+                    continue
+                if f and (best is None or (f["vm"] or 0) > (best["vm"] or 0)):
+                    best = f
+        except Exception as e:
+            tried.append(f"item {idx}: {type(e).__name__}: {str(e)[:120]}")
+    if best is None:
+        raise _SimScaleError(
+            "results", "run FINISHED but no stress/displacement field could be parsed from the result items "
+                       f"{listing}; attempts: {tried[:6]}. Open the run in the SimScale workbench to confirm the "
+                       "setup, then adapt _ss_fetch_results/_ss_fields_from_file to the file format you see.")
+    return best, listing
+
+
+def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0):
+    """
+    Blocking (call it via asyncio.to_thread). Returns (fem_result_or_None, diag)
+    exactly like run_calculix_fem: never raises, and `diag` always explains what
+    happened, including per-stage timings and — when SimScale itself rejected the
+    geometry — `design_related=True` so the refinement loop can pass that on to
+    the LLM.
+    """
+    if not SIMSCALE_ENABLED:
+        return None, {"attempted": False, "reason": "SIMSCALE_API_KEY not set (or SIMSCALE_ENABLED=0)"}
+    missing = [n for n, v in (("SIMSCALE_TEMPLATE_PROJECT_ID", SIMSCALE_TEMPLATE_PROJECT_ID),
+                              ("SIMSCALE_TEMPLATE_SIMULATION_ID", SIMSCALE_TEMPLATE_SIMULATION_ID),
+                              ("SIMSCALE_TEMPLATE_MESH_OPERATION_ID", SIMSCALE_TEMPLATE_MESH_OPERATION_ID)) if not v]
+    if missing:
+        return None, {"attempted": False, "reason": f"SimScale template not configured — set {', '.join(missing)}"}
+    if cad_obj is None:
+        return None, {"attempted": False,
+                      "reason": "no B-rep available (analysis of an uploaded mesh) — SimScale needs the CAD solid"}
+
+    diag = {"attempted": True, "stages": [], "reason": None}
+    t0 = time.time()
+    deadline = t0 + SIMSCALE_TIMEOUT_S
+    current = {"stage": "start"}
+
+    def mark(stage, **kw):
+        current["stage"] = stage
+        diag["stages"].append({"stage": stage, "t_s": round(time.time() - t0, 1), **kw})
+
+    tmpdir = tempfile.mkdtemp(prefix="simscale_")
+    try:
+        with _simscale_lock:
+            # the time budget starts once we hold the lock, not while queued behind another run
+            diag["queued_s"] = round(time.time() - t0, 1)
+            t0 = time.time()
+            deadline = t0 + SIMSCALE_TIMEOUT_S
+            # ── geometry facts (from our own B-rep, not from SimScale) ──────────
+            mark("export_step")
+            step_path = os.path.join(tmpdir, "part.step")
+            _b3d_write_step(cad_obj, step_path)
+            bb = cad_obj.bounding_box()
+            exts = [bb.size.X, bb.size.Y, bb.size.Z]
+            axis = int(np.argmax(exts))
+            lo_idx, hi_idx, n_faces = _ss_pick_end_faces(cad_obj, axis, exts)
+            if not lo_idx or not hi_idx:
+                raise _SimScaleError("setup", "could not identify two opposite end faces to fix / load "
+                                              "(part has no usable ends along its longest axis).")
+            fa = {"x": 0, "y": 1, "z": 2}.get((force_dir or "z").lower(), 2)
+            force_xyz = [0.0, 0.0, 0.0]
+            force_xyz[fa] = float(force_n)
+
+            # ── SimScale session + template ─────────────────────────────────────
+            mark("connect")
+            sim, api_client = _ss_client()
+            pid = SIMSCALE_TEMPLATE_PROJECT_ID
+            sims_api = sim.SimulationsApi(api_client)
+            mesh_api = sim.MeshOperationsApi(api_client)
+            tpl_sim = sims_api.get_simulation(pid, SIMSCALE_TEMPLATE_SIMULATION_ID)
+            tpl_mesh = mesh_api.get_mesh_operation(pid, SIMSCALE_TEMPLATE_MESH_OPERATION_ID)
+
+            # ── upload + import STEP ────────────────────────────────────────────
+            mark("upload")
+            tag = f"lumexa_{uuid.uuid4().hex[:8]}"
+            storage = sim.StorageApi(api_client).create_storage()
+            with open(step_path, "rb") as f:
+                blob = f.read()
+            try:
+                api_client.rest_client.PUT(url=storage.url, headers={"Content-Type": "application/octet-stream"},
+                                           body=blob)
+            except (AttributeError, TypeError):
+                import urllib.request
+                urllib.request.urlopen(urllib.request.Request(
+                    storage.url, data=blob, method="PUT",
+                    headers={"Content-Type": "application/octet-stream"}), timeout=120).close()
+            mark("geometry_import")
+            try:
+                opts = sim.GeometryImportRequestOptions(facet_split=False, sewing=False, improve=False,
+                                                        optimize_for_lbm_solver=False)
+            except TypeError:
+                opts = sim.GeometryImportRequestOptions()
+            gi_api = sim.GeometryImportsApi(api_client)
+            gi = gi_api.import_geometry(pid, sim.GeometryImportRequest(
+                name=tag, location=sim.GeometryImportRequestLocation(storage.storage_id),
+                format="STEP", input_unit="MM", options=opts))
+            gi = _ss_wait(lambda: gi_api.get_geometry_import(pid, gi.geometry_import_id),
+                          "geometry_import", deadline, design_related=True)
+            geometry_id = gi.geometry_id
+
+            # ── map our faces/body onto SimScale's entity names ─────────────────
+            mark("map_entities")
+            face_names = _ss_mappings(sim, api_client, pid, geometry_id, "face")
+            body_names = []
+            for klass in ("body", "volume", "region"):
+                body_names = _ss_mappings(sim, api_client, pid, geometry_id, klass)
+                if body_names:
+                    break
+            diag["entity_counts"] = {"simscale_faces": len(face_names), "b3d_faces": n_faces,
+                                     "simscale_bodies": len(body_names)}
+            if len(face_names) != n_faces:
+                raise _SimScaleError(
+                    "map_entities", f"SimScale reports {len(face_names)} faces but the B-rep has {n_faces}; "
+                                    f"face order cannot be trusted, refusing to guess which faces to fix/load "
+                                    f"(SimScale may have merged/split faces on import).")
+            if not body_names:
+                raise _SimScaleError("map_entities", "SimScale returned no body/volume entity to assign a material to.")
+            fixed_names = [face_names[i] for i in lo_idx]
+            load_names = [face_names[i] for i in hi_idx]
+
+            # ── clone template -> new simulation + mesh operation ───────────────
+            mark("setup")
+            model, patch_report = _ss_patch_model(sim, tpl_sim.model, body_names, fixed_names, load_names, force_xyz)
+            diag["patch"] = patch_report
+            simulation = sims_api.create_simulation(pid, sim.SimulationSpec(name=tag, geometry_id=geometry_id, model=model))
+            simulation_id = simulation.simulation_id
+            mesh_op = mesh_api.create_mesh_operation(
+                pid, sim.MeshOperation(name=tag, geometry_id=geometry_id, model=copy.deepcopy(tpl_mesh.model)))
+            mark("mesh")
+            mesh_api.start_mesh_operation(pid, mesh_op.mesh_operation_id, simulation_id=simulation_id)
+            mesh_op = _ss_wait(lambda: mesh_api.get_mesh_operation(pid, mesh_op.mesh_operation_id),
+                               "mesh", deadline, design_related=True)
+            spec = sims_api.get_simulation(pid, simulation_id)
+            spec.mesh_id = mesh_op.mesh_id
+            sims_api.update_simulation(pid, simulation_id, spec)
+            try:
+                chk = sims_api.check_simulation_setup(pid, simulation_id)
+                bad = [str(getattr(e, "message", e)) for e in (getattr(chk, "entries", None) or [])
+                       if str(getattr(e, "severity", "")).upper() == "ERROR"]
+                if bad:
+                    raise _SimScaleError("setup", "SimScale setup check reported errors: " + "; ".join(bad[:4]))
+            except AttributeError:
+                pass
+
+            # ── solve ───────────────────────────────────────────────────────────
+            mark("solve")
+            runs_api = sim.SimulationRunsApi(api_client)
+            run_id = runs_api.create_simulation_run(pid, simulation_id, sim.SimulationRun(name=tag)).run_id
+            runs_api.start_simulation_run(pid, simulation_id, run_id)
+            _ss_wait(lambda: runs_api.get_simulation_run(pid, simulation_id, run_id),
+                     "solve", deadline, design_related=True)
+
+            # ── results ─────────────────────────────────────────────────────────
+            mark("results")
+            fields, listing = _ss_fetch_results(sim, api_client, pid, simulation_id, run_id, tmpdir)
+            mark("render")
+            png, render_status = _ss_render_stress_png(fields, tmpdir)
+            diag["render"] = render_status
+
+        # ── convert SI results to this file's units ─────────────────────────────
+        L = max(exts)
+        scale = 1e3 if fields["points_extent"] < 0.05 * L else 1.0   # metres -> mm if the result mesh is ~1000x smaller
+        vm_raw = float(fields["vm"] or 0.0)
+        vm_mpa = vm_raw / 1e6 if vm_raw > 1e5 else vm_raw            # Pa -> MPa (values that large are Pa)
+        disp_mm = float(fields["disp"] or 0.0) * scale
+        E_tpl = MATERIALS.get(SIMSCALE_TEMPLATE_MATERIAL, MATERIALS["aluminum_6061"])["youngs_modulus_gpa"]
+        E_req = MATERIALS.get(mat_key, MATERIALS["aluminum_6061"])["youngs_modulus_gpa"]
+        disp_mm *= E_tpl / max(E_req, 1e-9)
+        Sy = MATERIALS.get(mat_key, MATERIALS["aluminum_6061"])["yield_strength_mpa"]
+        sfv = Sy / max(vm_mpa, 1e-6)
+        xyz = fields.get("vm_xyz")
+        xyz_mm = [round(float(c) * scale, 2) for c in xyz] if xyz else None
+        crit = {"axis": "xyz"[axis], "position_mm": (xyz_mm[axis] if xyz_mm else None),
+                "strengthen_factor_approx": round(min_sf / sfv, 2) if sfv > 0 else None,
+                "hotspot_xyz_mm": xyz_mm}
+        fem = {
+            "method": "simscale_static_fem",
+            "note": ("SimScale cloud linear-static FEM. Load case: fixed at the min-"
+                     f"{'xyz'[axis]} end face(s), {force_n} N along +{'xyz'[fa]} distributed over the max-"
+                     f"{'xyz'[axis]} end face(s). Peak stress at a fixed/loaded face edge can include a local "
+                     "singularity — judge by where the hotspot is, not just its magnitude."),
+            "stress": {"von_mises_mpa": round(vm_mpa, 3), "axial_mpa": 0.0, "bending_mpa": 0.0,
+                       "shear_mpa": 0.0, "stress_concentration_kt": 1.0},
+            "deflection_mm": round(disp_mm, 4),
+            "safety_factor": round(sfv, 3),
+            "critical_section": crit,
+            "numerically_suspect": bool(vm_mpa <= 0 or vm_mpa > 50 * Sy),
+            "simscale": {"project_id": pid, "geometry_id": geometry_id, "simulation_id": simulation_id,
+                         "run_id": run_id, "mesh_id": getattr(mesh_op, "mesh_id", None),
+                         "run_name": tag, "result_items": listing, "result_file": fields.get("file"),
+                         "template_material": SIMSCALE_TEMPLATE_MATERIAL, "requested_material": mat_key,
+                         "displacement_rescaled_by_E_ratio": round(E_tpl / max(E_req, 1e-9), 4)},
+            "inputs": {"force_n": force_n, "direction": force_dir},
+            "stress_image_png_base64": base64.b64encode(png).decode() if png else None,
+        }
+        mark("done")
+        diag["elapsed_s"] = round(time.time() - t0, 1)
+        return fem, diag
+    except _SimScaleError as e:
+        diag.update(reason=str(e), failed_stage=e.stage, design_related=e.design_related)
+    except Exception as e:
+        diag.update(reason=_ss_format_exception(e), failed_stage=current["stage"], design_related=False)
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+    diag["elapsed_s"] = round(time.time() - t0, 1)
+    return None, diag
 
 
 def topology_optimization_simp(mesh, mat_key, volfrac=0.5,
@@ -915,8 +1577,8 @@ TAPER_KEYWORDS = ("taper","tapered","tapering","drone arm","connecting rod",
     "streamlined","aerodynamic profile","tapered leg","tapered beam",
     "tapered spar","loft between")
 
-GEMINI_CADQUERY_SYSTEM = """You are a CadQuery expert mechanical engineer.
-Generate Python CadQuery code to create the described 3D part.
+BUILD123D_SYSTEM = """You are a build123d expert mechanical engineer.
+Generate Python build123d code (ALGEBRA MODE) to create the described 3D part.
 
 MANDATORY FIRST STEP — REQUIREMENTS CHECKLIST:
 Before writing any geometry code, write a Python comment block enumerating EVERY
@@ -940,49 +1602,75 @@ not submit a script with any unchecked box; if you can't fit a requirement
 in, go back and add it rather than leaving it off the list.
 
 STRICT RULES:
-- Import only: cadquery as cq, math, numpy as np
-- Assign final shape to variable named: result
+- First line: from build123d import *      (only build123d, math and numpy may be imported)
+- Prefer ALGEBRA MODE: Box(...), Pos(x,y,z) * shape, a + b, a - b. Builder blocks
+  (`with BuildPart() as p:` ... `result = p.part`, with Locations()/GridLocations()/PolarLocations()
+  and mode=Mode.SUBTRACT) are also allowed where they make a repeated feature pattern simpler.
+- Assign the final SOLID to a variable named: result   (a solid Part — never a
+  Sketch, Face, Wire, Curve or builder object)
 - All dimensions in millimeters
 - Add fillets to sharp internal corners minimum 0.5mm
 - Add mounting holes where appropriate
 - Code must be syntactically correct Python
 - No explanations, no markdown, pure Python code only
-- No os, sys, subprocess, socket, requests imports
+- No os, sys, subprocess, socket, requests imports; no file reading/writing/exporting
+- If a "VERIFIED build123d API REFERENCE" block is present in the user message, it was read from the
+  installed library: use exactly those signatures, parameters and enum members and never invent others.
 
-AVAILABLE CADQUERY OPERATIONS:
-cq.Workplane("XY"/"XZ"/"YZ")
-.box(length, width, height)
-.circle(radius).extrude(height)
-.cylinder(height, radius)
-.sphere(radius)
-.ellipse(x_radius, y_radius).extrude(height)
-.polygon(n_sides, circumradius).extrude(height)
-.polyline([(x1,y1),(x2,y2),...]).close().extrude(height)
-.spline([(x1,y1,z1),...])
-.circle(r1).workplane(offset=h).circle(r2).loft()
-.spline([(x1,y1,z1),...]).close().extrude(height)
-.workplane().moveTo(x,y).spline([...]).close().extrude(height)
-# Sweep a 2D profile along a curved path — the tool for a genuinely curved
-# structural member (e.g. a smoothly curved arm or duct), not just a straight
-# extrude with fillets bolted on:
-path = cq.Workplane("XZ").spline([(0,0),(x1,z1),(x2,z2)])
-swept = cq.Workplane("XY").circle(r).sweep(path)
-.fillet(radius)
-.chamfer(length)
-.shell(thickness)
-.hole(diameter)
-.cskHole(diameter, csk_diameter, csk_angle)
-.cboreHole(diameter, cboreDiameter, cboreDepth)
-.pushPoints([(x,y),...])
-.rarray(xSpacing, ySpacing, xCount, yCount, center=True)
-.union(other)
-.cut(other)
-.intersect(other)
-.translate((x,y,z))
-.rotate((0,0,0),(0,0,1),angle_degrees)
-.mirror("XY"/"XZ"/"YZ")
-.faces(">Z"/"<Z"/">X"/etc).workplane()
-.edges("|Z"/etc).fillet(radius)
+AVAILABLE BUILD123D OPERATIONS (algebra mode):
+3D primitives — CENTERED on the origin by default (add
+align=(Align.MIN, Align.MIN, Align.MIN) to put the min corner at the origin):
+  Box(length, width, height)                  # X, Y, Z extents
+  Cylinder(radius, height)                    # axis along Z
+  Cone(bottom_radius, top_radius, height)
+  Sphere(radius)
+  Torus(major_radius, minor_radius)
+Placing shapes (a Location times a shape returns the moved shape):
+  Pos(x, y, z) * shape                        # translate
+  Rot(rx, ry, rz) * shape                     # rotate (degrees) about X, Y, Z through the origin
+  Pos(10, 0, 5) * Rot(0, 0, 45) * shape       # rotate first, THEN move
+  Rot(0, 90, 0) * Cylinder(5, 40)             # a cylinder lying along X
+Booleans:
+  a + b        # union        a - b        # cut        a & b        # intersect
+2D sketches -> solids (a sketch lies on the XY plane, extrudes along +Z from z=0):
+  Rectangle(w, h)   Circle(r)   Ellipse(rx, ry)   RegularPolygon(radius, side_count)
+  SlotOverall(width, height)
+  Polygon((x1,y1), (x2,y2), (x3,y3), align=None)   # ALWAYS align=None, otherwise the outline is re-centered
+  extrude(sketch, amount=h)
+  Pos(x, y, z) * sketch   /   Plane.XZ * sketch     # place a sketch before extruding
+  Plane.XY normal = +Z,  Plane.XZ normal = -Y,  Plane.YZ normal = +X
+  revolve(profile, axis=Axis.Z)                     # profile drawn on Plane.XZ
+  loft([Rectangle(30, 10), Pos(0, 0, 100) * Rectangle(15, 6)])
+  # Sweep a 2D profile along a curved path — the tool for a genuinely curved
+  # structural member (smoothly curved arm, duct), not a straight extrude:
+  path = Spline((0, 0, 0), (10, 0, 30), (40, 0, 60))
+  profile = Plane(origin=path @ 0, z_dir=path % 0) * Circle(4)
+  result = sweep(profile, path=path)
+Selecting edges/faces (return a ShapeList):
+  part.edges().filter_by(Axis.Z)               # edges parallel to Z
+  part.edges().filter_by(GeomType.CIRCLE)
+  part.faces().sort_by(Axis.Z)[-1]             # top face   ([0] = bottom face)
+  part.edges().sort_by(Axis.Z)[-4:]            # the four highest edges
+  part.edges().filter_by_position(Axis.Z, 9.5, 10.5)   # edges whose Z lies in a band
+Edge treatment (returns the modified part):
+  part = fillet(part.edges().filter_by(Axis.Z), radius=2)
+  part = chamfer(part.edges().sort_by(Axis.Z)[-4:], length=1)
+Hollowing:
+  part = offset(part, amount=-wall, openings=part.faces().sort_by(Axis.Z)[-1])
+Holes: subtract a cylinder that overshoots BOTH faces of the material it goes through:
+  part = part - Pos(x, y, 0) * Cylinder(r, part_height + 2)
+  For hole patterns compute the (x, y) list with math.cos/math.sin or a loop and subtract each.
+
+FEATURE DECLARATIONS (machine-verified — do not skip):
+For EVERY hole or bore the prompt asks for (and every one you add on your own), put a comment directly
+above the code that cuts it, in exactly this form:
+    # FEATURE: hole dia=6 count=4
+    # FEATURE: bore dia=22 count=2
+`dia` is the DIAMETER in mm (Cylinder() takes the RADIUS, so radius = dia/2); `count` is how many identical
+holes/bores that line covers; one line per distinct diameter. After your script runs, the server measures the
+finished solid's cylindrical cavities and REJECTS the script if a declared hole is missing or the wrong size —
+so declare only what your code really cuts, and make sure the cut actually reaches the material (a cutter
+that misses the part, points along the wrong axis, or is subtracted from a shape you later discard cuts nothing).
 
 ENGINEERING DEFAULTS (apply unless the prompt specifies otherwise):
 - Mounting holes: diameter sized for M3-M6 fasteners, placed ≥2x diameter from any edge
@@ -991,14 +1679,14 @@ ENGINEERING DEFAULTS (apply unless the prompt specifies otherwise):
 - External edges: chamfer 0.5-1mm for safe handling unless a sharp edge is functionally required
 - Keep aspect ratios (longest/shortest dimension) under 15:1 unless the prompt explicitly asks for a slender part
 - Center the part roughly on the origin so the bounding box is well-formed
-- When union()-ing two separately-built solids that attach end-to-end (e.g. an
+- When union-ing (a + b) two separately-built solids that attach end-to-end (e.g. an
   end plate/boss/flange on a tapered or curved member), do NOT place them so
   they only touch at one exact coincident plane with no real overlap — this is
   a common cause of a non-watertight result, especially when their
   cross-sections differ in size at that interface (e.g. a large plate meeting
-  a much smaller tapered tip). Translate the attachment so it genuinely
+  a much smaller tapered tip). Move the attachment so it genuinely
   overlaps the other solid by a small real depth (a few percent of the
-  smaller cross-section's size is enough) before calling union().
+  smaller cross-section's size is enough) before adding it.
 - If the prompt describes a tapered, curved, streamlined, or organic-looking
   shape (e.g. "tapered arm", "curved bracket", "aerodynamic", "smoothly
   blends into"), use loft() between profiles or sweep() along a spline path
@@ -1007,15 +1695,14 @@ ENGINEERING DEFAULTS (apply unless the prompt specifies otherwise):
   is NOT the same as a genuinely tapered or curved shape, and looks
   noticeably different from what was actually asked for.
 - Do NOT blanket-fillet every edge of a loft/tapered solid in one
-  .edges().fillet() call — confirmed live, twice, as a real cause of
-  self-intersecting (non-watertight) geometry with no Python error at all.
-  The corners where a sloped taper edge meets two flat profile edges are a
-  compound 3-edge blend, a known-hard case for any CAD kernel. For a
-  loft/tapered body: skip fillets on it entirely unless the prompt
-  specifically requires edge-breaking there — an unfilleted taper edge is
-  far better than a self-intersecting one. If fillets are truly required,
-  fillet only the flat top/bottom profile edges individually via an
-  explicit edge selector, never .edges() (all edges) on the whole loft.
+  fillet(part.edges(), ...) call — this is a real cause of self-intersecting
+  (non-watertight) geometry with no Python error at all. The corners where a
+  sloped taper edge meets two flat profile edges are a compound 3-edge blend, a
+  known-hard case for any CAD kernel. For a loft/tapered body: skip fillets on
+  it entirely unless the prompt specifically requires edge-breaking there — an
+  unfilleted taper edge is far better than a self-intersecting one. If fillets
+  are truly required, fillet only the flat top/bottom profile edges via an
+  explicit selector (filter_by_position), never all edges of the loft.
 - Words like "flange", "leg", "L-bracket", "bent bracket", "angle bracket", or "folded
   sheet metal" describe TWO FACES THAT ARE NOT COPLANAR — a real fold, not just two
   flat pieces at different in-plane orientations. For ANY part matching this
@@ -1037,9 +1724,10 @@ ENGINEERING DEFAULTS (apply unless the prompt specifies otherwise):
 REFINEMENT_INSTRUCTIONS = """
 You are now in REFINEMENT MODE.
 
-You previously generated a CadQuery script for this part. It was exported to a mesh and
-run through a real engineering analysis pipeline (wall thickness, hole placement, sharp
-corner stress concentrations, FEA safety factor, fatigue, rule-engine checks).
+You previously generated a build123d script for this part. It was exported as a STEP/STL
+and run through a real engineering analysis pipeline: a SimScale cloud FEA run (peak von
+Mises stress, its location, deflection, safety factor) plus wall thickness, hole placement,
+sharp-corner stress concentration, fatigue and rule-engine checks.
 
 The analysis below lists concrete problems with the part as currently designed (or the
 script failed to execute — in that case fix the execution error). Your job is to produce
@@ -1050,16 +1738,30 @@ RULES FOR REFINEMENT:
 - Output a COMPLETE script (not a diff/patch) that can run standalone, same format as before.
 - Directly address each issue: e.g. if "Wall 0.6mm < material min 1.0mm", increase the
   relevant wall/shell thickness in the script's geometry, don't just change a comment.
-- If a hole violates the edge-distance rule, move that hole's pushPoint coordinates inward.
-- If sharp-corner stress concentration (Kf) is too high, add/increase a .fillet() on that edge.
+- If a hole violates the edge-distance rule, move that hole's (x, y) coordinates inward.
+- If sharp-corner stress concentration (Kf) is too high, add/increase a fillet() on that edge.
 - If safety factor is too low, increase cross-sectional area/thickness in the load path,
   or reduce unsupported span, rather than changing the material.
+- If the feedback contains a "SIMSCALE FEA" section, treat it as the authoritative
+  structural result. It gives the peak von Mises stress, WHERE it occurs (x/y/z in mm),
+  the deflection and the safety factor. Add material, fillets, ribs or cross-section AT
+  THAT LOCATION and along the load path leading into it — do not just scale the whole
+  part up, and do not thin any area that was fine. The load case is: fixed at the min end
+  of the longest axis, force applied on the max end.
+- If the feedback says SimScale could not import, mesh or solve the geometry, the shape
+  is topologically bad for FEM: remove sliver features, faces/walls thinner than ~0.5mm,
+  fillets smaller than ~0.3mm, coincident/tangent-only boolean joints and zero-thickness
+  faces, then rebuild the affected boolean with real overlap (see below).
 - If the previous script raised a Python error, fix the root cause (typo, wrong API call,
   bad chaining) — do not just simplify the part away.
+- If the feedback says "DETERMINISTIC FEATURE CHECK FAILED", a hole/bore you declared with a
+  '# FEATURE:' comment is NOT in the solid (measured on the B-rep). Find why the cut did nothing
+  (cutter misses the material, wrong axis, subtraction discarded, re-filled by a later union,
+  radius vs diameter) and fix the geometry. Keep every '# FEATURE:' comment in the script you return.
 - If told the mesh is STILL not watertight AFTER automatic tessellation repair was already
   attempted, this is a REAL geometric defect, not a triangulation artifact — most often a
   boolean union/cut that leaves a gap or self-intersection (e.g. two solids that only
-  partially overlap before a .union(), or a .cut() bore that exits through a corner instead
+  partially overlap before a union, or a cut bore that exits through a corner instead
   of a flat face). Rebuild the affected boolean operation with fully-overlapping/fully-
   enclosed operands rather than adding fillets or changing wall thickness — those don't fix
   a topology gap. Copy this exact overshoot/overlap pattern for whichever boolean op is
@@ -1067,31 +1769,25 @@ RULES FOR REFINEMENT:
 
     # DANGEROUS — cutting tool ends EXACTLY flush with the far face. This leaves a
     # coincident/zero-thickness face where they meet -> non-manifold mesh.
-    bore = cq.Workplane("XY").circle(hole_r).extrude(wall_thickness)     # BAD
-    result = housing.cut(bore)
+    bore = Pos(0, 0, wall_thickness / 2) * Cylinder(hole_r, wall_thickness)          # BAD
+    result = housing - bore
 
     # SAFE — cutting tool starts before the near face and ends after the far face,
     # overshooting BOTH by a real margin (>= 1.0mm or 10% of wall_thickness).
     overshoot = max(1.0, wall_thickness * 0.1)
-    bore = (cq.Workplane("XY")
-            .workplane(offset=-overshoot)
-            .circle(hole_r)
-            .extrude(wall_thickness + 2 * overshoot))
-    result = housing.cut(bore)
+    bore = Pos(0, 0, wall_thickness / 2) * Cylinder(hole_r, wall_thickness + 2 * overshoot)
+    result = housing - bore
 
     # DANGEROUS — second solid starts EXACTLY at the first solid's face, so they
     # only touch (tangent), never truly interpenetrate -> non-manifold seam on union.
-    boss = cq.Workplane("XY").workplane(offset=base_height).circle(r).extrude(h)  # BAD
-    result = base.union(boss)
+    boss = Pos(0, 0, base_height + h / 2) * Cylinder(r, h)                            # BAD
+    result = base + boss
 
     # SAFE — sink the second solid INTO the first by a real overlap margin before
     # unioning, so the two volumes genuinely share interior volume, not just a face.
     overlap = max(0.5, base_height * 0.05)
-    boss = (cq.Workplane("XY")
-            .workplane(offset=base_height - overlap)
-            .circle(r)
-            .extrude(h + overlap))
-    result = base.union(boss)
+    boss = Pos(0, 0, base_height - overlap + (h + overlap) / 2) * Cylinder(r, h + overlap)
+    result = base + boss
 
   This overshoot/overlap margin is the fix — not a fillet, not a wall-thickness change,
   not a different hole position. Apply it only to the boolean operation actually
@@ -1181,6 +1877,10 @@ CEREBRAS_MODEL = os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b")
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+# Nemotron 3 Ultra is a large reasoning model on a shared free tier: a design script can take
+# well over a minute. Raise/lower via env if you see read timeouts.
+NVIDIA_TIMEOUT_S = float(os.environ.get("NVIDIA_TIMEOUT_S", "180"))
+NVIDIA_GEN_MAX_TOKENS = int(os.environ.get("NVIDIA_GEN_MAX_TOKENS", "12000"))
 
 # Optional "strategic advisor" second model for the Engineering Agent — called
 # SPARINGLY (once up front, then once per FAILED run_fea — not per tool call)
@@ -1464,7 +2164,7 @@ def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None):
         }
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=NVIDIA_TIMEOUT_S) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="ignore")
@@ -1477,6 +2177,31 @@ def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None):
         raise
     except Exception as e:
         raise HTTPException(502, f"NVIDIA NIM request failed unexpectedly: {type(e).__name__}: {e}")
+
+    # FIX: this function previously ended right here — it sent the request and
+    # parsed the HTTP response into `data`, but never pulled the actual answer
+    # out of it, so every successful call returned None instead of the
+    # generated text. Every other provider function (_groq_request,
+    # _cerebras_request) ends with exactly this extract-and-validate block;
+    # _nvidia_request was missing it, meaning the whole NVIDIA/Nemotron path
+    # has never actually returned usable output. Reasoning models on NVIDIA's
+    # catalog (Nemotron included) put any chain-of-thought in a SEPARATE
+    # "reasoning_content" field on the message, not in "content" — so no
+    # extra stripping is needed here; reading "content" already excludes it.
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(502, f"Unexpected NVIDIA NIM response shape: {json.dumps(data)[:500]}")
+
+    if not content or not isinstance(content, str):
+        finish = None
+        try: finish = data["choices"][0].get("finish_reason")
+        except Exception: pass
+        hint = (" finish_reason=length: the model spent its whole token budget on reasoning — raise "
+                "NVIDIA_GEN_MAX_TOKENS." if finish == "length" else "")
+        raise HTTPException(502, f"NVIDIA NIM returned empty/null content.{hint} "
+                                  f"Raw response: {json.dumps(data)[:500]}")
+    return content
 
 
 def _openrouter_request(messages, temperature=0.15, max_tokens=3000, model=None, timeout=60):
@@ -1766,6 +2491,10 @@ def _claude_request(system, messages, temperature=0.15, max_tokens=3000, model=N
 
 def _clean_code_block(text: str, lang_hints=("python","json")) -> str:
     t = text.strip()
+    # If the model wrapped the code in prose, take the largest fenced block instead.
+    fenced = re.findall(r"```[a-zA-Z0-9_+-]*\n(.*?)```", t, flags=re.S)
+    if fenced:
+        return max(fenced, key=len).strip()
     for h in lang_hints:
         t = t.replace(f"```{h}", "```")
     if t.startswith("```"):
@@ -1774,25 +2503,662 @@ def _clean_code_block(text: str, lang_hints=("python","json")) -> str:
         t = t[:-3]
     return t.strip()
 
+# ═══════════════════════════════════════════════════════════════════
+# API KNOWLEDGE BASE (RAG) — stop the LLM inventing build123d calls
+#
+# Ground truth = the INSTALLED build123d package itself: every class/function/enum/method
+# signature and docstring is read with `inspect`, so the reference always matches the exact
+# version deployed (and only names the sandbox really exposes are indexed — never the file
+# I/O functions the sandbox forbids). It is topped up with
+#   * a small set of idiom snippets (algebra mode, BuildPart + Locations + Mode.SUBTRACT, ...),
+#     each one machine-checked against the installed library at index time — an idiom that
+#     uses a name or keyword the installed version doesn't have is DROPPED, not shown;
+#   * any .md/.rst/.txt/.py files under KB_DOCS_DIR (the Docker build drops build123d's own
+#     docs + examples there when it can).
+#
+# Retrieval per generation call:  BM25 (exact identifiers)  +  NVIDIA nv-embedqa-e5-v5
+# (semantic)  ->  reciprocal-rank fusion  ->  NVIDIA reranker (precision filter)  ->  top-k
+# chunks injected into the prompt. Identifiers that appear in the previous script / the error
+# message are looked up EXACTLY and always included.
+#
+# Degrades gracefully at every level: no NVIDIA key or embeddings down -> BM25 only; reranker
+# unavailable -> fused order; KB off/not ready -> the prompt is unchanged. It never blocks or
+# fails a generation.
+#
+# Separately, lint_b3d_script() statically checks a script against the installed signatures
+# (unknown names / keywords / enum members / too many positionals, with "did you mean")
+# and is appended to the feedback when a script fails to run — so ONE refinement round
+# fixes ALL the API mistakes instead of one per round.
+# ═══════════════════════════════════════════════════════════════════
+import hashlib
+import inspect
+import difflib
+import enum
+import contextvars
+
+KB_ENABLED = _env_flag("KB_ENABLED", True)
+# Semantic (embedding) retrieval is OFF by default: the index would have to be re-embedded (dozens of NVIDIA
+# API calls, shared with your generation quota) every time the instance boots, and Render's free disk is
+# ephemeral (a sleeping instance wakes cold). BM25 + exact-identifier lookup + the reranker already cover
+# the main job (finding the right function signature). Set KB_EMBEDDINGS=1 if you have a persistent disk
+# (KB_INDEX_PATH) or don't mind the warm-up.
+KB_EMBEDDINGS = _env_flag("KB_EMBEDDINGS", False)
+KB_TOP_K = int(os.environ.get("KB_TOP_K", "6"))
+KB_MAX_CHARS = int(os.environ.get("KB_MAX_CHARS", "7000"))
+KB_TIMEOUT_S = float(os.environ.get("KB_TIMEOUT_S", "25"))
+KB_DOCS_DIR = os.environ.get("KB_DOCS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge"))
+KB_INDEX_PATH = os.environ.get("KB_INDEX_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "kb_index.npz"))
+KB_EMBED_BATCH = int(os.environ.get("KB_EMBED_BATCH", "32"))
+KB_EMBED_PAUSE_S = float(os.environ.get("KB_EMBED_PAUSE_S", "1.6"))   # stay under the free tier's ~40 requests/min
+
+NVIDIA_EMBED_MODEL = os.environ.get("NVIDIA_EMBED_MODEL", "nvidia/nv-embedqa-e5-v5")
+NVIDIA_EMBED_URL = os.environ.get("NVIDIA_EMBED_URL", "https://integrate.api.nvidia.com/v1/embeddings")
+# Reranker candidates, tried in this order until one answers. `nvidia/rerank-qa-mistral-4b` is last on purpose:
+# NVIDIA's own model page says that API was deprecated on 08/24/2026. Put your preferred model FIRST via
+# NVIDIA_RERANK_MODELS (comma-separated) or disable reranking with KB_RERANK=0.
+NVIDIA_RERANK_MODELS = [m.strip() for m in os.environ.get(
+    "NVIDIA_RERANK_MODELS",
+    "nvidia/llama-nemotron-rerank-vl-1b-v2,nvidia/llama-nemotron-rerank-1b-v2,"
+    "nvidia/llama-3.2-nv-rerankqa-1b-v2,nvidia/nv-rerankqa-mistral-4b-v3,nvidia/rerank-qa-mistral-4b").split(",")
+    if m.strip()]
+KB_RERANK = _env_flag("KB_RERANK", True)
+
+_KB_METHOD_CLASSES = ("Shape", "ShapeList", "Mixin1D", "Mixin2D", "Mixin3D", "Face", "Edge", "Wire", "Solid",
+                      "Compound", "Part", "Sketch", "Curve", "Location", "Plane", "Axis", "Vector", "BoundBox",
+                      "BuildPart", "BuildSketch", "BuildLine")
+_KB_STOP = {"the", "a", "an", "of", "to", "in", "and", "or", "for", "with", "is", "are", "be", "by", "on", "as",
+            "it", "this", "that", "from", "at", "we", "you", "your", "can", "will", "not"}
+_KB_FORBIDDEN_IN_DOCS = ("export_", "import_step", "import_stl", "import_brep", "ocp_vscode", "open(", "import os",
+                         "import sys", "subprocess", "Mesher", "ExportSVG", "ExportDXF")
+
+_kb = {"chunks": [], "bm25": None, "emb": None, "mode": "off", "error": None, "built_at": None,
+       "building": False, "counts": {}, "dropped_idioms": [], "skipped_doc_chunks": 0, "by_name": {},
+       "b3d_version": None, "embed_dim": None, "fingerprint": None, "docs_files": 0}
+_kb_lock = threading.Lock()
+_rr = {"model": None, "url": None, "disabled_until": 0.0, "last_error": None, "tried": []}
+_KB_TRACE = contextvars.ContextVar("kb_trace", default=None)
+
+# ── the ONE network function (monkeypatched in tests) ───────────────────────
+def _nv_post(url, payload, timeout=30):
+    """POST JSON with the NVIDIA key. Returns (http_status | None, parsed_json | None, error_text)."""
+    if not NVIDIA_API_KEY:
+        return None, None, "NVIDIA_API_KEY not set"
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
+                                 headers={"Authorization": f"Bearer {NVIDIA_API_KEY}",
+                                          "Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read()), ""
+    except urllib.error.HTTPError as e:
+        return e.code, None, e.read().decode(errors="ignore")[:400]
+    except Exception as e:
+        return None, None, f"{type(e).__name__}: {str(e)[:200]}"
+
+
+# ── tokenizer + BM25 (exact identifier matching; no network) ────────────────
+def _kb_tokens(text):
+    toks = []
+    for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]*|\d+", text or ""):
+        parts = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", w).replace("_", " ").lower().split()
+        toks.extend(parts)
+        if len(parts) > 1:
+            toks.append(w.lower())
+    return [t for t in toks if len(t) > 1 and t not in _KB_STOP]
+
+
+class _BM25:
+    def __init__(self, docs, k1=1.5, b=0.75):
+        self.k1, self.b = k1, b
+        self.tf, self.df, self.dl = [], {}, []
+        for d in docs:
+            counts = {}
+            for t in d:
+                counts[t] = counts.get(t, 0) + 1
+            self.tf.append(counts)
+            self.dl.append(len(d))
+            for t in counts:
+                self.df[t] = self.df.get(t, 0) + 1
+        self.n = len(docs)
+        self.avg = (sum(self.dl) / self.n) if self.n else 1.0
+        self.inv = {}
+        for i, counts in enumerate(self.tf):
+            for t in counts:
+                self.inv.setdefault(t, []).append(i)
+
+    def scores(self, q):
+        out = {}
+        for t in set(q):
+            if t not in self.inv:
+                continue
+            idf = math.log(1 + (self.n - self.df[t] + 0.5) / (self.df[t] + 0.5))
+            for i in self.inv[t]:
+                f = self.tf[i][t]
+                out[i] = out.get(i, 0.0) + idf * f * (self.k1 + 1) / (f + self.k1 * (1 - self.b + self.b * self.dl[i] / self.avg))
+        return out
+
+
+# ── corpus 1: the installed build123d itself ────────────────────────────────
+def _kb_doc(obj, limit=1200):
+    d = (inspect.getdoc(obj) or "").strip()
+    d = re.sub(r"\n{3,}", "\n\n", d)
+    return d if len(d) <= limit else d[:limit].rsplit("\n", 1)[0] + "\n..."
+
+def _kb_sig(obj):
+    try:
+        s = str(inspect.signature(obj))
+    except (TypeError, ValueError):
+        return "(...)"
+    return s if len(s) <= 420 else s[:420] + "...)"
+
+def _kb_introspect():
+    ns = _b3d_public_namespace()
+    chunks = []
+    def add(kind, title, text, names):
+        chunks.append({"kind": kind, "title": title, "text": text, "names": names})
+    for name in sorted(ns):
+        v = ns[name]
+        if isinstance(v, type):
+            if issubclass(v, enum.Enum):
+                members = [m.name for m in v]
+                add("enum", f"ENUM {name}", f"ENUM {name} - members: {', '.join(members)}\nUse as {name}.{members[0] if members else 'X'}\n{_kb_doc(v, 600)}", [name])
+                continue
+            pub = [a for a in dir(v) if not a.startswith("_")]
+            def _callable_attr(a):
+                try:
+                    return callable(getattr(v, a))
+                except Exception:
+                    return False
+            meths = [a for a in pub if _callable_attr(a)][:30]
+            extra = ""
+            if name in ("Plane", "Axis"):
+                known = [a for a in ("XY", "YZ", "ZX", "XZ", "ZY", "YX", "X", "Y", "Z", "front", "back", "left", "right", "top", "bottom") if hasattr(v, a)]
+                if known:
+                    extra = f"\nPredefined: {', '.join(name + '.' + a for a in known)}"
+            add("class", f"CLASS {name}", f"CLASS {name}{_kb_sig(v)}\n{_kb_doc(v)}{extra}"
+                + (f"\nMethods: {', '.join(meths)}" if meths else ""), [name])
+            if name in _KB_METHOD_CLASSES:
+                for m in pub:
+                    if m not in v.__dict__:
+                        continue                                   # inherited: documented under its defining class
+                    try:
+                        static = inspect.getattr_static(v, m)
+                        member = getattr(v, m)
+                    except Exception:
+                        continue
+                    if isinstance(static, property):
+                        doc = _kb_doc(static.fget, 500) if static.fget else ""
+                        if doc:
+                            add("method", f"PROPERTY {name}.{m}", f"PROPERTY {name}.{m}\n{doc}", [f"{name}.{m}"])
+                    elif callable(member):
+                        doc = _kb_doc(member, 800)
+                        if doc:
+                            add("method", f"METHOD {name}.{m}", f"METHOD {name}.{m}{_kb_sig(member)}\n{doc}", [f"{name}.{m}"])
+        elif callable(v):
+            add("function", f"FUNCTION {name}", f"FUNCTION {name}{_kb_sig(v)}\n{_kb_doc(v)}", [name])
+    return chunks
+
+
+# ── corpus 2: idioms, each verified against the installed library ───────────
+_KB_IDIOMS = [
+    ("Plate with a hole pattern (algebra mode)",
+     "from build123d import *\nplate = Box(60, 40, 8)\nfor x, y in [(-20, -12), (20, -12), (-20, 12), (20, 12)]:\n"
+     "    plate = plate - Pos(x, y, 0) * Cylinder(3, 10)   # Cylinder(radius, height); overshoots both faces\nresult = plate\n"),
+    ("Holes with BuildPart, Locations and Mode.SUBTRACT (builder mode)",
+     "from build123d import *\nwith BuildPart() as p:\n    Box(60, 40, 8)\n    with Locations((-20, -12), (20, -12), (-20, 12), (20, 12)):\n"
+     "        Cylinder(3, 10, mode=Mode.SUBTRACT)\nresult = p.part\n"),
+    ("Bolt pattern on a grid with GridLocations (builder mode)",
+     "from build123d import *\nwith BuildPart() as p:\n    Box(80, 50, 6)\n    with GridLocations(60, 30, 2, 2):\n"
+     "        Cylinder(2.5, 8, mode=Mode.SUBTRACT)\nresult = p.part\n"),
+    ("Bolt circle with PolarLocations (builder mode)",
+     "from build123d import *\nwith BuildPart() as p:\n    Cylinder(40, 8)\n    with PolarLocations(28, 6):\n"
+     "        Cylinder(3, 10, mode=Mode.SUBTRACT)\n    Cylinder(8, 10, mode=Mode.SUBTRACT)   # centre bore\nresult = p.part\n"),
+    ("Sketch with cut-outs, then extrude (builder mode)",
+     "from build123d import *\nwith BuildPart() as p:\n    with BuildSketch():\n        Rectangle(60, 30)\n        with Locations((-20, 0), (20, 0)):\n"
+     "            Circle(4, mode=Mode.SUBTRACT)\n    extrude(amount=8)\nresult = p.part\n"),
+    ("Extrude a 2D sketch (algebra mode)",
+     "from build123d import *\nsketch = Rectangle(60, 30) - SlotOverall(20, 6)\nresult = extrude(sketch, amount=8)\n"),
+    ("Fillet the vertical edges of a block",
+     "from build123d import *\npart = Box(50, 30, 10)\npart = fillet(part.edges().filter_by(Axis.Z), radius=4)\nresult = part\n"),
+    ("Chamfer the top edges",
+     "from build123d import *\npart = Box(50, 30, 10)\npart = chamfer(part.edges().group_by(Axis.Z)[-1], length=1.5)\nresult = part\n"),
+    ("Select faces and edges by position",
+     "from build123d import *\npart = Box(50, 30, 10)\ntop_face = part.faces().sort_by(Axis.Z)[-1]\nbottom_edges = part.edges().group_by(Axis.Z)[0]\n"
+     "vertical_edges = part.edges().filter_by(Axis.Z)\nresult = part\n"),
+    ("Tube lying along X (rotate a Z-axis cylinder)",
+     "from build123d import *\nresult = Rot(0, 90, 0) * (Cylinder(10, 50) - Cylinder(7, 52))\n"),
+    ("Hollow box with an open top",
+     "from build123d import *\npart = Box(60, 40, 30)\nresult = offset(part, amount=-2, openings=part.faces().sort_by(Axis.Z)[-1])\n"),
+    ("Revolve a profile into a solid of revolution",
+     "from build123d import *\nprofile = Plane.XZ * Polygon((0, 0), (10, 0), (10, 20), (4, 30), (0, 30), align=None)\nresult = revolve(profile, axis=Axis.Z)\n"),
+    ("Sweep a circle along a spline (curved arm / duct)",
+     "from build123d import *\npath = Spline((0, 0, 0), (10, 0, 30), (40, 0, 60))\nprofile = Plane(origin=path @ 0, z_dir=path % 0) * Circle(4)\nresult = sweep(profile, path=path)\n"),
+    ("Mirror a feature across a plane",
+     "from build123d import *\nhalf = Pos(20, 0, 0) * Box(30, 20, 10)\nresult = half + mirror(half, about=Plane.YZ)\n"),
+    ("Rounded rectangle plate",
+     "from build123d import *\nresult = extrude(RectangleRounded(60, 30, 5), amount=6)\n"),
+]
+
+def _kb_idiom_chunks():
+    good, dropped = [], []
+    for title, code in _KB_IDIOMS:
+        try:
+            ast.parse(code)
+            issues = lint_b3d_script(code, max_issues=3)
+        except SyntaxError as e:
+            issues = [f"syntax error {e}"]
+        if issues:
+            dropped.append({"idiom": title, "why": issues[0][:160]})
+            continue
+        good.append({"kind": "idiom", "title": f"EXAMPLE {title}", "names": [],
+                     "text": f"EXAMPLE - {title} (checked against the installed build123d)\n```python\n{code}```"})
+    return good, dropped
+
+
+# ── corpus 3: user/Docker-supplied docs and examples ────────────────────────
+def _kb_sanitize_example(text):
+    keep = []
+    for line in text.splitlines():
+        if re.search(r"ocp_vscode|\bshow(_object)?\(|export_|import_(step|stl|brep|svg)|\bset_defaults\(|^\s*from\s+(os|sys)\b|^\s*import\s+(os|sys)\b", line):
+            continue
+        keep.append(line)
+    return "\n".join(keep)
+
+def _kb_doc_chunks(root):
+    chunks, skipped, files = [], 0, 0
+    if not root or not os.path.isdir(root):
+        return chunks, skipped, files
+    for dirpath, _dirs, fnames in os.walk(root):
+        for fn in sorted(fnames):
+            if not fn.lower().endswith((".md", ".rst", ".txt", ".py")) or fn.lower() == "readme.txt":
+                continue
+            path = os.path.join(dirpath, fn)
+            try:
+                if os.path.getsize(path) > 400_000:
+                    continue
+                text = open(path, encoding="utf-8", errors="ignore").read()
+            except Exception:
+                continue
+            files += 1
+            rel = os.path.relpath(path, root)
+            if fn.endswith(".py"):
+                text = _kb_sanitize_example(text)
+                parts = [text] if len(text) <= 1800 else [p for p in re.split(r"\n\s*\n(?=\S)", text) if p.strip()]
+            else:
+                text = re.sub(r"^\.\. (image|figure|toctree|index|only|raw)::.*$", "", text, flags=re.M)
+                parts = [p for p in re.split(r"\n\s*\n", text) if p.strip()]
+            buf = ""
+            merged = []
+            for p in parts:
+                if len(buf) + len(p) < 1200:
+                    buf += ("\n\n" if buf else "") + p
+                else:
+                    if buf:
+                        merged.append(buf)
+                    buf = p
+            if buf:
+                merged.append(buf)
+            for m in merged:
+                m = m.strip()[:1800]
+                if len(m) < 60:
+                    continue
+                if any(tok in m for tok in _KB_FORBIDDEN_IN_DOCS):
+                    skipped += 1
+                    continue
+                chunks.append({"kind": "doc", "title": f"DOC {rel}", "names": [], "text": f"DOC {rel}\n{m}"})
+    return chunks, skipped, files
+
+
+# ── NVIDIA embeddings + reranker ────────────────────────────────────────────
+def _kb_embed(texts, input_type):
+    """-> float32 array (n, d), L2-normalised. Raises RuntimeError on failure."""
+    rows = []
+    for i in range(0, len(texts), KB_EMBED_BATCH):
+        batch = [t[:1800] for t in texts[i:i + KB_EMBED_BATCH]]
+        for attempt in range(5):
+            status, data, err = _nv_post(NVIDIA_EMBED_URL, {"model": NVIDIA_EMBED_MODEL, "input": batch,
+                                                            "input_type": input_type, "encoding_format": "float",
+                                                            "truncate": "END"}, timeout=60)
+            if status == 200 and data and data.get("data"):
+                break
+            if status in (429, 500, 502, 503, 504, None) and attempt < 4:
+                time.sleep(min(2 ** attempt * 2, 20))
+                continue
+            raise RuntimeError(f"embeddings HTTP {status}: {err[:200]}")
+        rows.extend(r["embedding"] for r in sorted(data["data"], key=lambda r: r.get("index", 0)))
+        if len(texts) > KB_EMBED_BATCH:
+            time.sleep(KB_EMBED_PAUSE_S)
+    arr = np.asarray(rows, dtype=np.float32)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    return arr / np.maximum(norms, 1e-9)
+
+def _rerank_urls(model):
+    short = model.split("/")[-1]
+    return ["https://integrate.api.nvidia.com/v1/ranking",
+            f"https://ai.api.nvidia.com/v1/retrieval/nvidia/{short.replace('.', '_')}/reranking"]
+
+def _kb_rerank(query, passages):
+    """[(index, logit)] best-first, or None when reranking is unavailable. The first (model, endpoint)
+    that answers is remembered; if every candidate fails (e.g. models retired) reranking is switched off
+    for 15 minutes instead of paying a failed round-trip on every request."""
+    if not KB_RERANK or not NVIDIA_API_KEY or not passages:
+        return None
+    now = time.time()
+    if now < _rr["disabled_until"]:
+        return None
+    combos = [(_rr["model"], _rr["url"])] if _rr["model"] else [(m, u) for m in NVIDIA_RERANK_MODELS for u in _rerank_urls(m)]
+    for model, url in combos:
+        payload = {"model": model, "query": {"text": query[:1200]},
+                   "passages": [{"text": p[:1800]} for p in passages], "truncate": "END"}
+        status, data, err = _nv_post(url, payload, timeout=25)
+        if status == 200 and data and data.get("rankings"):
+            _rr.update(model=model, url=url, last_error=None)
+            return sorted(((int(r["index"]), float(r.get("logit", 0.0))) for r in data["rankings"]), key=lambda t: -t[1])
+        _rr["tried"] = (_rr["tried"] + [f"{model} @ {url.split('/v1/')[1][:40]} -> {status}"])[-12:]
+        _rr["last_error"] = f"{model}: HTTP {status} {err[:120]}"
+        if status in (401, 403):
+            break                                  # auth problem: other models will not help
+        if status == 429:
+            return None                            # transient: keep the cached model, just skip this once
+        if _rr["model"]:                           # cached combo stopped working -> re-probe from scratch next time
+            _rr["model"] = _rr["url"] = None
+    _rr["disabled_until"] = now + 900
+    return None
+
+
+# ── index lifecycle ─────────────────────────────────────────────────────────
+def kb_build(force=False):
+    """(Re)build the knowledge base. Chunking + BM25 is instant (mode 'lexical'); embeddings are then
+    loaded from KB_INDEX_PATH or fetched from NVIDIA (mode 'hybrid'). Safe to call from a thread."""
+    with _kb_lock:
+        if _kb["building"]:
+            return
+        _kb["building"] = True
+        _kb["error"] = None
+    try:
+        chunks = []
+        if B3D:
+            chunks += _kb_introspect()
+            idioms, dropped = _kb_idiom_chunks()
+            chunks += idioms
+            _kb["dropped_idioms"] = dropped
+        docs, skipped, nfiles = _kb_doc_chunks(KB_DOCS_DIR)
+        chunks += docs
+        for i, c in enumerate(chunks):
+            c["id"] = i
+            c["embed_text"] = c["text"][:1800]
+        by_name = {}
+        for c in chunks:
+            for n in c["names"]:
+                by_name.setdefault(n, []).append(c["id"])
+        bm25 = _BM25([_kb_tokens(c["title"] + " " + c["text"]) for c in chunks])
+        ver = getattr(b3d, "__version__", None) if B3D else None
+        fp = hashlib.sha1((NVIDIA_EMBED_MODEL + "|" + str(ver) + "|" + "\x00".join(c["embed_text"] for c in chunks)).encode()).hexdigest()
+        counts = {}
+        for c in chunks:
+            counts[c["kind"]] = counts.get(c["kind"], 0) + 1
+        with _kb_lock:
+            _kb.update(chunks=chunks, bm25=bm25, by_name=by_name, counts=counts, b3d_version=ver, fingerprint=fp,
+                       skipped_doc_chunks=skipped, docs_files=nfiles, emb=None,
+                       mode="lexical" if chunks else "off", built_at=time.time())
+        if not chunks or not NVIDIA_API_KEY or not KB_EMBEDDINGS:
+            if not NVIDIA_API_KEY:
+                _kb["error"] = "NVIDIA_API_KEY not set — lexical (BM25) retrieval only"
+            return
+        emb = None
+        if not force and os.path.exists(KB_INDEX_PATH):
+            try:
+                z = np.load(KB_INDEX_PATH, allow_pickle=False)
+                if str(z["fp"]) == fp and z["emb"].shape[0] == len(chunks):
+                    emb = z["emb"].astype(np.float32)
+            except Exception:
+                emb = None
+        if emb is None:
+            emb = _kb_embed([c["embed_text"] for c in chunks], "passage")
+            try:
+                np.savez_compressed(KB_INDEX_PATH, emb=emb.astype(np.float16), fp=np.array(fp))
+            except Exception:
+                pass                              # a read-only disk only costs a re-embed next boot
+            emb = emb.astype(np.float32)
+        with _kb_lock:
+            _kb.update(emb=emb, mode="hybrid", embed_dim=int(emb.shape[1]))
+    except Exception as e:
+        _kb["error"] = f"{type(e).__name__}: {str(e)[:300]}"
+    finally:
+        _kb["building"] = False
+
+
+def _rrf(lists, k=60):
+    score = {}
+    for lst in lists:
+        for rank, cid in enumerate(lst):
+            score[cid] = score.get(cid, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(score, key=lambda c: -score[c])
+
+
+def kb_retrieve(query, exact_names=(), k=None):
+    """-> (chunks, info). Hybrid retrieval + rerank; identifiers in `exact_names` are always included."""
+    k = k or KB_TOP_K
+    t0 = time.time()
+    with _kb_lock:
+        chunks, bm25, emb, by_name, mode = _kb["chunks"], _kb["bm25"], _kb["emb"], _kb["by_name"], _kb["mode"]
+    info = {"mode": mode, "rerank": "off"}
+    if not chunks:
+        return [], info
+    lists = []
+    bm = bm25.scores(_kb_tokens(query))
+    lists.append(sorted(bm, key=lambda i: -bm[i])[:30])
+    if emb is not None:
+        try:
+            qv = _kb_embed([query], "query")[0]
+            lists.append([int(i) for i in np.argsort(-(emb @ qv))[:30]])
+        except Exception as e:
+            info["embed_error"] = str(e)[:160]
+            info["mode"] = "lexical (embedding query failed)"
+    cand = _rrf(lists)[:20]
+    order = cand
+    ranked = _kb_rerank(query, [chunks[i]["embed_text"] for i in cand]) if len(cand) > 1 else None
+    if ranked:
+        order = [cand[i] for i, _ in ranked if i < len(cand)]
+        info["rerank"] = _rr["model"]
+    elif KB_RERANK and NVIDIA_API_KEY:
+        info["rerank"] = f"unavailable ({_rr['last_error'] or 'cooling down'})"
+    picked = []
+    for n in exact_names:
+        for cid in by_name.get(n, [])[:1]:
+            if cid not in picked:
+                picked.append(cid)
+        if len(picked) >= 3:
+            break
+    info["exact"] = len(picked)
+    for cid in order:
+        if len(picked) >= k + info["exact"]:
+            break
+        if cid not in picked:
+            picked.append(cid)
+    info["ms"] = int((time.time() - t0) * 1000)
+    return [chunks[i] for i in picked], info
+
+
+def kb_format(chunks, max_chars=None):
+    max_chars = max_chars or KB_MAX_CHARS
+    ver = _kb.get("b3d_version") or "installed"
+    head = (f"VERIFIED build123d API REFERENCE (read from the installed library, v{ver}). "
+            f"Use ONLY these names, parameters and enum members — do not invent others. "
+            f"Prefer algebra mode; use BuildPart/Locations/Mode.SUBTRACT only where an example below shows the need.")
+    out, used = [head], len(head)
+    for c in chunks:
+        body = c["text"]
+        if used + len(body) + 2 > max_chars:
+            body = body[:max(0, max_chars - used - 20)].rstrip() + "\n..."
+            if len(body) < 80:
+                break
+        out.append(body)
+        used += len(body) + 2
+        if used >= max_chars:
+            break
+    return "\n\n".join(out) + "\n=== END REFERENCE ==="
+
+
+_EXEC_ERR_MARKERS = ("Script execution failed", "Script syntax error", "Unsafe operation", "did not assign",
+                     "not a valid B-rep", "zero volume")
+
+def _kb_identifiers(text):
+    return re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text or "")
+
+def _kb_context_sync(query, exact_candidates):
+    with _kb_lock:
+        by_name = _kb["by_name"]
+    exact = []
+    for n in exact_candidates:
+        if n in by_name and n not in exact:
+            exact.append(n)
+    chunks, info = kb_retrieve(query, exact_names=exact)
+    info["titles"] = [c["title"] for c in chunks]
+    return (kb_format(chunks) if chunks else ""), info
+
+async def kb_context_for(prompt, previous_script=None, feedback=None):
+    """Reference block for the prompt ('' when the KB is off / not ready / anything goes wrong)."""
+    trace = _KB_TRACE.get()
+    if trace is None:
+        trace = {}
+        _KB_TRACE.set(trace)
+    trace["enabled"] = KB_ENABLED
+    try:
+        if not KB_ENABLED or not _kb["chunks"]:
+            trace["skipped"] = "kb off" if not KB_ENABLED else "kb not ready"
+            return ""
+        is_exec_err = bool(feedback) and any(m in feedback for m in _EXEC_ERR_MARKERS)
+        query = (feedback[:700] + " " if feedback else "") + prompt[:400]
+        # exact lookups: identifiers on the failing line first, then everything the script uses
+        cands = []
+        if is_exec_err:
+            cands += _kb_identifiers(feedback)
+            cands += _kb_identifiers(previous_script) if previous_script else []
+        block, info = await asyncio.wait_for(asyncio.to_thread(_kb_context_sync, query, cands), KB_TIMEOUT_S)
+        trace.update(info)
+        trace["chars"] = len(block)
+        return block
+    except Exception as e:
+        trace["error"] = f"{type(e).__name__}: {str(e)[:160]}"
+        return ""
+
+
+# ── static API lint against the installed signatures ────────────────────────
+_LINT_BUILTINS = {"abs", "min", "max", "round", "range", "len", "sum", "float", "int", "bool", "str", "list", "tuple",
+                  "dict", "set", "enumerate", "zip", "map", "filter", "sorted", "reversed", "isinstance", "any", "all",
+                  "pow", "divmod", "print", "iter", "next", "slice", "Exception", "ValueError", "TypeError",
+                  "ZeroDivisionError", "True", "False", "None", "math", "np", "result", "make_bent_bracket",
+                  "make_tapered_beam", "as_solid"}
+
+def lint_b3d_script(script, max_issues=8):
+    """Static check of a generated script against the INSTALLED build123d: unknown names, unknown keyword
+    arguments, too many positional arguments, and unknown members on classes/enums (Mode.SUBTRACTION).
+    Returns a list of readable issues (each with 'did you mean' and the true signature)."""
+    if not B3D:
+        return []
+    try:
+        tree = ast.parse(script)
+    except SyntaxError:
+        return []
+    ns = _b3d_public_namespace()
+    defined = set(_LINT_BUILTINS)
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            defined.add(n.id)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defined.add(n.name)
+        elif isinstance(n, ast.arg):
+            defined.add(n.arg)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for a in n.names:
+                defined.add((a.asname or a.name).split(".")[0])
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            defined.add(n.name)
+    issues = []
+    def add(node, msg):
+        if len(issues) < max_issues:
+            issues.append(f"line {getattr(node, 'lineno', '?')}: {msg}")
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in ns and n.id not in defined:
+            close = difflib.get_close_matches(n.id, list(ns), n=3, cutoff=0.7)
+            add(n, f"unknown name '{n.id}'" + (f" — did you mean {', '.join(close)}?" if close else "")
+                + " (only build123d names, math and np exist in this environment)")
+        elif isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and isinstance(ns.get(n.value.id), type):
+            cls = ns[n.value.id]
+            if not hasattr(cls, n.attr) and not n.attr.startswith("_"):
+                members = ([m.name for m in cls] if issubclass(cls, enum.Enum)
+                           else [a for a in dir(cls) if not a.startswith("_")])
+                close = difflib.get_close_matches(n.attr, members, n=3, cutoff=0.6)
+                add(n, f"{n.value.id} has no member '{n.attr}'" + (f" — did you mean {', '.join(close)}?" if close else "")
+                    + (f" Members: {', '.join(members[:14])}" if issubclass(cls, enum.Enum) else ""))
+        elif isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ns and callable(ns[n.func.id]):
+            obj = ns[n.func.id]
+            try:
+                sig = inspect.signature(obj)
+            except (TypeError, ValueError):
+                continue
+            params = sig.parameters
+            kinds = [p.kind for p in params.values()]
+            has_varkw = inspect.Parameter.VAR_KEYWORD in kinds
+            has_varpos = inspect.Parameter.VAR_POSITIONAL in kinds
+            if not has_varkw:
+                for kw in n.keywords:
+                    if kw.arg and kw.arg not in params:
+                        close = difflib.get_close_matches(kw.arg, list(params), n=2, cutoff=0.5)
+                        add(n, f"{n.func.id}() has no parameter '{kw.arg}'" + (f" — did you mean {', '.join(close)}?" if close else "")
+                            + f" Real signature: {n.func.id}{_kb_sig(obj)}")
+            if not has_varpos and not any(isinstance(a, ast.Starred) for a in n.args):
+                cap = sum(1 for p in params.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD))
+                if len(n.args) > cap:
+                    add(n, f"{n.func.id}() takes at most {cap} positional arguments but {len(n.args)} were given. "
+                           f"Real signature: {n.func.id}{_kb_sig(obj)}")
+    return issues
+
+
+def _kb_lint_report(issues):
+    return ("STATIC API CHECK of your previous script against the installed build123d (fix ALL of these in one go):\n"
+            + "\n".join(f"- {i}" for i in issues))
+
+async def _kb_enrich_feedback(previous_script, feedback):
+    """When the previous script failed to run, append the static API check so one round fixes every API mistake."""
+    try:
+        if any(m in feedback for m in _EXEC_ERR_MARKERS):
+            issues = await asyncio.to_thread(lint_b3d_script, previous_script)
+            t = _KB_TRACE.get()
+            if t is not None:
+                t["lint_issues"] = len(issues)
+            if issues:
+                return feedback + "\n\n" + _kb_lint_report(issues)
+    except Exception:
+        pass
+    return feedback
+
+
 async def gemini_generate_script(prompt: str, previous_script: Optional[str] = None,
                                   feedback: Optional[str] = None) -> str:
     """
-    Generate/refine a CadQuery script via whichever provider AI_PROVIDER selects —
-    direct Claude API or the Lovable/Gemini gateway. Same prompting logic either way;
-    only the transport differs (see _claude_request vs _lovable_request).
+    Generate/refine a build123d script via whichever provider AI_PROVIDER selects
+    (nvidia = Nemotron via NIM, groq, cerebras, openrouter, claude, gemini, lovable).
+    Same prompting logic for all; only the transport differs. (Name kept for backward
+    compatibility — it is not Gemini-specific.)
 
     - First call (previous_script/feedback are None): plain generation from `prompt`.
     - Refinement call: include the prior script and an engineering-analysis feedback
       report so the model can produce a corrected version targeting the same part.
     """
-    system_prompt = GEMINI_CADQUERY_SYSTEM + REFINEMENT_INSTRUCTIONS
+    system_prompt = BUILD123D_SYSTEM + REFINEMENT_INSTRUCTIONS
+    _KB_TRACE.set({})            # per-call trace, read by the refinement loop
 
     if previous_script and feedback:
+        # a failed script gets a static API check appended (all mistakes in one round), and the
+        # exact docs for the APIs involved are retrieved and shown
+        feedback = await _kb_enrich_feedback(previous_script, feedback)
+        kb_block = await kb_context_for(prompt, previous_script, feedback)
         turns = [
             {"role": "user", "content":
                 f"Original request: {prompt}\n\nReturn ONLY Python code. No markdown."},
             {"role": "assistant", "content": previous_script},
-            {"role": "user", "content":
+            {"role": "user", "content": (kb_block + "\n\n" if kb_block else "") +
                 f"ANALYSIS / FEEDBACK FROM ENGINEERING PIPELINE:\n{feedback}\n\n"
                 f"Produce a corrected, COMPLETE script fixing the issues above. "
                 f"Return ONLY Python code. No markdown."},
@@ -1802,13 +3168,13 @@ async def gemini_generate_script(prompt: str, previous_script: Optional[str] = N
         is_taper_part = any(w in prompt.lower() for w in TAPER_KEYWORDS)
         if is_fold_part:
             user_msg = (
-                f"Generate CadQuery code for: {prompt}\n\n"
+                f"Generate build123d code for: {prompt}\n\n"
                 "This part has a bent/folded flange (per the description above). "
                 "MANDATORY: do not write any box/polyline/rotate/union geometry code "
                 "yourself for this. Your entire script must build the part by calling "
                 "the make_bent_bracket(...) helper that is already available in this "
-                "environment, then optionally chaining simple .fillet()/.chamfer() calls "
-                "on its result — nothing else constructs the base geometry. Example:\n\n"
+                "environment, then optionally applying fillet()/chamfer() to selected edges "
+                "of its result — nothing else constructs the base geometry. Example:\n\n"
                 "result = make_bent_bracket(\n"
                 "    leg1_length=50.0, leg2_length=50.0, width=30.0, thickness=4.0,\n"
                 "    bend_angle_deg=90.0, fillet_radius=3.0,\n"
@@ -1820,7 +3186,7 @@ async def gemini_generate_script(prompt: str, previous_script: Optional[str] = N
             )
         elif is_taper_part:
             user_msg = (
-                f"Generate CadQuery code for: {prompt}\n\n"
+                f"Generate build123d code for: {prompt}\n\n"
                 "This part is tapered/lofted (per the description above). MANDATORY: "
                 "do not write your own loft()/fillet() geometry code for this — "
                 "confirmed live, twice, that hand-written loft+fillet code on a "
@@ -1838,7 +3204,9 @@ async def gemini_generate_script(prompt: str, previous_script: Optional[str] = N
                 "dimensions stated in the prompt above. Return ONLY Python code. No markdown."
             )
         else:
-            user_msg = f"Generate CadQuery code for: {prompt}\n\nReturn ONLY Python code. No markdown."
+            kb_block = await kb_context_for(prompt)
+            user_msg = ((kb_block + "\n\n") if kb_block else "") + \
+                f"Generate build123d code for: {prompt}\n\nReturn ONLY Python code. No markdown."
         turns = [{"role": "user", "content": user_msg}]
 
     # 3000 tokens was too tight — real users hit truncated/unclosed-expression
@@ -1871,10 +3239,12 @@ async def gemini_generate_script(prompt: str, previous_script: Optional[str] = N
             temperature=0.15, max_tokens=GEN_MAX_TOKENS
         )
     elif AI_PROVIDER == "nvidia":
+        # Nemotron is a reasoning model: its (hidden) chain-of-thought counts against
+        # max_tokens, so give it more headroom than the non-reasoning providers get.
         text = await asyncio.to_thread(
             _nvidia_request,
             [{"role": "system", "content": system_prompt}] + turns,
-            temperature=0.15, max_tokens=GEN_MAX_TOKENS
+            temperature=0.15, max_tokens=NVIDIA_GEN_MAX_TOKENS
         )
     elif AI_PROVIDER == "openrouter":
         text = await asyncio.to_thread(
@@ -1978,45 +3348,171 @@ Return JSON only (no markdown):
 
 import ast
 import traceback
+import types
 
 # Modules the generated script is allowed to import. Anything else is rejected.
-CQ_ALLOWED_IMPORTS = {"cadquery", "cq", "math", "numpy", "np"}
+B3D_ALLOWED_IMPORTS = {"build123d", "math", "numpy", "np"}
 
-# Attribute/name access that is never allowed regardless of context — these are the
-# standard sandbox-escape primitives in pure-Python exec() jails.
-CQ_FORBIDDEN_NAMES = {
+# Attribute/name access that is never allowed regardless of context — the
+# standard sandbox-escape primitives in pure-Python exec() jails, plus every
+# build123d entry point that reads or writes files (a sandboxed script must never
+# touch the filesystem; the server does all importing/exporting itself).
+B3D_FORBIDDEN_NAMES = {
     "__import__", "__builtins__", "__globals__", "__getattribute__",
     "__subclasses__", "__bases__", "__base__", "__mro__", "__class__",
     "__dict__", "__code__", "__closure__", "__loader__", "__spec__",
     "exec", "eval", "compile", "open", "input", "vars", "globals", "locals",
     "getattr", "setattr", "delattr", "breakpoint", "help", "exit", "quit",
+    # build123d file I/O
+    "export_stl", "export_step", "export_brep", "export_gltf", "export_svg", "export_dxf",
+    "import_step", "import_stl", "import_brep", "import_svg", "import_3mf",
+    "Mesher", "ExportDXF", "ExportSVG", "ImportSVG",
 }
 
-class _CQSandboxViolation(Exception):
+class _B3DSandboxViolation(Exception):
     pass
 
-def _validate_cq_ast(tree: ast.AST):
+def _validate_b3d_ast(tree: ast.AST):
     """
     Walk the parsed AST and reject anything outside a narrow, known-safe subset:
     imports of allowed modules only, no dunder/reflection access, no exec/eval-style
     calls, no file/network/process primitives. This replaces a naive substring
     blocklist (trivially bypassable via string concatenation, getattr tricks, etc.)
-    with a real structural check.
+    with a real structural check. It is defense in depth, not a security boundary —
+    run untrusted prompts in a locked-down container.
     """
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             mod_names = [n.name.split(".")[0] for n in node.names] if isinstance(node, ast.Import) \
                         else [(node.module or "").split(".")[0]]
             for m in mod_names:
-                if m not in CQ_ALLOWED_IMPORTS:
-                    raise _CQSandboxViolation(f"Import of '{m}' is not allowed. "
-                                               f"Only {sorted(CQ_ALLOWED_IMPORTS)} may be imported.")
-        elif isinstance(node, ast.Name) and node.id in CQ_FORBIDDEN_NAMES:
-            raise _CQSandboxViolation(f"Use of '{node.id}' is not allowed.")
-        elif isinstance(node, ast.Attribute) and node.attr in CQ_FORBIDDEN_NAMES:
-            raise _CQSandboxViolation(f"Access to attribute '{node.attr}' is not allowed.")
+                if m not in B3D_ALLOWED_IMPORTS:
+                    raise _B3DSandboxViolation(f"Import of '{m}' is not allowed. "
+                                               f"Only {sorted(B3D_ALLOWED_IMPORTS)} may be imported.")
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("build123d."):
+                raise _B3DSandboxViolation("Import only from the top-level 'build123d' module "
+                                           "(from build123d import *).")
+        elif isinstance(node, ast.Name) and node.id in B3D_FORBIDDEN_NAMES:
+            raise _B3DSandboxViolation(f"Use of '{node.id}' is not allowed.")
+        elif isinstance(node, ast.Attribute) and node.attr in B3D_FORBIDDEN_NAMES:
+            raise _B3DSandboxViolation(f"Access to attribute '{node.attr}' is not allowed.")
         elif isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__"):
-            raise _CQSandboxViolation(f"Access to dunder attribute '{node.attr}' is not allowed.")
+            raise _B3DSandboxViolation(f"Access to dunder attribute '{node.attr}' is not allowed.")
+
+
+# ── build123d helpers ────────────────────────────────────────────────────────
+
+_B3D_NS_CACHE = {}
+
+def _b3d_public_namespace():
+    """Every public build123d name a generated script may use — minus modules and
+    all file-I/O entry points. Built once and reused."""
+    if not _B3D_NS_CACHE:
+        for n in dir(b3d):
+            if n.startswith("_") or n in B3D_FORBIDDEN_NAMES or n.startswith(("import_", "export_")):
+                continue
+            v = getattr(b3d, n, None)
+            if isinstance(v, types.ModuleType):
+                continue
+            _B3D_NS_CACHE[n] = v
+    return _B3D_NS_CACHE
+
+_B3D_SHIM = []
+
+def _b3d_sandbox_module():
+    """A stand-in 'build123d' module that only exposes the safe names above, so that
+    `from build123d import *` / `import build123d as bd` inside a script can never
+    pull in the real module's file-I/O functions."""
+    if not _B3D_SHIM:
+        ns = _b3d_public_namespace()
+        m = types.ModuleType("build123d")
+        for k, v in ns.items():
+            setattr(m, k, v)
+        m.__all__ = sorted(ns)
+        _B3D_SHIM.append(m)
+    return _B3D_SHIM[0]
+
+def _b3d_prop(obj, attr, default=None):
+    """build123d turned several methods into properties across releases
+    (is_valid, is_manifold, ...). Read either form."""
+    try:
+        v = getattr(obj, attr)
+        return v() if callable(v) else v
+    except Exception:
+        return default
+
+def _b3d_is_valid(shape) -> bool:
+    v = _b3d_prop(shape, "is_valid", None)
+    return True if v is None else bool(v)
+
+def as_solid(obj):
+    """Public helper for scripts: turn a BuildPart builder / list of shapes into one
+    Shape. (Scripts normally just assign a Part to `result`.)"""
+    shape, err = _b3d_to_shape(obj)
+    if err:
+        raise ValueError(err)
+    return shape
+
+def _b3d_to_shape(obj):
+    """Coerce whatever a script (or one of our primitives) produced into one
+    build123d Shape with real volume. Returns (shape, error_message)."""
+    if obj is None:
+        return None, "no shape was assigned"
+    if isinstance(obj, (list, tuple)):
+        parts = []
+        for o in obj:
+            s, err = _b3d_to_shape(o)
+            if err:
+                return None, err
+            parts.append(s)
+        if not parts:
+            return None, "result is an empty list"
+        shape = parts[0]
+        for p in parts[1:]:
+            shape = shape + p
+        return shape, None
+    if not isinstance(obj, b3d.Shape):
+        part = getattr(obj, "part", None)          # BuildPart context object
+        if part is not None:
+            obj = part
+        elif hasattr(obj, "sketch"):
+            return None, ("'result' is a 2D sketch (BuildSketch). Extrude/revolve it into a solid first, "
+                          "e.g. result = extrude(Rectangle(20, 10), amount=5).")
+        elif hasattr(obj, "line"):
+            return None, "'result' is a curve (BuildLine), not a solid."
+        else:
+            return None, (f"'result' is of type {type(obj).__name__}, not a build123d solid. Assign a "
+                          f"Part/Solid, e.g. result = Box(10, 10, 10).")
+    vol = _b3d_prop(obj, "volume", 0.0) or 0.0
+    if not (vol > 1e-9):
+        return None, (f"'result' ({type(obj).__name__}) has zero volume — it is a Face/Wire/Sketch or an empty "
+                      f"boolean, not a solid. Extrude/revolve/loft it into a solid, and check that a cut "
+                      f"didn't remove everything.")
+    return obj, None
+
+def _b3d_fillet(shape, edges, radius):
+    """Fillet `edges` of `shape` — works across build123d versions."""
+    edges = list(edges)
+    try:
+        return shape.fillet(radius, edges)
+    except (TypeError, AttributeError):
+        return b3d.fillet(edges, radius)
+
+def _b3d_rect_wire(w, h, z):
+    """Closed rectangular wire, centered on the Z axis, lying in the plane Z=z."""
+    face = b3d.Pos(0, 0, z) * b3d.Face.make_rect(w, h)
+    return face.outer_wire()
+
+def _b3d_write_stl(shape, path, tolerance=0.01, angular_tolerance=0.05):
+    ok = _b3d_export_stl(shape, path, tolerance=tolerance, angular_tolerance=angular_tolerance)
+    if ok is False or not os.path.exists(path) or os.path.getsize(path) < 84:
+        raise RuntimeError("build123d STL export produced no usable file (empty/invalid solid?)")
+
+def _b3d_write_step(shape, path):
+    ok = _b3d_export_step(shape, path)
+    if ok is False or not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise RuntimeError("build123d STEP export produced no usable file (empty/invalid solid?)")
+
 
 def make_bent_bracket(leg1_length, leg2_length, width, thickness,
                        bend_angle_deg=90.0, fillet_radius=2.0,
@@ -2024,44 +3520,44 @@ def make_bent_bracket(leg1_length, leg2_length, width, thickness,
     """
     Build a genuinely folded two-flange bracket (L-bracket / angle bracket) as one
     solid, guaranteeing leg2 actually rises out of the base plane by bend_angle_deg
-    via a real rotate() — the exact operation the free-tier model kept failing to
-    hand-write correctly (confirmed live: it either left both legs flat and coplanar,
-    or attempted its own rotate/union and produced non-watertight geometry). This is
-    trusted server-side code, not AI-generated, so it only needs to be gotten right
-    once; the model's job becomes picking sensible parameters, not 3D CAD authoring.
+    via a real rotation — the exact operation free-tier LLMs kept failing to
+    hand-write correctly (confirmed live: they either left both legs flat and
+    coplanar, or attempted their own rotate/union and produced non-watertight
+    geometry). This is trusted server-side code, not AI-generated, so it only needs
+    to be gotten right once; the model's job becomes picking sensible parameters,
+    not 3D CAD authoring.
 
     Both legs share a bend edge along the Y-axis at x=0,z=0. Each leg extends from
     that edge outward along its own local +X for leg{1,2}_length, and is `width`
     wide (centered on y=0), thickness `thickness`. holes_leg1/holes_leg2 are each an
     optional list of (x_from_bend_mm, y_from_centerline_mm, diameter_mm) tuples, given
     in that leg's own FLAT local frame (before folding) — no 3D math required by the
-    caller. Fold direction (up vs down) isn't guaranteed, only that real out-of-plane
-    height exists; that's all the downstream FEA/geometry checks require.
+    caller. Leg2 folds up towards +Z.
 
-    Returns the finished CadQuery solid — assign it to `result`.
+    Returns the finished build123d solid — assign it to `result`.
     """
     holes_leg1 = holes_leg1 or []
     holes_leg2 = holes_leg2 or []
 
     def _leg_with_holes(length, holes):
-        leg = cq.Workplane("XY").rect(length, width, centered=(False, True)).extrude(thickness)
+        leg = b3d.Pos(length / 2.0, 0, thickness / 2.0) * b3d.Box(length, width, thickness)
         for hx, hy, hd in holes:
-            leg = leg.workplane(offset=thickness).pushPoints([(hx, hy)]).hole(hd)
+            # cutter overshoots both faces by 1mm -> clean through-hole, no coincident faces
+            leg = leg - (b3d.Pos(hx, hy, thickness / 2.0) * b3d.Cylinder(hd / 2.0, thickness + 2.0))
         return leg
 
     leg1 = _leg_with_holes(leg1_length, holes_leg1)
-    leg2 = _leg_with_holes(leg2_length, holes_leg2)
-    leg2 = leg2.rotate((0, -1, 0), (0, 1, 0), -bend_angle_deg)
+    leg2 = b3d.Rot(0, -bend_angle_deg, 0) * _leg_with_holes(leg2_length, holes_leg2)
 
-    bracket = leg1.union(leg2)
+    bracket = leg1 + leg2
 
     if fillet_radius and fillet_radius > 0:
         try:
-            bend_edges = [e for e in bracket.edges().vals()
-                          if abs(e.Center().x) < 0.5 and abs(e.Center().z) < 0.5
-                          and abs(e.Length() - width) < 0.5]
+            bend_edges = [e for e in bracket.edges()
+                          if abs(e.center().X) < 0.5 and abs(e.center().Z) < 0.5
+                          and abs(e.length - width) < 0.5]
             if bend_edges:
-                bracket = bracket.newObject(bend_edges).fillet(fillet_radius)
+                bracket = _b3d_fillet(bracket, bend_edges, fillet_radius)
         except Exception:
             pass  # sharp (unfilleted) bend is a fine fallback; don't fail the whole part
 
@@ -2072,22 +3568,21 @@ def make_tapered_beam(length, base_width, base_thick, tip_width, tip_thick,
     """
     Build a tapered/lofted beam (drone arm, tapered leg, connecting rod, fin,
     tapered housing wall) as one solid, guaranteeing correct topology via a
-    proper loft() plus SAFE fillet handling — instead of relying on the model
+    proper ruled loft PLUS safe fillet handling — instead of relying on the model
     to hand-write loft+fillet code itself. Confirmed live, twice: blanket
-    .edges().fillet() on ALL of a loft's edges — including the compound
-    corners where a sloped taper edge meets two flat profile edges — silently
-    produces self-intersecting (non-watertight) geometry with no Python error
-    at all, and simply telling the model the exact coordinates of the
-    resulting gap was NOT enough for it to reliably avoid the mistake next
-    time. This is trusted server-side code, not AI-generated, so it only
-    needs to be gotten right once.
+    fillet on ALL of a loft's edges — including the compound corners where a
+    sloped taper edge meets two flat profile edges — silently produces
+    self-intersecting (non-watertight) geometry with no Python error at all, and
+    simply telling the model the exact coordinates of the resulting gap was NOT
+    enough for it to reliably avoid the mistake next time. This is trusted
+    server-side code, not AI-generated, so it only needs to be gotten right once.
 
     The beam runs along Z from 0 (base) to length (tip). Cross-section is a
     rectangle: base_width x base_thick at Z=0, tapering to tip_width x
     tip_thick at Z=length. holes_base/holes_tip are each an optional list of
-    (x_from_center_mm, y_from_center_mm, diameter_mm) tuples, drilled
-    straight through that end's flat face in its own local centered frame —
-    no 3D math required by the caller.
+    (x_from_center_mm, y_from_center_mm, diameter_mm) tuples, drilled straight
+    through along Z in the beam's centered cross-section frame — no 3D math
+    required by the caller.
 
     fillet_radius, if given, is applied ONLY to the 8 flat top/bottom
     profile edges (the rectangle outlines at Z=0 and Z=length) — NEVER the 4
@@ -2096,50 +3591,48 @@ def make_tapered_beam(length, base_width, base_thick, tip_width, tip_thick,
     0 (no fillet): an unfilleted-but-correct beam is far better than a
     filleted-but-broken one.
 
-    Returns the finished CadQuery solid — assign it to `result`.
+    Returns the finished build123d solid — assign it to `result`.
     """
     holes_base = holes_base or []
     holes_tip = holes_tip or []
 
-    beam = (cq.Workplane("XY")
-            .rect(base_width, base_thick)
-            .workplane(offset=length)
-            .rect(tip_width, tip_thick)
-            .loft())
+    beam = b3d.Solid.make_loft([_b3d_rect_wire(base_width, base_thick, 0.0),
+                                _b3d_rect_wire(tip_width, tip_thick, float(length))], True)
 
     if fillet_radius and fillet_radius > 0:
         try:
-            flat_edges = [e for e in beam.edges().vals()
-                          if abs(e.Center().z) < 0.1 or abs(e.Center().z - length) < 0.1]
+            flat_edges = [e for e in beam.edges()
+                          if abs(e.center().Z) < 0.1 or abs(e.center().Z - length) < 0.1]
             if flat_edges:
-                beam = beam.newObject(flat_edges).fillet(fillet_radius)
+                beam = _b3d_fillet(beam, flat_edges, fillet_radius)
         except Exception:
             pass  # unfilleted taper is a fine fallback; don't fail the whole part
 
-    for hx, hy, hd in holes_base:
-        beam = beam.faces("<Z").workplane().pushPoints([(hx, hy)]).hole(hd)
-    for hx, hy, hd in holes_tip:
-        beam = beam.faces(">Z").workplane().pushPoints([(hx, hy)]).hole(hd)
+    # Same semantics as before the CadQuery -> build123d switch: each hole is a
+    # bore along Z through the whole beam, overshooting both end faces by 1mm.
+    for hx, hy, hd in list(holes_base) + list(holes_tip):
+        beam = beam - (b3d.Pos(hx, hy, length / 2.0) * b3d.Cylinder(hd / 2.0, length + 2.0))
 
     return beam
 
-def execute_cq_script_safely(script: str):
+def execute_cad_script_safely(script: str):
     """
-    Execute an AI-generated CadQuery script in a sandboxed namespace.
+    Execute an AI-generated build123d script in a sandboxed namespace.
 
-    Security model: parse to an AST first and reject anything outside a narrow
-    known-safe subset (imports limited to cadquery/math/numpy, no dunder/reflection
-    access, no exec/eval/getattr-style escape hatches) before ever calling exec().
-    A restricted builtins dict is also passed to the exec namespace as defense in
-    depth, in case a novel AST-level bypass is found later.
+    The script is first parsed to an AST and checked against a narrow allowlist
+    (imports limited to build123d/math/numpy, no dunder/reflection access, no
+    exec/eval/getattr-style escape hatches, no build123d file I/O) before ever
+    calling exec(). A restricted builtins dict and a filtered build123d namespace
+    are also used as defense in depth.
 
-    Returns (obj, error_message). On success, error_message is None and obj is the
-    CadQuery/trimesh object assigned to `result`. On any failure (forbidden op, syntax
-    error, runtime error, missing `result`), obj is None and error_message describes
-    the problem in a form suitable for feeding back to the LLM for refinement.
+    Returns (shape, error_message). On success, error_message is None and shape is
+    the build123d solid assigned to `result`. On any failure (forbidden op, syntax
+    error, runtime error, missing/invalid `result`), shape is None and
+    error_message describes the problem in a form suitable for feeding back to the
+    LLM for refinement.
     """
-    if not CQ:
-        return None, "CadQuery is not installed on this server."
+    if not B3D:
+        return None, "build123d is not installed on this server."
 
     try:
         tree = ast.parse(script, filename="<ai_script>", mode="exec")
@@ -2147,26 +3640,21 @@ def execute_cq_script_safely(script: str):
         return None, f"Script syntax error: {str(e)} (line {e.lineno}: {e.text!r})"
 
     try:
-        _validate_cq_ast(tree)
-    except _CQSandboxViolation as e:
+        _validate_b3d_ast(tree)
+    except _B3DSandboxViolation as e:
         return None, f"Unsafe operation detected and blocked: {str(e)} Remove it entirely."
 
-    # Minimal, explicit builtins — defense in depth beyond the AST check above.
-    # __import__ IS included here, but wrapped to only allow the same modules
-    # the AST check already allowlisted (CQ_ALLOWED_IMPORTS) — by the time exec()
-    # runs, every `import` statement in the script has already been proven safe
-    # at the AST level, so this wrapper is redundant-but-safe defense in depth,
-    # not a new hole. Omitting __import__ entirely (the previous version of this
-    # function) breaks every script, since Python's own `import X` statement
-    # calls __builtins__.__import__(...) internally to execute the import —
-    # including the mandatory `import cadquery as cq` line every generated
-    # script needs, which is why ALL generations were failing with
-    # "ImportError: __import__ not found" until this fix.
-    def _restricted_import(name, *args, **kwargs):
+    # __import__ must exist for Python's own `import X` statement to work at all,
+    # but this wrapper only ever hands back the filtered build123d shim, math or
+    # numpy — by the time exec() runs, every import in the script has already been
+    # proven safe at the AST level, so this is redundant-but-safe defense in depth.
+    def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
         top_level = name.split(".")[0]
-        if top_level not in CQ_ALLOWED_IMPORTS:
-            raise ImportError(f"Import of '{name}' is not allowed in this sandbox.")
-        return __import__(name, *args, **kwargs)
+        if name == "build123d":
+            return _b3d_sandbox_module()
+        if top_level in ("math", "numpy") and name.count(".") == 0:
+            return __import__(name, globals, locals, fromlist, level)
+        raise ImportError(f"Import of '{name}' is not allowed in this sandbox.")
 
     safe_builtins = {
         "abs": abs, "min": min, "max": max, "round": round, "range": range,
@@ -2174,33 +3662,34 @@ def execute_cq_script_safely(script: str):
         "str": str, "list": list, "tuple": tuple, "dict": dict, "set": set,
         "enumerate": enumerate, "zip": zip, "map": map, "filter": filter,
         "sorted": sorted, "reversed": reversed, "isinstance": isinstance,
+        "any": any, "all": all, "pow": pow, "divmod": divmod, "print": print,
+        "iter": iter, "next": next, "slice": slice,
+        "Exception": Exception, "ValueError": ValueError, "TypeError": TypeError,
+        "ZeroDivisionError": ZeroDivisionError,
         "True": True, "False": False, "None": None,
         "__import__": _restricted_import,
     }
 
-    namespace = {
+    namespace = dict(_b3d_public_namespace())
+    namespace.update({
         "__builtins__": safe_builtins,
-        "cq": cq,
         "math": math,
         "np": np,
         "make_bent_bracket": make_bent_bracket,
         "make_tapered_beam": make_tapered_beam,
+        "as_solid": as_solid,
         "result": None,
-    }
+    })
+    pre_existing = set(namespace)
 
     try:
         exec(compile(tree, "<ai_script>", "exec"), namespace)
     except Exception as e:
-        # FIX: was returning only f"{type(e).__name__}: {str(e)}" — e.g. just
-        # "AttributeError: 'Edge' object has no attribute 'center'" with zero
-        # indication of WHERE in a 60-100 line chained-CadQuery script that
-        # happened. Confirmed live: the refinement loop burned all 3 attempts
-        # hitting what was plausibly the same mistake each time, because the
-        # model had no way to locate which operation to fix — it could only
-        # guess. Extracting the failing line from the AI's own script (filtering
-        # traceback frames to filename "<ai_script>" so this harness's own
-        # exec()-call frame doesn't leak in) turns an unlocatable error into an
-        # actionable one.
+        # Extracting the failing line from the AI's own script (filtering traceback
+        # frames to filename "<ai_script>" so this harness's own exec()-call frame
+        # doesn't leak in) turns an unlocatable error into an actionable one —
+        # without it the refinement loop burned all its attempts repeating the same
+        # mistake because the model could not tell which operation to fix.
         tb_lines = script.splitlines()
         script_frames = [f for f in traceback.extract_tb(e.__traceback__)
                           if f.filename == "<ai_script>"]
@@ -2213,21 +3702,16 @@ def execute_cq_script_safely(script: str):
 
     obj = namespace.get("result")
     if obj is None:
-        # Fallback: the AI occasionally builds a valid shape but assigns it to
-        # a differently-named variable despite the system prompt's explicit
-        # instruction — no amount of prompt wording guarantees 100% compliance
-        # from an LLM. Rather than hard-fail a script that actually succeeded
-        # at building real geometry, scan the namespace for anything that
-        # looks like a CadQuery Workplane/Shape and use that instead. Only
-        # look at names the script itself defined (skip cq/math/np/__builtins__
-        # and anything starting with _), and only accept it if exactly one
-        # candidate exists — if there are multiple, it's genuinely ambiguous
-        # which one was meant to be the final part, so don't guess.
-        reserved = {"cq", "math", "np", "result", "__builtins__"}
+        # Fallback: the AI occasionally builds a valid shape but assigns it to a
+        # differently-named variable despite the system prompt's explicit
+        # instruction. Rather than hard-fail a script that actually built real
+        # geometry, look at names the script itself defined and accept the shape
+        # only if exactly one candidate exists — with several it is genuinely
+        # ambiguous which was meant to be final, so don't guess.
         candidates = [
             (k, v) for k, v in namespace.items()
-            if k not in reserved and not k.startswith("_")
-            and (hasattr(v, "val") or hasattr(v, "vertices"))
+            if k not in pre_existing and not k.startswith("_")
+            and (isinstance(v, b3d.Shape) or getattr(v, "part", None) is not None)
         ]
         if len(candidates) == 1:
             obj = candidates[0][1]
@@ -2235,40 +3719,271 @@ def execute_cq_script_safely(script: str):
             return None, (
                 "Script ran without error but did not assign a shape to the "
                 "'result' variable."
-                + (f" Found {len(candidates)} other CadQuery-shaped variables "
-                   f"({', '.join(k for k,_ in candidates)}) — too ambiguous to "
+                + (f" Found {len(candidates)} other build123d shapes "
+                   f"({', '.join(k for k, _ in candidates)}) — too ambiguous to "
                    f"guess which was meant to be final; assign explicitly to "
                    f"'result'." if candidates else "")
             )
 
-    # Sanity check: must be exportable (CadQuery Workplane/Shape)
-    if not hasattr(obj, "val") and not hasattr(obj, "vertices"):
-        return None, (f"'result' is of type {type(obj).__name__}, which doesn't look like a "
-                       f"CadQuery Workplane/Shape. Make sure the final expression returns "
-                       f"a cq.Workplane.")
+    obj, shape_err = _b3d_to_shape(obj)
+    if shape_err:
+        return None, shape_err
 
-    # FIX: defensively call OCCT's own .clean() on the final solid before it's ever
-    # tessellated to STL. A boolean union/cut chain — especially one using the
-    # deliberate overshoot/overlap margins the refinement prompt now teaches, to
-    # avoid non-manifold gaps — can leave the resulting BREP with redundant/coincident
-    # topology that OCCT doesn't auto-simplify. That later tessellates into thin
-    # overlapping facets that Gmsh's discrete-direct meshing correctly rejects
-    # ("Invalid boundary mesh (overlapping facets)"), even though the mesh still
-    # passes a basic watertight check — confirmed live, same run, same part.
-    # .clean() simplifies the solid at the BREP level, before tessellation ever
-    # happens, which is the right layer to fix this at — a mesh-level repair pass
-    # afterward is patching an already-lossy triangulated approximation instead.
-    # Applied unconditionally to every script's result, not just when the AI
-    # remembers to call it itself. Best-effort: if .clean() itself raises on some
-    # pathological shape, fall back to the uncleaned object rather than failing
-    # the whole script over a cleanup step.
-    if hasattr(obj, "clean"):
+    # Defensively simplify the final solid at the B-rep level before it is ever
+    # tessellated or sent to a solver. A boolean union/cut chain — especially one
+    # using the deliberate overshoot/overlap margins the refinement prompt teaches —
+    # can leave redundant/coincident topology that later tessellates into thin
+    # overlapping facets, which Gmsh/SimScale meshers correctly reject. Doing it
+    # here fixes it at the right layer. Best-effort: never fail a script over cleanup.
+    try:
+        cleaned = obj.clean()
+        if cleaned is not None and _b3d_prop(cleaned, "volume", 0.0):
+            obj = cleaned
+    except Exception:
+        pass
+
+    if not _b3d_is_valid(obj):
         try:
-            obj = obj.clean()
+            fixed = obj.fix()
+            if fixed is not None and _b3d_is_valid(fixed):
+                obj = fixed
         except Exception:
             pass
+    if not _b3d_is_valid(obj):
+        return None, ("The resulting solid is not a valid B-rep (OpenCascade validity check failed) — usually a "
+                      "self-intersecting boolean/fillet or a degenerate loft. Simplify the failing operation, "
+                      "use real overlap for unions and overshoot for cuts, and avoid tiny fillets.")
 
     return obj, None
+
+# ═══════════════════════════════════════════════════════════════════
+# DETERMINISTIC FEATURE VERIFICATION — "the AI says there is a hole, is there?"
+#
+# The LLM is told (BUILD123D_SYSTEM) to put a machine-readable comment above the code
+# that cuts each hole/bore:
+#       # FEATURE: hole dia=6 count=4
+#       # FEATURE: bore dia=22 count=2
+# After the script runs, we MEASURE the finished B-rep — cylindrical faces whose axis
+# lies in empty space (i.e. cavities, not bosses or fillets) — and compare against the
+# declarations. A declared hole that is not in the solid (cutter missed the material,
+# wrong axis, subtraction discarded, later union re-filled it, radius/diameter mixup)
+# is reported back to the LLM as a "missing_features" refinement round. This runs
+# BEFORE the slow SimScale analysis, so a part missing a required hole never costs a
+# cloud run.
+#
+# Kernel access goes through OCP (the OpenCascade binding build123d itself sits on)
+# and shape.is_inside(), not build123d's higher-level face helpers, because those
+# helpers changed between build123d releases while these have not.
+# ═══════════════════════════════════════════════════════════════════
+_FEATURE_COMMENT_RE = re.compile(r"#\s*FEATURE\s*:\s*(.+?)\s*$", re.I)
+_FNUM = r"(\d+(?:\.\d+)?)"
+
+
+def parse_declared_features(script: str):
+    """Parse '# FEATURE: <hole|bore> dia=<mm> count=<n>' comments (flexible wording:
+    '4x hole 6mm', 'hole dia 6 x4', 'bore d=22 count=2' all work). Returns a list of
+    dicts: kind (hole|bore|None), dia (mm or None), count (int), line, text."""
+    feats = []
+    for ln, line in enumerate(script.splitlines(), 1):
+        m = _FEATURE_COMMENT_RE.search(line)
+        if not m:
+            continue
+        text = m.group(1).strip()
+        low = text.lower()
+        kind = "bore" if re.search(r"\bbores?\b", low) else ("hole" if re.search(r"\bholes?\b", low) else None)
+        md = (re.search(r"(?<![a-z])(?:dia(?:meter)?|d|\u2300|\u00f8)\s*[=:]?\s*" + _FNUM, low)
+              or re.search(_FNUM + r"\s*mm", low))
+        dia = float(md.group(1)) if md else None
+        mc = (re.search(r"(?:count|qty|num|n)\s*[=:]\s*(\d+)", low)
+              or re.search(r"[x\u00d7]\s*(\d+)\b", low)
+              or re.search(r"\b(\d+)\s*[x\u00d7]", low))
+        count = max(int(mc.group(1)), 1) if mc else 1
+        feats.append({"kind": kind, "dia": dia, "count": count, "line": ln, "text": text})
+    return feats
+
+
+def _extract_cylinder_candidates(shape):
+    """Every CONCAVE cylindrical face of `shape` as a plain dict (radius, canonical axis
+    direction, perpendicular axis offset, axial interval, angular span, midpoint).
+    Concave = the point on the cylinder's axis half-way along the face lies OUTSIDE the
+    material (holes, bores, tube interiors); bosses and outer rounds fail that test."""
+    import OCP.GeomAbs as ga
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    cyl_type = getattr(ga, "GeomAbs_Cylinder", None) or ga.GeomAbs_SurfaceType.GeomAbs_Cylinder
+    solids = list(shape.solids()) or [shape]
+
+    def inside(pt):
+        """True / False, or None when the kernel query itself failed (then we skip the face
+        rather than guess)."""
+        answered = False
+        for s in solids:
+            try:
+                if s.is_inside(pt):
+                    return True
+                answered = True
+            except Exception:
+                continue
+        return False if answered else None
+
+    out = []
+    for f in shape.faces():
+        try:
+            surf = BRepAdaptor_Surface(f.wrapped, True)
+            if surf.GetType() != cyl_type:
+                continue
+            cyl = surf.Cylinder()
+            r = float(cyl.Radius())
+            ax = cyl.Axis()
+            loc, dr = ax.Location(), ax.Direction()
+            L = (loc.X(), loc.Y(), loc.Z())
+            D = [dr.X(), dr.Y(), dr.Z()]
+            u0, u1 = surf.FirstUParameter(), surf.LastUParameter()
+            v0, v1 = surf.FirstVParameter(), surf.LastVParameter()
+        except Exception:
+            continue
+        h = abs(v1 - v0)
+        if r <= 1e-6 or h <= 1e-6:
+            continue
+        vm = 0.5 * (v0 + v1)
+        mid = tuple(L[i] + D[i] * vm for i in range(3))
+        if inside(mid) is not False:      # material on the axis (boss/round) or unknown -> not a hole
+            continue
+        # canonical axis direction (first significant component positive) so that the two
+        # halves of a split hole wall — and anti-parallel duplicates — compare equal
+        flip = D[0] < -1e-9 or (abs(D[0]) <= 1e-9 and (D[1] < -1e-9 or (abs(D[1]) <= 1e-9 and D[2] < 0)))
+        Dc = [-c for c in D] if flip else D
+        tm = sum(mid[i] * Dc[i] for i in range(3))
+        q = tuple(mid[i] - Dc[i] * tm for i in range(3))
+        out.append({"r": r, "d": tuple(Dc), "q": q, "t0": tm - h / 2, "t1": tm + h / 2,
+                    "ang": min(abs(u1 - u0), 2 * math.pi)})
+    return out
+
+
+def _cluster_hole_candidates(cands, min_angle_deg=300.0):
+    """Merge cylinder pieces that belong to the same physical hole (the two halves of a
+    split wall share radius/axis/axial range) and keep only those covering >= min_angle_deg
+    of the circumference — that is what separates a hole from a slot end or an inner fillet."""
+    groups = []
+    for c in cands:
+        placed = False
+        for g in groups:
+            if abs(g["r"] - c["r"]) > 1e-3 + 1e-4 * g["r"]:
+                continue
+            if sum(a * b for a, b in zip(g["d"], c["d"])) < 0.9999:
+                continue
+            if math.dist(g["q"], c["q"]) > 0.02:
+                continue
+            ov = min(g["t1"], c["t1"]) - max(g["t0"], c["t0"])
+            if ov < 0.9 * min(g["t1"] - g["t0"], c["t1"] - c["t0"]):
+                continue
+            g["ang"] += c["ang"]
+            g["t0"], g["t1"] = min(g["t0"], c["t0"]), max(g["t1"], c["t1"])
+            placed = True
+            break
+        if not placed:
+            groups.append(dict(c))
+    holes = []
+    for g in groups:
+        if math.degrees(g["ang"]) < min_angle_deg:
+            continue
+        tm = 0.5 * (g["t0"] + g["t1"])
+        ctr = [g["q"][i] + g["d"][i] * tm for i in range(3)]
+        holes.append({"diameter_mm": round(2 * g["r"], 3),
+                      "axis": [round(x, 3) for x in g["d"]],
+                      "center_mm": [round(x, 2) for x in ctr],
+                      "depth_mm": round(g["t1"] - g["t0"], 3)})
+    holes.sort(key=lambda h: (h["diameter_mm"], h["center_mm"]))
+    return holes
+
+
+def find_b3d_holes(shape):
+    """All holes/bores actually present in a build123d solid (see module comment)."""
+    return _cluster_hole_candidates(_extract_cylinder_candidates(shape))
+
+
+def _verify_against_holes(declared, holes):
+    out = {"declared": declared, "found_holes": holes, "missing": [], "unverified": [], "ok": True,
+           "checked": 0}
+    avail = list(holes)
+    # declarations with a diameter claim their holes first; 'any hole' declarations take what is left
+    for f in sorted(declared, key=lambda f: (f["dia"] is None)):
+        if f["kind"] is None:
+            out["unverified"].append(f)
+            continue
+        out["checked"] += 1
+        if f["dia"] is None:
+            match = list(avail)
+        else:
+            tol = max(0.05, 0.01 * f["dia"])
+            match = [h for h in avail if abs(h["diameter_mm"] - f["dia"]) <= tol]
+        take = match[:f["count"]]
+        for h in take:
+            avail.remove(h)
+        if len(take) < f["count"]:
+            out["missing"].append({**f, "found_matching": len(take), "missing_count": f["count"] - len(take)})
+    out["ok"] = not out["missing"]
+    return out
+
+
+def verify_declared_features(script: str, shape):
+    """Check every '# FEATURE:' declaration in `script` against the finished solid.
+    Never raises: if the kernel query itself fails, verification is skipped (ok=True,
+    `error` set) rather than blocking a design over a checker problem."""
+    declared = parse_declared_features(script)
+    if not declared:
+        return {"declared": [], "found_holes": [], "missing": [], "unverified": [], "ok": True, "checked": 0}
+    try:
+        holes = find_b3d_holes(shape)
+    except Exception as e:
+        return {"declared": declared, "found_holes": [], "missing": [], "unverified": declared, "ok": True,
+                "checked": 0, "error": f"feature check skipped: {type(e).__name__}: {str(e)[:200]}"}
+    return _verify_against_holes(declared, holes)
+
+
+def feature_failure_summary(fv) -> str:
+    parts = []
+    for m in fv.get("missing", []):
+        d = f" dia={m['dia']:g}" if m.get("dia") is not None else ""
+        parts.append(f"'{m['kind']}{d}' x{m['count']} (line {m['line']}): found {m['found_matching']}")
+    return "; ".join(parts) or "none"
+
+
+def _fv_brief(fv):
+    return {"ok": fv.get("ok", True), "declared": len(fv.get("declared", [])), "checked": fv.get("checked", 0),
+            "missing": [{k: m[k] for k in ("kind", "dia", "count", "line", "found_matching")}
+                        for m in fv.get("missing", [])],
+            "found_hole_diameters_mm": [h["diameter_mm"] for h in fv.get("found_holes", [])][:40],
+            **({"error": fv["error"]} if fv.get("error") else {})}
+
+
+def feature_failure_feedback(fv) -> str:
+    """The message the LLM gets in a 'missing_features' refinement round."""
+    lines = ["DETERMINISTIC FEATURE CHECK FAILED. Your script declares features with '# FEATURE:' comments "
+             "that the finished SOLID does not actually contain. This was measured on the B-rep itself "
+             "(cylindrical cavities), it is not an estimate:", ""]
+    for m in fv.get("missing", []):
+        d = f" dia={m['dia']:g} mm" if m.get("dia") is not None else ""
+        lines.append(f"- line {m['line']}: `# FEATURE: {m['text']}` -> expected {m['count']} x {m['kind']}{d}, "
+                     f"solid has only {m['found_matching']} matching.")
+    holes = fv.get("found_holes", [])
+    if holes:
+        lines.append("")
+        lines.append("Holes/bores that DO exist in the solid: " + "; ".join(
+            f"dia {h['diameter_mm']:g} at {h['center_mm']} axis {h['axis']}" for h in holes[:12]))
+    else:
+        lines.append("")
+        lines.append("The solid contains NO holes or bores at all.")
+    lines += ["",
+              "Typical causes: the cutter sits outside the material or points along the wrong axis "
+              "(Cylinder's axis is Z by default — use Rot(0, 90, 0) for X, Rot(90, 0, 0) for Y); the cutter is "
+              "too short to reach the material; the subtraction was applied to a shape that was later "
+              "discarded, or `result` was assigned from a variable created BEFORE the cut; a later union (+) "
+              "re-filled the hole; Cylinder() takes the RADIUS (dia/2), not the diameter.",
+              "Fix the geometry so every declared feature really exists — editing only the comment does not "
+              "count. Keep all other features and dimensions unchanged, and keep the '# FEATURE:' comments "
+              "(update them only if you deliberately change a feature)."]
+    return "\n".join(lines)
+
 
 # ═══════════════════════════════════════════════════════════════════
 # RETAINED v7.0 ANALYSIS FUNCTIONS (all upgraded algorithms)
@@ -3004,7 +4719,7 @@ def build_gemini_context_v8(filename,part_name,mat,exts,vol,is_wt,
     calc_used=fea.get("method","") in ("calculix_solid_tet_fem","calculix_shell_fem")
     return f"""╔═══════════════════════════════════════════════════════╗
 ║   LUMEXA v8.0 ENTERPRISE ENGINEERING REPORT           ║
-║   FEA Method: {"CalculiX Real FEM (Gmsh-meshed)" if calc_used else "Multi-Section Analytical (unbenchmarked estimate)"}  ║
+║   FEA Method: {"SimScale cloud FEM" if fea.get("method")=="simscale_static_fem" else "CalculiX Real FEM (Gmsh-meshed)" if calc_used else "Multi-Section Analytical (unbenchmarked estimate)"}  ║
 ╚═══════════════════════════════════════════════════════╝
 
 PART: {part_name or filename} | Context: {ctx.get('key')} | Material: {mat['name']}
@@ -3090,57 +4805,74 @@ Return JSON:
 """
 
 # ═══════════════════════════════════════════════════════════════════
-# CADQUERY GENERATORS (all from v7.0 retained)
+# BUILD123D GENERATORS (ported from the v7.0 build123d generators; algebra mode)
 # ═══════════════════════════════════════════════════════════════════
+
+def _fillet_vertical(shape, r):
+    """Fillet every edge parallel to Z (the 'corner rounding' the build123d
+    `.edges("|Z").fillet(r)` calls used to do)."""
+    if not r or r <= 0:
+        return shape
+    return _b3d_fillet(shape, shape.edges().filter_by(b3d.Axis.Z), r)
+
+def _bore(x, y, z_center, radius, height):
+    """Vertical cylinder cutter centered at (x, y, z_center)."""
+    return b3d.Pos(x, y, z_center) * b3d.Cylinder(radius, height)
 
 def gen_bracket(p):
     w=p.get("width",80);h=p.get("height",60);d=p.get("depth",40)
     t=p.get("thickness",5);hd=p.get("hole_diameter",6);fr=p.get("fillet_radius",2);nh=p.get("num_holes",4)
-    base=cq.Workplane("XY").box(w,d,t).edges("|Z").fillet(fr)
-    wall=cq.Workplane("XY").box(w,t,h).translate((0,-(d/2-t/2),h/2+t/2)).edges("|Z").fillet(fr)
-    b=base.union(wall)
+    base=_fillet_vertical(b3d.Box(w,d,t),fr)
+    wall=_fillet_vertical(b3d.Box(w,t,h),fr)
+    wall=b3d.Pos(0,-(d/2-t/2),h/2+t/2)*wall
+    b=base+wall
     sp=max((w-20)/max(nh//2-1,1),1)
     for x in [-(w/2-10)+i*sp for i in range(max(nh//2,1))]:
         for y in [-(d/2-10),d/2-10]:
-            try: b=b.faces(">Z").workplane().pushPoints([(x,y)]).hole(hd)
-            except: pass
+            try: b=b-_bore(x,y,h/2,hd/2,h+t+4)
+            except Exception: pass
     return b
 
 def gen_shaft(p):
     L=p.get("length",100);D=p.get("diameter",20)
-    s=cq.Workplane("YZ").circle(D/2).extrude(L)
-    if p.get("shoulder_diameter",0)>D: s=s.union(cq.Workplane("YZ").circle(p["shoulder_diameter"]/2).extrude(p.get("shoulder_length",15)))
-    if p.get("keyway_width",0)>0: s=s.cut(cq.Workplane("XY").box(L,p["keyway_width"],p.get("keyway_depth",3)*2).translate((L/2,0,D/2)))
+    along_x=lambda length,dia: b3d.Pos(length/2,0,0)*b3d.Rot(0,90,0)*b3d.Cylinder(dia/2,length)
+    s=along_x(L,D)
+    if p.get("shoulder_diameter",0)>D: s=s+along_x(p.get("shoulder_length",15),p["shoulder_diameter"])
+    if p.get("keyway_width",0)>0: s=s-(b3d.Pos(L/2,0,D/2)*b3d.Box(L,p["keyway_width"],p.get("keyway_depth",3)*2))
     return s
 
 def gen_plate(p):
     w=p.get("width",100);h=p.get("height",80);t=p.get("thickness",6)
     hp=p.get("hole_pattern","corners");hd=p.get("hole_diameter",8);fr=p.get("fillet_radius",3);m=p.get("margin",15)
-    pl=cq.Workplane("XY").box(w,h,t).edges("|Z").fillet(fr)
+    pl=_fillet_vertical(b3d.Box(w,h,t),fr)
     if hp=="corners":
-        pl=pl.faces(">Z").workplane().pushPoints([(-(w/2-m),-(h/2-m)),(w/2-m,-(h/2-m)),(-(w/2-m),h/2-m),(w/2-m,h/2-m)]).hole(hd)
-    elif hp=="center": pl=pl.faces(">Z").workplane().hole(hd)
+        for x,y in [(-(w/2-m),-(h/2-m)),(w/2-m,-(h/2-m)),(-(w/2-m),h/2-m),(w/2-m,h/2-m)]:
+            pl=pl-_bore(x,y,0,hd/2,t+2)
+    elif hp=="center": pl=pl-_bore(0,0,0,hd/2,t+2)
     return pl
 
 def gen_housing(p):
     ow=p.get("width",80);oh=p.get("height",60);od=p.get("depth",50)
     wt=p.get("wall_thickness",4);fr=p.get("fillet_radius",3);bd=p.get("boss_diameter",8)
-    outer=cq.Workplane("XY").box(ow,od,oh).edges("|Z").fillet(fr)
-    inner=cq.Workplane("XY").box(ow-2*wt,od-2*wt,oh-wt).translate((0,0,wt/2))
-    h=outer.cut(inner)
+    outer=_fillet_vertical(b3d.Box(ow,od,oh),fr)
+    # open-top cavity: inner box top is flush with the outer top face
+    inner=b3d.Pos(0,0,wt/2)*b3d.Box(ow-2*wt,od-2*wt,oh-wt)
+    h=outer-inner
     if p.get("num_bosses",4)>=4:
         bx=ow/2-wt-bd/2-2;by=od/2-wt-bd/2-2
+        floor_z=wt-oh/2                      # inner floor height (ported fix: bosses used to be placed
+        boss_h=oh-wt-2                       # at z=wt, i.e. floating above/outside the housing)
         for pos in [(-bx,-by),(bx,-by),(-bx,by),(bx,by)]:
-            boss=cq.Workplane("XY").circle(bd/2).extrude(oh-wt-2).translate((pos[0],pos[1],wt))
-            hole=cq.Workplane("XY").circle(bd/4).extrude(oh-wt-2).translate((pos[0],pos[1],wt))
-            h=h.union(boss).cut(hole)
+            boss=b3d.Pos(pos[0],pos[1],floor_z-0.5+(boss_h+0.5)/2)*b3d.Cylinder(bd/2,boss_h+0.5)
+            hole=b3d.Pos(pos[0],pos[1],floor_z+boss_h/2)*b3d.Cylinder(bd/4,boss_h)
+            h=(h+boss)-hole
     return h
 
 def gen_true_involute_gear(p):
     mod=p.get("module",2.0);nt=p.get("num_teeth",20);pa=math.radians(p.get("pressure_angle",20))
     fw=p.get("face_width",15);bore=p.get("bore_diameter",6);hd=p.get("hub_diameter",10);hl=p.get("hub_length",20)
     pitch_r=mod*nt/2;base_r=pitch_r*math.cos(pa);tip_r=pitch_r+mod;root_r=pitch_r-1.25*mod
-    g=cq.Workplane("XY").circle(tip_r).extrude(fw)
+    g=b3d.extrude(b3d.Circle(tip_r),amount=fw)
     ta=2*math.pi/nt
     for i in range(nt):
         angle=i*ta+ta/2
@@ -3148,42 +4880,49 @@ def gen_true_involute_gear(p):
                 (tip_r*1.02*math.cos(angle+ta*0.15),tip_r*1.02*math.sin(angle+ta*0.15)),
                 (tip_r*1.02*math.cos(angle+ta*0.85),tip_r*1.02*math.sin(angle+ta*0.85)),
                 (root_r*0.95*math.cos(angle+ta*0.85),root_r*0.95*math.sin(angle+ta*0.85))]
-        try: g=g.cut(cq.Workplane("XY").polyline(sp_pts).close().extrude(fw+1))
-        except: pass
-    if hd>0: g=g.union(cq.Workplane("XY").circle(hd/2).extrude(max(fw,hl)))
-    if bore>0: g=g.cut(cq.Workplane("XY").circle(bore/2).extrude(max(fw,hl)+2))
+        try: g=g-(b3d.Pos(0,0,-0.5)*b3d.extrude(b3d.Polygon(*sp_pts,align=None),amount=fw+1))
+        except Exception: pass
+    if hd>0: g=g+b3d.extrude(b3d.Circle(hd/2),amount=max(fw,hl))
+    if bore>0: g=g-(b3d.Pos(0,0,-1)*b3d.extrude(b3d.Circle(bore/2),amount=max(fw,hl)+2))
     return g
 
 def gen_flange(p):
     od=p.get("outer_diameter",100);id_=p.get("inner_diameter",40);t=p.get("thickness",12)
     bc_r=p.get("bolt_circle_radius",40);n=p.get("num_bolts",6);bd=p.get("bolt_diameter",8)
     hub_od=p.get("hub_od",50);hub_h=p.get("hub_height",20)
-    f=cq.Workplane("XY").circle(od/2).extrude(t).cut(cq.Workplane("XY").circle(id_/2).extrude(t+1))
-    hub=cq.Workplane("XY").circle(hub_od/2).extrude(hub_h).cut(cq.Workplane("XY").circle(id_/2).extrude(hub_h+1))
-    f=f.union(hub).faces(">Z").workplane().pushPoints([(bc_r*math.cos(2*math.pi*i/n),bc_r*math.sin(2*math.pi*i/n)) for i in range(n)]).hole(bd)
+    f=b3d.extrude(b3d.Circle(od/2),amount=t)-(b3d.Pos(0,0,-0.5)*b3d.extrude(b3d.Circle(id_/2),amount=t+1))
+    hub=b3d.extrude(b3d.Circle(hub_od/2),amount=hub_h)-(b3d.Pos(0,0,-0.5)*b3d.extrude(b3d.Circle(id_/2),amount=hub_h+1))
+    f=f+hub
+    H=max(t,hub_h)
+    for i in range(n):
+        f=f-_bore(bc_r*math.cos(2*math.pi*i/n),bc_r*math.sin(2*math.pi*i/n),H/2,bd/2,H+2)
     return f
 
 def gen_ibeam(p):
     L=p.get("length",200);fw=p.get("flange_width",80);fh=p.get("flange_thickness",8);wh=p.get("web_height",100);wt=p.get("web_thickness",6)
-    top=cq.Workplane("XY").box(fw,fh,L).translate((0,wh/2+fh/2,L/2))
-    bot=cq.Workplane("XY").box(fw,fh,L).translate((0,-(wh/2+fh/2),L/2))
-    web=cq.Workplane("XY").box(wt,wh,L).translate((0,0,L/2))
-    return top.union(bot).union(web)
+    top=b3d.Pos(0,wh/2+fh/2,L/2)*b3d.Box(fw,fh,L)
+    bot=b3d.Pos(0,-(wh/2+fh/2),L/2)*b3d.Box(fw,fh,L)
+    web=b3d.Pos(0,0,L/2)*b3d.Box(wt,wh+0.2,L)   # +0.2 sinks 0.1mm into each flange -> real overlap, same outer shape
+    return top+bot+web
 
 def gen_motor_mount(p):
     w=p.get("width",30);h=p.get("height",30);t=p.get("thickness",3)
     md=p.get("motor_diameter",28);hd=p.get("hole_diameter",3);hp=p.get("hole_pattern_size",16)
-    base=cq.Workplane("XY").box(w,h,t).edges("|Z").fillet(2).faces(">Z").workplane().hole(md)
-    return base.faces(">Z").workplane().pushPoints([(hp/2,hp/2),(-hp/2,hp/2),(hp/2,-hp/2),(-hp/2,-hp/2)]).hole(hd)
+    base=_fillet_vertical(b3d.Box(w,h,t),2)
+    base=base-_bore(0,0,0,md/2,t+2)
+    for x,y in [(hp/2,hp/2),(-hp/2,hp/2),(hp/2,-hp/2),(-hp/2,-hp/2)]:
+        base=base-_bore(x,y,0,hd/2,t+2)
+    return base
 
 def gen_heatsink(p):
     bw=p.get("base_width",60);bh=p.get("base_height",40);bt=p.get("base_thickness",5)
     n=p.get("num_fins",8);fh=p.get("fin_height",20);ft=p.get("fin_thickness",2)
-    base=cq.Workplane("XY").box(bw,bt,bh).translate((0,0,bh/2))
+    base=b3d.Pos(0,0,bh/2)*b3d.Box(bw,bt,bh)
     sp=(bw-ft)/max(n-1,1)
     for i in range(n):
         x=-(bw/2-ft/2)+i*sp
-        base=base.union(cq.Workplane("XY").box(ft,fh,bh).translate((x,bt/2+fh/2,bh/2)))
+        # fin sinks 0.1mm into the base plate (real overlap); its tip stays at bt/2+fh
+        base=base+(b3d.Pos(x,bt/2+fh/2-0.05,bh/2)*b3d.Box(ft,fh+0.1,bh))
     return base
 
 def gen_wing_rib_naca(p):
@@ -3206,10 +4945,10 @@ def gen_wing_rib_naca(p):
         upper.append((x-yt*math.sin(theta),yc+yt*math.cos(theta)))
         lower.append((x+yt*math.sin(theta),yc-yt*math.cos(theta)))
     all_pts=upper+list(reversed(lower[1:-1]))
-    rib=cq.Workplane("XY").polyline(all_pts).close().extrude(thick)
+    rib=b3d.extrude(b3d.Polygon(*all_pts,align=None),amount=thick)
     for xp in [chord*0.25-chord/2,chord*0.5-chord/2,chord*0.7-chord/2]:
-        try: rib=rib.cut(cq.Workplane("XY").circle(spar_d/2).extrude(thick+1).translate((xp,0,0)))
-        except: pass
+        try: rib=rib-(b3d.Pos(xp,0,-0.5)*b3d.extrude(b3d.Circle(spar_d/2),amount=thick+1))
+        except Exception: pass
     return rib
 
 # Organic shapes — trimesh (accurate, not Blender)
@@ -3237,7 +4976,7 @@ def gen_swept_fairing(p):
     return trimesh.Trimesh(vertices=np.array(verts),faces=np.array(faces),process=True)
 
 # Route map
-CADQUERY_MAP={
+B3D_MAP={
     "bracket":(gen_bracket,["bracket","mount","l-bracket","mounting bracket","clamp bracket"]),
     "shaft":(gen_shaft,["shaft","axle","rod","spindle","pin"]),
     "plate":(gen_plate,["plate","panel","flat","baseplate","sheet"]),
@@ -3256,37 +4995,37 @@ TRIMESH_MAP={
 
 def route(description,params):
     d=description.lower()
-    for pt,(fn,kws) in CADQUERY_MAP.items():
-        if any(k in d for k in kws): return pt,"cadquery",fn(params)
+    for pt,(fn,kws) in B3D_MAP.items():
+        if any(k in d for k in kws): return pt,"build123d",fn(params)
     for pt,(fn,kws) in TRIMESH_MAP.items():
         if any(k in d for k in kws): return pt,"trimesh",fn(params)
-    return "plate","cadquery",gen_plate(params)
+    return "plate","build123d",gen_plate(params)
 
-def stl_from_cq(obj):
+def stl_from_cad(obj):
     with tempfile.NamedTemporaryFile(suffix=".stl",delete=False) as t: p=t.name
-    cq.exporters.export(obj,p); return p
+    _b3d_write_stl(obj,p,tolerance=0.02,angular_tolerance=0.1); return p
 
 def stl_from_tm(mesh):
     with tempfile.NamedTemporaryFile(suffix=".stl",delete=False) as t: p=t.name
     mesh.export(p); return p
 
-def step_from_cq(obj):
+def step_from_cad(obj):
     with tempfile.NamedTemporaryFile(suffix=".step",delete=False) as t: p=t.name
-    cq.exporters.export(obj,p); return p
+    _b3d_write_step(obj,p); return p
 
 # ═══════════════════════════════════════════════════════════════════
 # CORE ANALYSIS PIPELINE v8.0
 # ═══════════════════════════════════════════════════════════════════
 
 def _repair_watertight_mesh(mesh):
-    """Attempt cheap, best-effort repairs on a mesh straight off CadQuery's STL
+    """Attempt cheap, best-effort repairs on a mesh straight off build123d's STL
     export before judging or using it for anything.
 
-    CadQuery/OCCT's STL tessellation routinely leaves tiny gaps and near-but-
+    build123d/OCCT's STL tessellation routinely leaves tiny gaps and near-but-
     not-quite-coincident duplicate vertices at the seams between adjacent
     tessellated patches — most visibly at fillet-to-flat-face boundaries. This
     is a known tessellation artifact, not necessarily a real defect in the
-    underlying B-rep solid (mesh_from_cq_object's own tolerance-tightening fix
+    underlying B-rep solid (mesh_from_cad_object's own tolerance-tightening fix
     above notes the same class of artifact causing Gmsh/CalculiX meshing
     failures downstream). trimesh.load()'s default vertex-merge tolerance is
     often too tight to close these seams on its own.
@@ -3341,7 +5080,7 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
                            force_n=1000, force_dir="z", T_op=25.0,
                            proj=None, surface_finish="machined",
                            reliability=0.99, run_topo=False,
-                           topo_volfrac=0.5):
+                           topo_volfrac=0.5, cad_obj=None):
     mesh, was_auto_repaired = _repair_watertight_mesh(mesh)
     vol=sf(mesh.volume);exts=[sf(e) for e in mesh.extents]
     se=sorted(exts);asp=se[2]/se[0] if se[0]>0 else 0;is_wt=bool(mesh.is_watertight)
@@ -3355,8 +5094,18 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
     holes=detect_holes_v8(mesh)
     sharp=detect_sharp_v8(mesh,mat_key)
 
-    # Try CalculiX first, fall back to analytical
-    fea,calculix_diag=run_calculix_fem(mesh,mat_key,force_n,force_dir)
+    # FEA priority: SimScale cloud FEM (needs the CAD solid `cad_obj`) -> CalculiX
+    # analysis service -> analytical model. Whatever ran is reported in fea["method"];
+    # SimScale's own success/failure detail is in result["simscale_diagnostic"].
+    fea=None;simscale_diag=None;calculix_diag=None
+    if cad_obj is not None:
+        if SIMSCALE_ENABLED:
+            fea,simscale_diag=await asyncio.to_thread(run_simscale_fem,cad_obj,mat_key,force_n,force_dir,ctx["min_sf"])
+        else:
+            simscale_diag={"attempted":False,"reason":"SIMSCALE_API_KEY not set (or SIMSCALE_ENABLED=0)"}
+    stress_img=fea.pop("stress_image_png_base64",None) if isinstance(fea,dict) else None
+    if fea is None:
+        fea,calculix_diag=run_calculix_fem(mesh,mat_key,force_n,force_dir)
     if fea is None:
         fea=multi_section_fea(mesh,mat_key,force_n,force_dir,ctx["min_sf"])
         fea["calculix_diagnostic"]=calculix_diag
@@ -3413,6 +5162,9 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
         # "calculix_shell_fem") — so this flag reported False on every single
         # request regardless of whether real FEM actually ran. Confirmed live.
         "calculix_used":fea.get("method","") in ("calculix_solid_tet_fem","calculix_shell_fem"),
+        "simscale_used":fea.get("method","")=="simscale_static_fem",
+        "simscale_diagnostic":simscale_diag,
+        "simscale_stress_image_base64":stress_img,
         "filename":filename,"part_name":part_name,"part_context":ctx,
         "geometry":{
             "dimensions_mm":{"x":round(exts[0],3),"y":round(exts[1],3),"z":round(exts[2],3)},
@@ -3489,6 +5241,13 @@ def evaluate_design_quality(result: dict, min_health_score: float = 75.0,
     is_wt = (result.get("geometry", {}) or {}).get("is_watertight", True)
 
     reasons = []
+    ss_diag = result.get("simscale_diagnostic") or {}
+    if ss_diag.get("attempted") and ss_diag.get("design_related"):
+        # SimScale itself rejected the geometry (import / mesh / solve) — that is a
+        # design defect the LLM must fix, even if a fallback solver happily analysed it.
+        reasons.append(f"SimScale could not {ss_diag.get('failed_stage','process')} this geometry: "
+                       f"{ss_diag.get('reason')}. Fix the geometry so the cloud FEM solver accepts it "
+                       f"(no slivers/tiny fillets, real overlap on unions, overshoot on cuts).")
     if score < min_health_score:
         reasons.append(f"Health score {score} is below target {min_health_score}.")
     if n_crit > max_critical:
@@ -3529,6 +5288,7 @@ def evaluate_design_quality(result: dict, min_health_score: float = 75.0,
             "fea_status": fea_status,
             "fatigue_status": fat_status,
             "is_watertight": is_wt,
+            "fea_method": fea.get("method"),
         }
     }
 
@@ -3568,6 +5328,26 @@ def summarize_analysis_for_refinement(result: dict, quality: dict) -> str:
                       f"{crit.get('strengthen_factor_approx')}x more cross-section needed there) "
                       f"— do not thin any other area to compensate.")
 
+    ss_diag = result.get("simscale_diagnostic") or {}
+    if fea.get("method") == "simscale_static_fem":
+        mprops = (result.get("material", {}) or {}).get("properties", {}) or {}
+        hot = crit.get("hotspot_xyz_mm")
+        lines.append("")
+        lines.append("SIMSCALE FEA (authoritative cloud-solver result):")
+        lines.append(f"  peak von Mises = {fea.get('stress',{}).get('von_mises_mpa')} MPa vs yield "
+                      f"{mprops.get('yield_strength_mpa')} MPa -> safety factor {fea.get('safety_factor')} "
+                      f"(required {fea.get('required_sf')}); max deflection {fea.get('deflection_mm')} mm")
+        if hot:
+            lines.append(f"  peak stress is at x,y,z = {hot} mm (position along the {crit.get('axis')}-axis: "
+                          f"{crit.get('position_mm')} mm) — reinforce THERE and along the load path into it.")
+        lines.append(f"  load case: {fea.get('note')}")
+    elif ss_diag.get("attempted") and ss_diag.get("reason"):
+        who = "the design" if ss_diag.get("design_related") else "infrastructure, not the design"
+        lines.append("")
+        lines.append(f"SIMSCALE: run did not complete at stage '{ss_diag.get('failed_stage')}' "
+                      f"({ss_diag.get('reason')}). Cause is {who}; the FEA figures above come from the "
+                      f"fallback solver ({fea.get('method')}).")
+
     if holes:
         lines.append("HOLE VIOLATIONS:")
         for h in holes[:5]:
@@ -3589,24 +5369,20 @@ def summarize_analysis_for_refinement(result: dict, quality: dict) -> str:
 
     return "\n".join(lines)
 
-async def mesh_from_cq_object(obj):
-    """Export a CadQuery object to STL and load as a trimesh mesh. Returns (mesh, stl_bytes).
+async def mesh_from_cad_object(obj):
+    """Export a build123d shape to STL and load as a trimesh mesh. Returns (mesh, stl_bytes).
 
-    FIX: this used to call cq.exporters.export(obj, tmp) with zero tessellation
-    control, which uses CadQuery/OCCT's default linear/angular deflection — an
-    ABSOLUTE distance tolerance, not scaled to the size of the feature being
-    tessellated. A 1.5-2mm fillet gets the same coarse triangulation budget as
-    a 200mm flat face under that default, which is a plausible real contributor
-    to the sliver triangles behind the Gmsh "invalid exterior boundary mesh"
-    and CalculiX "nonpositive jacobian" failures seen on every tapered-beam
-    test so far (on top of the Humphrey-smoothing mitigation already added on
-    the analysis_service side). Tightening this is the direct, low-risk lever
-    CadQuery already exposes for exactly this — no architectural change needed.
+    Tessellation control matters: OCCT's default deflection is an ABSOLUTE distance,
+    not scaled to the size of the feature being tessellated, so a 1.5-2mm fillet gets
+    the same coarse triangulation budget as a 200mm flat face — a plausible real
+    contributor to sliver triangles behind Gmsh "invalid exterior boundary mesh" and
+    CalculiX "nonpositive jacobian" failures. tolerance=0.01mm / angular 0.05rad keeps
+    small features well resolved.
     """
     with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as t:
         tmp = t.name
     try:
-        cq.exporters.export(obj, tmp, tolerance=0.01, angularTolerance=0.05)
+        _b3d_write_stl(obj, tmp, tolerance=0.01, angular_tolerance=0.05)
         mesh = trimesh.load(tmp)
         if hasattr(mesh, "geometry"):
             mesh = trimesh.util.concatenate(list(mesh.geometry.values()))
@@ -3634,13 +5410,15 @@ def home():
     # page report solid-tet FEM as unavailable even when it's working fine
     # via the remote service).
     fea_label = (
+        "SimScale cloud FEM (primary; falls back to CalculiX service / analytical)"
+        if (SIMSCALE_ENABLED and SIMSCALE_TEMPLATE_SIMULATION_ID) else
         "real solid tetrahedral FEM (C3D4, Gmsh-meshed + CalculiX) — via separate "
         "analysis service" if ANALYSIS_SERVICE_URL
         else "multi-section analytical (ANALYSIS_SERVICE_URL not configured on "
              "this deployment — set it to enable real FEM)"
     )
     return {
-        "status":"Lumexa v8.23 Enterprise (split architecture) — Vibe Engineering Edition",
+        "status":"Lumexa v8.24 Enterprise (build123d + SimScale) — Vibe Engineering Edition",
         "methodology_note": "The fields below describe *what each module does*, not an "
             "independently-verified accuracy percentage — none of these have been "
             "benchmarked against NAFEMS or other published test cases yet.",
@@ -3654,7 +5432,13 @@ def home():
                        "FEA-verified — see topology_optimization_simp docstring)",
             "composite":"Classical Laminate Theory + Tsai-Wu"},
         "capabilities":{
-            "cadquery_available":CQ,
+            "build123d_available":B3D,
+            "cadquery_available":B3D,   # deprecated alias — kept so existing frontend health checks keep working
+            "simscale_configured": SIMSCALE_ENABLED,
+            "pyvista_enabled": USE_PYVISTA, "pyvista_render": PYVISTA_RENDER,
+            "api_knowledge_base": {"enabled": KB_ENABLED, "mode": _kb["mode"], "chunks": len(_kb["chunks"])},
+            "simscale_template_configured": bool(SIMSCALE_TEMPLATE_PROJECT_ID and SIMSCALE_TEMPLATE_SIMULATION_ID
+                                                  and SIMSCALE_TEMPLATE_MESH_OPERATION_ID),
             "analysis_service_configured": bool(ANALYSIS_SERVICE_URL),
             "solid_tet_fem_available": bool(ANALYSIS_SERVICE_URL),
             "blender_available":BLENDER,
@@ -3671,6 +5455,26 @@ def home():
                          else OPENROUTER_MODEL if AI_PROVIDER == "openrouter"
                          else LOVABLE_AI_MODEL),
             "engineering_agent_configured": AI_PROVIDER in ("groq", "openrouter", "lovable", "cerebras", "nvidia")},
+        "new_in_v8_24":[
+            "CAD kernel switched from CadQuery to build123d (algebra-mode scripts, new sandbox, "
+            "new LLM prompts). make_tapered_beam / make_bent_bracket / all gen_* parametric parts ported.",
+            "SimScale cloud FEA is the primary analyzer when SIMSCALE_* env vars are set; any failure "
+            "falls back to CalculiX / analytical and is reported in result.simscale_diagnostic. "
+            "If SimScale itself rejects the geometry, that failure is fed to the LLM as refinement feedback.",
+            "Deterministic hole/bore verification for build123d ('# FEATURE: hole dia=6 count=4' comments "
+            "checked against the finished B-rep; failures become a 'missing_features' refinement round BEFORE "
+            "the slow SimScale analysis). Reconstructed for build123d — see feature_verification in results.",
+            "build123d API knowledge base (RAG): the installed library's real signatures/docstrings + verified "
+            "idioms, retrieved with NVIDIA embeddings + reranker and injected into every generation; failed "
+            "scripts also get a static API check (GET /kb/status, /kb/search, POST /kb/lint).",
+            "Optional PyVista (USE_PYVISTA=1): reads SimScale result files (incl. cell-data-only results) "
+            "and, with PYVISTA_RENDER=1, returns a von Mises stress picture (simscale_stress_image_base64). "
+            "GET /pyvista-selftest reports the real memory cost on your instance.",
+            "GET /cad-selftest and GET /simscale-selftest — verify the build123d kernel and the SimScale "
+            "wiring end-to-end (the latter compares against a closed-form cantilever).",
+            "POST /generate-validate-refine-async — same loop, returns a job_id to poll at GET /job/{id} "
+            "(SimScale runs take minutes; use this behind proxies with request timeouts).",
+        ],
         "new_in_v8_23":[
             "Optional second-model 'strategic advisor' for the Engineering Agent: set "
             "NEMOTRON_ADVISOR_MODEL (e.g. to a Nemotron/Kimi/DeepSeek model via OpenRouter, reusing "
@@ -3683,7 +5487,7 @@ def home():
             "Inspect -> Diagnose -> Propose -> Modify -> Simulate -> Compare -> "
             "Refine, instead of /generate-validate-refine's regenerate-the-whole-script "
             "loop. The frontier model (GPT-OSS-120B via Groq by default) never writes "
-            "CadQuery or declares pass/fail itself for the tapered-beam/bent-bracket "
+            "build123d or declares pass/fail itself for the tapered-beam/bent-bracket "
             "workflows — it calls tools (inspect_geometry, diagnose_failure, "
             "modify_parameter/modify_thickness/.../add_hole, run_fea, compare_designs, "
             "...) that go through a safe parameter contract and the same "
@@ -3756,6 +5560,8 @@ def home():
             "POST /generate-part","POST /generate-and-analyze",
             "POST /generate-from-prompt",
             "POST /generate-validate-refine  ★ self-correcting AI design loop",
+            "POST /generate-validate-refine-async  ★ same loop as a background job (poll GET /job/{id})",
+            "GET  /cad-selftest","GET  /simscale-selftest","GET  /pyvista-selftest",
             "POST /engineering-agent  ★★ tool-calling reasoning agent (Understand->Inspect->"
             "Diagnose->Propose->Modify->Verify->Simulate->Compare->Refine) — tapered-beam "
             "workflow is the first implementation target, see docstring",
@@ -3786,7 +5592,9 @@ def get_materials():
 @app.get("/part-types")
 @_sanitize_response
 def get_part_types():
-    return {"cadquery":{k:v[1] for k,v in CADQUERY_MAP.items()},
+    parametric={k:v[1] for k,v in B3D_MAP.items()}
+    return {"build123d":parametric,
+            "cadquery":parametric,   # deprecated alias for older frontends
             "organic":{k:v[1] for k,v in TRIMESH_MAP.items()}}
 
 @app.post("/analyze-part")
@@ -3877,13 +5685,13 @@ async def generate_part(
     params:str=Form("{}"),
     export_format:str=Form("stl"),
 ):
-    if not CQ: raise HTTPException(503,"CadQuery not installed")
+    if not B3D: raise HTTPException(503,"build123d not installed")
     try: pd=json.loads(params)
     except: pd={}
     pt,gen_type,obj=route(description,pd)
-    tmp=stl_from_cq(obj) if gen_type=="cadquery" else stl_from_tm(obj)
+    tmp=stl_from_cad(obj) if gen_type=="build123d" else stl_from_tm(obj)
     suffix=".stl" if export_format in ["stl","STL"] else ".step"
-    if export_format not in ["stl","STL"]: tmp=step_from_cq(obj) if gen_type=="cadquery" else tmp
+    if export_format not in ["stl","STL"]: tmp=step_from_cad(obj) if gen_type=="build123d" else tmp
     return FileResponse(path=tmp,media_type="application/octet-stream",filename=f"lumexa_{pt}{suffix}")
 
 @app.post("/generate-and-analyze")
@@ -3898,18 +5706,19 @@ async def generate_and_analyze(
     reliability:float=Form(0.99),
     project_description:Optional[str]=Form(None),
 ):
-    if not CQ: raise HTTPException(503,"CadQuery not installed")
+    if not B3D: raise HTTPException(503,"build123d not installed")
     try: pd=json.loads(params)
     except: pd={}
     pt,gen_type,obj=route(description,pd)
-    tmp=stl_from_cq(obj) if gen_type=="cadquery" else stl_from_tm(obj)
+    tmp=stl_from_cad(obj) if gen_type=="build123d" else stl_from_tm(obj)
     try:
         mesh=trimesh.load(tmp)
         if hasattr(mesh,"geometry"): mesh=trimesh.util.concatenate(list(mesh.geometry.values()))
         with open(tmp,"rb") as f: stl_b64=base64.b64encode(f.read()).decode()
         result=await run_analysis_v8(mesh,description,description,material,
                                       force_n,"z",operating_temp_c,project_description,
-                                      surface_finish,reliability)
+                                      surface_finish,reliability,
+                                      cad_obj=(obj if gen_type=="build123d" else None))
         result["generated_stl_base64"]=stl_b64
         result["part_type_detected"]=pt
         result["generation_engine"]=gen_type
@@ -3926,11 +5735,11 @@ async def generate_from_prompt(
     operating_temp_c:float=Form(25.0),
 ):
     """
-    Any part from natural language → Gemini (via Lovable AI Gateway) writes CadQuery → real STL + analysis.
+    Any part from natural language → Gemini (via Lovable AI Gateway) writes build123d → real STL + analysis.
     Single-shot version (no refinement loop). For an AI design that automatically fixes
     its own engineering problems, use POST /generate-validate-refine instead.
     """
-    if not CQ: raise HTTPException(503,"CadQuery not installed")
+    if not B3D: raise HTTPException(503,"build123d not installed")
 
     # Gemini (Lovable AI Gateway) generates script
     try:
@@ -3941,17 +5750,18 @@ async def generate_from_prompt(
         raise HTTPException(502,f"Gemini API error: {str(e)}")
 
     # Execute safely (non-raising)
-    obj,err=execute_cq_script_safely(script)
+    obj,err=execute_cad_script_safely(script)
     if err:
         raise HTTPException(400,f"Generated script failed: {err}")
 
     # Export + analyze
-    mesh,stl_bytes=await mesh_from_cq_object(obj)
+    mesh,stl_bytes=await mesh_from_cad_object(obj)
     stl_b64=base64.b64encode(stl_bytes).decode()
-    result=await run_analysis_v8(mesh,prompt,prompt,material,force_n,"z",operating_temp_c)
+    result=await run_analysis_v8(mesh,prompt,prompt,material,force_n,"z",operating_temp_c,cad_obj=obj)
     result["generated_stl_base64"]=stl_b64
     result["generated_script"]=script
-    result["generation_method"]="gemini_cadquery_v8"
+    result["feature_verification"]=verify_declared_features(script,obj)   # single-shot: reported, not refined
+    result["generation_method"]="llm_build123d_v8"
     return result
 
 def _parse_groq_retry_after(detail: str) -> float:
@@ -3969,33 +5779,56 @@ def _parse_groq_retry_after(detail: str) -> float:
     return 5.0
 
 
-def _diagnose_cq_error(err: str) -> str:
-    """Pattern-match known CadQuery/OpenCascade failure signatures and append
-    specific, actionable guidance — confirmed live: the generic 'fix the root
-    cause' feedback wasn't enough for the model to recover from these across
-    a real refinement run (it got a DIFFERENT failure on the retry instead of
-    a working script). These two are common, recurring OCC fillet/chamfer
-    failures, not one-off flukes."""
+def _diagnose_cad_error(err: str) -> str:
+    """Pattern-match known build123d/OpenCascade failure signatures and append
+    specific, actionable guidance — the generic 'fix the root cause' feedback was not
+    enough for the model to recover from these across a real refinement run (it got a
+    DIFFERENT failure on the retry instead of a working script)."""
     hints = []
-    if "requires that edges be selected" in err:
+    low = err.lower()
+    if "BRep_API: command not done" in err or "StdFail_NotDone" in err or "Standard_ConstructionError" in err:
         hints.append(
-            "Your .edges()/.faces() selector for the fillet/chamfer matched "
-            "ZERO edges — the selection string is stale or wrong after prior "
-            "operations changed the current context. Select the edges "
-            "immediately after creating the feature they belong to, before "
-            "chaining unrelated operations, and double-check the selector "
-            "string (e.g. '|Z', '>Z', 'not(%CIRCLE)') actually matches edges "
-            "that exist on THIS solid."
-        )
-    if "BRep_API: command not done" in err or "StdFail_NotDone" in err:
-        hints.append(
-            "The CAD kernel REJECTED a fillet/chamfer/boolean operation as "
+            "The CAD kernel REJECTED a fillet/chamfer/offset/boolean operation as "
             "geometrically infeasible — almost always because the requested "
             "radius is too large for the edge it's applied to (bigger than "
             "the material thickness, or it would overlap an adjacent edge or "
             "hole). Use a SMALLER radius (rule of thumb: no more than 20-30% "
             "of the local wall thickness), and apply fillets/chamfers BEFORE "
             "cutting nearby holes so the kernel has simpler geometry to work with."
+        )
+    if ("empty" in low and ("shapelist" in low or "edge" in low or "list" in low)) or "index out of range" in low \
+            or "no edges" in low or "no faces" in low:
+        hints.append(
+            "Your edge/face selector matched NOTHING (empty ShapeList) — the filter is wrong for THIS solid, or "
+            "the geometry changed since you assumed a position. Select edges immediately after creating the "
+            "feature they belong to, and check the selector actually matches: filter_by(Axis.Z) keeps edges "
+            "PARALLEL to Z, sort_by(Axis.Z)[-1] is the top-most, filter_by_position(Axis.Z, lo, hi) uses "
+            "world coordinates."
+        )
+    if "nameerror" in low:
+        hints.append(
+            "Only names from `from build123d import *`, plus math and np, exist in this environment. Common "
+            "algebra-mode names: Box, Cylinder, Cone, Sphere, Torus, Rectangle, Circle, Ellipse, Polygon, "
+            "RegularPolygon, SlotOverall, Pos, Rot, Plane, Axis, extrude, revolve, loft, sweep, fillet, "
+            "chamfer, offset, mirror, Spline, Polyline, Line."
+        )
+    if "typeerror" in low and ("argument" in low or "positional" in low):
+        hints.append(
+            "Wrong build123d call signature. Reminders: Box(length, width, height); Cylinder(radius, height) "
+            "(radius FIRST); Cone(bottom_radius, top_radius, height); Sphere(radius); extrude(sketch, amount=h); "
+            "fillet(edge_list, radius=r); chamfer(edge_list, length=l); Pos(x, y, z) * shape; "
+            "Polygon((x,y), (x,y), ..., align=None)."
+        )
+    if "zero volume" in low or "2d sketch" in low or "not a build123d solid" in low:
+        hints.append(
+            "`result` must be a SOLID. A Rectangle/Circle/Polygon is a 2D sketch — extrude(it, amount=...) or "
+            "revolve(it) first, and make sure a subtraction didn't remove the whole part."
+        )
+    if "not a valid b-rep" in low:
+        hints.append(
+            "Invalid solid: typically a self-intersecting fillet on a loft, a boolean between tangent-only "
+            "solids, or a cut that exits exactly flush with a face. Rebuild that step with real overlap "
+            "(unions) / overshoot (cuts)."
         )
     return ("\n\n" + "\n\n".join(hints)) if hints else ""
 
@@ -4021,7 +5854,7 @@ async def generate_validate_refine(
     """
     ★ THE CORE VIBE-ENGINEERING LOOP ★
 
-    1. AI (Gemini via Lovable AI Gateway) writes a CadQuery script from `prompt`.
+    1. AI (Gemini via Lovable AI Gateway) writes a build123d script from `prompt`.
     2. Script is executed → STL → full engineering analysis (FEA, fatigue, fracture,
        wall thickness, hole placement, sharp-corner stress, rule engine, health score).
     3. The result is checked against quality thresholds (health score, safety factor,
@@ -4040,11 +5873,12 @@ async def generate_validate_refine(
       - max_high_violations: HIGH-severity violations allowed (default 2)
       - min_safety_factor: minimum FEA safety factor (default 1.0)
     """
-    if not CQ: raise HTTPException(503,"CadQuery not installed")
+    if not B3D: raise HTTPException(503,"build123d not installed")
     if max_iterations<1: max_iterations=1
     if max_iterations>6: max_iterations=6  # hard cap: cost + latency safety
 
     iterations=[]
+    kb_log=[]        # per-iteration API-knowledge-base trace (mode, reranker, titles, lint issues)
     best=None        # best {"result":..., "quality":..., "script":..., "stl_b64":..., "iteration":int}
     script=None
     feedback=None
@@ -4064,6 +5898,7 @@ async def generate_validate_refine(
         while True:
             try:
                 script=await gemini_generate_script(prompt, previous_script=script, feedback=feedback)
+                kb_log.append({"iteration":i,**(_KB_TRACE.get() or {})})
                 break
             except HTTPException as e:
                 is_rate_limited=(e.status_code==429)
@@ -4081,20 +5916,33 @@ async def generate_validate_refine(
             break
 
         # 2) Execute
-        obj,err=execute_cq_script_safely(script)
+        obj,err=execute_cad_script_safely(script)
         if err:
             iterations.append({"iteration":i,"stage":"execution_failed","error":err,"script":script})
             feedback=(f"Your script FAILED TO EXECUTE with this error:\n{err}\n\n"
                       f"Fix the root cause and return a complete, runnable script."
-                      f"{_diagnose_cq_error(err)}")
+                      f"{_diagnose_cad_error(err)}")
+            continue
+
+        # 2b) Deterministic feature check: do the holes/bores the script DECLARED ('# FEATURE:')
+        # actually exist in the solid? Exact and cheap, so it runs BEFORE the slow SimScale
+        # analysis — a part missing a required hole is never worth a cloud run. On the LAST
+        # iteration there is no refinement left, so analyse anyway and just record the failure.
+        fv=verify_declared_features(script,obj)
+        if not fv["ok"] and i<max_iterations:
+            iterations.append({"iteration":i,"stage":"missing_features",
+                               "error":"declared features missing from the solid: "+feature_failure_summary(fv),
+                               "feature_verification":_fv_brief(fv),"script":script})
+            feedback=feature_failure_feedback(fv)
             continue
 
         # 3) Analyze
         try:
-            mesh,stl_bytes=await mesh_from_cq_object(obj)
+            mesh,stl_bytes=await mesh_from_cad_object(obj)
             result=await run_analysis_v8(mesh,prompt,prompt,material,force_n,force_dir,
                                           operating_temp_c,project_description,
-                                          surface_finish,reliability,run_topology)
+                                          surface_finish,reliability,run_topology,
+                                          cad_obj=obj)
         except Exception as e:
             iterations.append({"iteration":i,"stage":"analysis_failed","error":str(e),"script":script})
             feedback=(f"The generated geometry exported, but the analysis pipeline raised:\n{str(e)}\n\n"
@@ -4106,14 +5954,19 @@ async def generate_validate_refine(
         # 4) Quality gate
         quality=evaluate_design_quality(result, min_health_score, max_critical_violations,
                                          max_high_violations, min_safety_factor)
+        if not fv["ok"]:
+            # last iteration only (earlier ones `continue`d above): never call a design that is
+            # missing a declared hole "passed", whatever its health score
+            quality["passed"]=False
+            quality["reasons"].insert(0,"Declared feature(s) missing from the solid: "+feature_failure_summary(fv))
         stl_b64=base64.b64encode(stl_bytes).decode()
         entry={"iteration":i,"stage":"analyzed","passed":quality["passed"],
                "health_score":quality["score"],"reasons":quality["reasons"],
-               "metrics":quality["metrics"]}
+               "metrics":quality["metrics"],"feature_verification":_fv_brief(fv)}
         iterations.append(entry)
 
         candidate={"result":result,"quality":quality,"script":script,
-                   "stl_b64":stl_b64,"iteration":i}
+                   "stl_b64":stl_b64,"iteration":i,"fv":fv}
         # A candidate that actually PASSED is always preferred over one that
         # didn't, no matter the raw score — a failing 95 (e.g. fatigue FAIL)
         # must never beat a passing 87. Only compare raw scores head-to-head
@@ -4146,7 +5999,8 @@ async def generate_validate_refine(
     result=best["result"]
     result["generated_stl_base64"]=best["stl_b64"]
     result["generated_script"]=best["script"]
-    result["generation_method"]="gemini_cadquery_v8_refined"
+    result["feature_verification"]=best.get("fv")
+    result["generation_method"]="llm_build123d_v8_refined"
     result["refinement"]={
         "iterations_used":len(iterations),
         "max_iterations":max_iterations,
@@ -4161,8 +6015,285 @@ async def generate_validate_refine(
             "min_safety_factor":min_safety_factor,
         },
         "history":iterations,
+        "kb":kb_log,
     }
     return result
+
+
+@app.on_event("startup")
+async def _kb_startup():
+    """Build the API knowledge base in the background (chunking is instant -> BM25 works at once;
+    embeddings follow when NVIDIA answers). Never delays or fails startup."""
+    if KB_ENABLED and B3D:
+        threading.Thread(target=kb_build, daemon=True).start()
+
+
+@app.get("/kb/status")
+@_sanitize_response
+async def kb_status():
+    """State of the build123d API knowledge base: retrieval mode, chunk counts, embedding/reranker health."""
+    with _kb_lock:
+        st = {k: _kb[k] for k in ("mode", "error", "building", "counts", "dropped_idioms", "skipped_doc_chunks",
+                                   "b3d_version", "embed_dim", "docs_files")}
+        st["chunks"] = len(_kb["chunks"])
+        st["built_at"] = _kb["built_at"]
+    st.update(enabled=KB_ENABLED, embeddings_enabled=KB_EMBEDDINGS, embed_model=NVIDIA_EMBED_MODEL, docs_dir=KB_DOCS_DIR, index_path=KB_INDEX_PATH,
+              nvidia_key_set=bool(NVIDIA_API_KEY))
+    st["reranker"] = {"enabled": KB_RERANK, "working_model": _rr["model"], "endpoint": _rr["url"],
+                      "last_error": _rr["last_error"], "recent_attempts": _rr["tried"],
+                      "cooling_down_s": max(0, int(_rr["disabled_until"] - time.time())),
+                      "candidates": NVIDIA_RERANK_MODELS,
+                      "note": "nvidia/rerank-qa-mistral-4b: NVIDIA's model page announces its API was deprecated on 08/24/2026"}
+    return st
+
+
+@app.get("/kb/search")
+@_sanitize_response
+async def kb_search(q: str, k: int = 6):
+    """Debug: what would be retrieved for this query (hybrid + rerank), without calling the LLM."""
+    chunks, info = await asyncio.to_thread(kb_retrieve, q, (), max(1, min(k, 15)))
+    return {"query": q, "info": info,
+            "results": [{"title": c["title"], "kind": c["kind"], "text": c["text"][:800]} for c in chunks]}
+
+
+@app.post("/kb/rebuild")
+@_sanitize_response
+async def kb_rebuild(force: bool = Form(True)):
+    """Re-read the installed build123d + docs dir and (force=true) re-embed everything."""
+    threading.Thread(target=kb_build, kwargs={"force": force}, daemon=True).start()
+    return {"started": True, "note": "poll GET /kb/status"}
+
+
+@app.post("/kb/lint")
+@_sanitize_response
+async def kb_lint(script: str = Form(...)):
+    """Static API check of a build123d script against the installed library (unknown names/keywords/members)."""
+    issues = await asyncio.to_thread(lint_b3d_script, script, 25)
+    return {"ok": not issues, "issues": issues}
+
+
+@app.post("/generate-validate-refine-async")
+@_sanitize_response
+async def generate_validate_refine_async(
+    background_tasks: BackgroundTasks,
+    prompt:str=Form(...),
+    material:str=Form("auto"),
+    force_n:float=Form(1000.0),
+    force_dir:str=Form("z"),
+    operating_temp_c:float=Form(25.0),
+    surface_finish:str=Form("machined"),
+    reliability:float=Form(0.99),
+    project_description:Optional[str]=Form(None),
+    max_iterations:int=Form(6),
+    min_health_score:float=Form(75.0),
+    max_critical_violations:int=Form(0),
+    max_high_violations:int=Form(2),
+    min_safety_factor:float=Form(1.0),
+    run_topology:bool=Form(False),
+):
+    """
+    Same self-correcting loop as /generate-validate-refine, but as a background job.
+    Use this with SimScale: one cloud analysis takes minutes, so a multi-iteration loop
+    will exceed the request timeout of most hosts (Render/Railway/proxies). Returns a
+    job_id immediately; poll GET /job/{job_id} (returns the final result when done).
+    """
+    job_id=str(uuid.uuid4())
+    JOB_STORE[job_id]={"status":"running","created":time.time(),"filename":prompt[:80]}
+
+    async def run_job():
+        try:
+            result=await generate_validate_refine(
+                prompt=prompt,material=material,force_n=force_n,force_dir=force_dir,
+                operating_temp_c=operating_temp_c,surface_finish=surface_finish,reliability=reliability,
+                project_description=project_description,max_iterations=max_iterations,
+                min_health_score=min_health_score,max_critical_violations=max_critical_violations,
+                max_high_violations=max_high_violations,min_safety_factor=min_safety_factor,
+                run_topology=run_topology)
+            JOB_STORE[job_id]={"status":"complete","result":result,"created":time.time()}
+        except HTTPException as e:
+            JOB_STORE[job_id]={"status":"error","error":f"{e.status_code}: {e.detail}","created":time.time()}
+        except Exception as e:
+            JOB_STORE[job_id]={"status":"error","error":f"{type(e).__name__}: {e}","created":time.time()}
+
+    background_tasks.add_task(run_job)
+    return {"job_id":job_id,"status":"running",
+            "message":"Design loop started. Poll GET /job/{job_id} for the result.",
+            "estimated_time":"1-5 minutes per iteration with SimScale, seconds without"}
+
+
+def _b3d_stats(shape):
+    bb=shape.bounding_box()
+    return {"volume_mm3":round(float(shape.volume),2),"valid_brep":bool(_b3d_is_valid(shape)),
+            "bbox_mm":[round(float(bb.size.X),2),round(float(bb.size.Y),2),round(float(bb.size.Z),2)]}
+
+
+@app.get("/cad-selftest")
+@_sanitize_response
+async def cad_selftest():
+    """
+    Smoke-test the build123d kernel on THIS deployment: the two trusted primitives, every
+    parametric generator, the LLM-script sandbox (positive AND negative cases), and STL/STEP
+    export + watertightness. Run this once after deploying — build123d's API moves between
+    releases, and this pinpoints exactly which call (if any) needs adjusting.
+    """
+    if not B3D:
+        return {"ok":False,"error":"build123d is not installed (pip install build123d)"}
+    try:
+        version=getattr(b3d,"__version__",None)
+    except Exception:
+        version=None
+    checks=[]
+    def run(name,fn):
+        t0=time.time()
+        try:
+            info=fn() or {}
+            checks.append({"check":name,"ok":True,"t_s":round(time.time()-t0,2),**info})
+        except Exception as e:
+            checks.append({"check":name,"ok":False,"error":f"{type(e).__name__}: {str(e)[:300]}"})
+
+    run("make_tapered_beam",lambda:_b3d_stats(make_tapered_beam(120,24,10,12,6,fillet_radius=1.0,
+                                                                holes_base=[(6,0,3)])))
+    run("make_bent_bracket",lambda:_b3d_stats(make_bent_bracket(50,40,30,4,90,3,
+                                                                holes_leg1=[(25,0,6)],holes_leg2=[(20,0,6)])))
+    for pt,(fn,_kw) in B3D_MAP.items():
+        run(f"gen_{pt}",lambda fn=fn:_b3d_stats(fn({})))
+
+    def _feature_check():
+        part = b3d.Box(60, 40, 10)
+        for x, y in [(-20, -10), (20, -10), (-20, 10), (20, 10)]:
+            part = part - (b3d.Pos(x, y, 0) * b3d.Cylinder(3, 14))          # 4 x dia6 through
+        part = part - (b3d.Pos(0, 0, 4) * b3d.Cylinder(5, 6))               # 1 x dia10 blind (from the top)
+        part = part + (b3d.Pos(25, 0, 7) * b3d.Cylinder(4, 10))             # a BOSS (must not count as a hole)
+        found = sorted(h["diameter_mm"] for h in find_b3d_holes(part))
+        if found != [6.0, 6.0, 6.0, 6.0, 10.0]:
+            raise RuntimeError(f"hole detection found {found}, expected four dia6 + one dia10 (boss must not count)")
+        good = verify_declared_features("# FEATURE: hole dia=6 count=4\n# FEATURE: hole dia=10 count=1\n", part)
+        if not good["ok"]:
+            raise RuntimeError(f"true declarations were rejected: {good['missing']}")
+        bad = verify_declared_features("# FEATURE: hole dia=6 count=5\n# FEATURE: hole dia=8 count=1\n", part)
+        if bad["ok"] or len(bad["missing"]) != 2:
+            raise RuntimeError("false declarations (5th dia6 hole; a dia8 hole that is only a boss) were not caught")
+        return {"holes_found_mm": found, "false_claims_caught": len(bad["missing"])}
+    run("feature_verification", _feature_check)
+
+    def _script_ok():
+        s=("from build123d import *\n"
+           "result = Box(40, 20, 10) - Pos(10, 0, 0) * Cylinder(3, 12)\n"
+           "result = fillet(result.edges().filter_by(Axis.Z), radius=2)\n")
+        obj,err=execute_cad_script_safely(s)
+        if err: raise RuntimeError(err)
+        return _b3d_stats(obj)
+    run("sandbox_runs_valid_script",_script_ok)
+
+    def _script_blocked():
+        for bad in ("from build123d import *\nexport_stl(Box(1,1,1), '/tmp/x.stl')\nresult = Box(1,1,1)\n",
+                    "import os\nresult = None\n",
+                    "from build123d import *\nresult = Box(1,1,1).export_step('/tmp/x.step')\n"):
+            _o,err=execute_cad_script_safely(bad)
+            if not err: raise RuntimeError(f"sandbox failed to block: {bad[:60]!r}")
+    run("sandbox_blocks_io_and_os",_script_blocked)
+
+    async def _export():
+        obj=make_tapered_beam(100,20,10,10,6)
+        mesh,stl=await mesh_from_cad_object(obj)
+        p=step_from_cad(obj)
+        try: step_kb=round(os.path.getsize(p)/1024,1)
+        finally: os.unlink(p)
+        return {"stl_kb":round(len(stl)/1024,1),"triangles":int(len(mesh.faces)),
+                "watertight":bool(mesh.is_watertight),"step_kb":step_kb}
+    t0=time.time()
+    try:
+        info=await _export(); checks.append({"check":"stl_step_export","ok":True,"t_s":round(time.time()-t0,2),**info})
+    except Exception as e:
+        checks.append({"check":"stl_step_export","ok":False,"error":f"{type(e).__name__}: {str(e)[:300]}"})
+    return {"ok":all(c["ok"] for c in checks),"build123d_version":version,"checks":checks}
+
+
+@app.get("/pyvista-selftest")
+@_sanitize_response
+async def pyvista_selftest(render: bool = False):
+    """
+    Loads PyVista/VTK and reports what it costs on THIS instance (RSS before/after import and
+    peak RSS) — run it before enabling USE_PYVISTA on Render free (512 MB). Round-trips a
+    synthetic result file through the real SimScale result reader; with ?render=true it also
+    draws a stress picture off-screen, which is what proves the GL backend works.
+    """
+    out={"use_pyvista":USE_PYVISTA,"pyvista_render":PYVISTA_RENDER,"gl_backend":PYVISTA_GL_BACKEND,
+         "rss_mb":{"start":_rss_mb()}}
+    pv=_pyvista()
+    if pv is None:
+        out.update(ok=False,error=_pv["err"],hint="pip install pyvista (in requirements.txt) and rebuild")
+        return out
+    out["pyvista_version"]=getattr(pv,"__version__",None)
+    out["rss_mb"]["after_import"]=_rss_mb()
+    checks=[]
+    tmp=tempfile.mkdtemp(prefix="pvtest_")
+    try:
+        fields=None
+        try:
+            sph=pv.Sphere(radius=0.05).cast_to_unstructured_grid()
+            n=sph.n_points
+            sph.point_data["VonMisesStress"]=np.linspace(1e6,20e6,n)
+            disp=np.zeros((n,3)); disp[:,1]=np.linspace(0,1e-4,n)
+            sph.point_data["Displacement"]=disp
+            path=os.path.join(tmp,"res.vtu"); sph.save(path)
+            fields=_ss_fields_via_pyvista(path)
+            good=bool(fields and abs(fields["vm"]-20e6)<1 and abs(fields["disp"]-1e-4)<1e-9)
+            checks.append({"check":"read_result_file_and_find_peak_stress","ok":good,
+                           "peak_vm_pa":fields and fields["vm"],"peak_disp_m":fields and fields["disp"]})
+        except Exception as e:
+            checks.append({"check":"read_result_file_and_find_peak_stress","ok":False,"error":f"{type(e).__name__}: {str(e)[:250]}"})
+        if render and fields:
+            png,status=_ss_render_stress_png(fields,tmp,force=True)
+            checks.append({"check":"offscreen_render","ok":png is not None,"status":status,
+                           "png_kb":round(len(png)/1024,1) if png else None})
+        else:
+            checks.append({"check":"offscreen_render","ok":None,"note":"skipped — call /pyvista-selftest?render=true"})
+    finally:
+        import shutil
+        shutil.rmtree(tmp,ignore_errors=True)
+    out["rss_mb"]["end"]=_rss_mb()
+    try:
+        import resource
+        out["rss_mb"]["peak_ever"]=round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,1)
+    except Exception:
+        pass
+    out["checks"]=checks
+    out["ok"]=all(c["ok"] is not False for c in checks)
+    out["render_dict_note"]="On a 512 MB instance keep rss_mb.end + your normal working set well under 512."
+    return out
+
+
+@app.get("/simscale-selftest")
+@_sanitize_response
+async def simscale_selftest(force_n:float=100.0, material:str=""):
+    """
+    End-to-end check of the SimScale wiring using a 100 x 20 x 10 mm cantilever (fixed at x=0,
+    `force_n` along +Y on the x=100 end) and compare with the closed-form answer
+    (sigma = 6FL/(b h^2), delta = 4FL^3/(E b h^3)). Expect the FEM peak stress to be somewhat
+    ABOVE the beam-theory value (root singularity) and the deflection within a few percent.
+    If the numbers are wildly off, the face mapping / load case is wrong — check
+    diagnostic.entity_counts and diagnostic.patch. A run takes several minutes.
+    """
+    if not B3D:
+        raise HTTPException(503,"build123d not installed")
+    mat_key=material or SIMSCALE_TEMPLATE_MATERIAL
+    if mat_key not in MATERIALS: mat_key="aluminum_6061"
+    L,h,b=100.0,20.0,10.0    # length (X), depth along the load (Y), width (Z)
+    beam=b3d.Pos(L/2,0,0)*b3d.Box(L,h,b)
+    fem,diag=await asyncio.to_thread(run_simscale_fem,beam,mat_key,force_n,"y",2.0)
+    E=MATERIALS[mat_key]["youngs_modulus_gpa"]*1e3   # MPa
+    expected={"beam_theory_max_stress_mpa":round(6*force_n*L/(b*h**2),3),
+              "beam_theory_tip_deflection_mm":round(4*force_n*L**3/(E*b*h**3),5),
+              "note":"cantilever, end shear load; FEM stress at the fixed edge is typically higher (singularity)."}
+    out={"configured":SIMSCALE_ENABLED,"diagnostic":diag,"expected":expected}
+    if fem:
+        vm=fem["stress"]["von_mises_mpa"];dz=fem["deflection_mm"]
+        out["fem"]={"von_mises_mpa":vm,"deflection_mm":dz,"hotspot_xyz_mm":fem["critical_section"].get("hotspot_xyz_mm"),
+                    "simscale":fem.get("simscale")}
+        out["ratio_fem_over_theory"]={"stress":round(vm/max(expected["beam_theory_max_stress_mpa"],1e-9),3),
+                                      "deflection":round(dz/max(expected["beam_theory_tip_deflection_mm"],1e-9),3)}
+    return out
 
 
 @app.post("/refine-from-external-fea")
@@ -4205,8 +6336,8 @@ async def refine_from_external_fea(
     the response is rechecked against Lumexa's own internal analysis only; send the
     result back through Ansys to confirm before trusting it for anything real.
     """
-    if not CQ:
-        raise HTTPException(503, "CadQuery not installed")
+    if not B3D:
+        raise HTTPException(503, "build123d not installed")
 
     contents = await hotspots_csv.read()
     text = contents.decode(errors="ignore")
@@ -4290,16 +6421,17 @@ async def refine_from_external_fea(
     new_script = await gemini_generate_script(prompt, previous_script=previous_script,
                                                 feedback=feedback_text)
 
-    obj, err = execute_cq_script_safely(new_script)
+    obj, err = execute_cad_script_safely(new_script)
     if err:
         return {
             "stage": "execution_failed", "error": err, "script": new_script,
             "external_feedback_used": feedback_text,
         }
 
-    mesh, stl_bytes = await mesh_from_cq_object(obj)
+    mesh, stl_bytes = await mesh_from_cad_object(obj)
     result = await run_analysis_v8(mesh, prompt, prompt, material, force_n, force_dir,
-                                    operating_temp_c, None, surface_finish, reliability, False)
+                                    operating_temp_c, None, surface_finish, reliability, False,
+                                    cad_obj=obj)
     quality = evaluate_design_quality(result, min_health_score, max_critical_violations,
                                        max_high_violations, min_safety_factor)
     stl_b64 = base64.b64encode(stl_bytes).decode()
@@ -4326,7 +6458,7 @@ def _rename_result_var(script: str, new_name: str) -> str:
     regex substitution, so two independently-generated scripts can be concatenated
     into one combined script without their `result` assignments colliding. Safe
     because every script this system generates is instructed to use exactly the
-    literal name `result` for its final shape — see GEMINI_CADQUERY_SYSTEM.
+    literal name `result` for its final shape — see BUILD123D_SYSTEM.
     """
     return _re.sub(r"\bresult\b", new_name, script)
 
@@ -4362,12 +6494,12 @@ async def edit_design_region(
          into the cut base.
       5. Assemble ONE new combined script (previous_script + the AI's local
          script + the cut/union glue, with `result` variables renamed to avoid
-         collision) so the result is a normal, fully re-editable CadQuery script
+         collision) so the result is a normal, fully re-editable build123d script
          — future edits (another region, or /refine-from-external-fea) work on
          it exactly like any other script in this system.
     """
-    if not CQ:
-        raise HTTPException(503, "CadQuery not installed")
+    if not B3D:
+        raise HTTPException(503, "build123d not installed")
 
     bx, by, bz = abs(x_max - x_min), abs(y_max - y_min), abs(z_max - z_min)
     if bx <= 0 or by <= 0 or bz <= 0:
@@ -4376,7 +6508,7 @@ async def edit_design_region(
     cx, cy, cz = (x_min+x_max)/2, (y_min+y_max)/2, (z_min+z_max)/2
 
     # Step 1: confirm the base script still executes before spending an AI call.
-    base_obj, base_err = execute_cq_script_safely(previous_script)
+    base_obj, base_err = execute_cad_script_safely(previous_script)
     if base_err:
         raise HTTPException(400, f"previous_script failed to execute, can't edit it: {base_err}")
 
@@ -4390,7 +6522,7 @@ async def edit_design_region(
     )
     local_script = await gemini_generate_script(local_prompt)
 
-    local_obj, local_err = execute_cq_script_safely(local_script)
+    local_obj, local_err = execute_cad_script_safely(local_script)
     if local_err:
         return {"stage": "local_generation_failed", "error": local_err, "local_script": local_script}
 
@@ -4400,21 +6532,23 @@ async def edit_design_region(
         local_renamed = _rename_result_var(local_script, "_local_result")
 
         combined_script = (
-            "import cadquery as cq\n\n"
+            "from build123d import *\n\n"
             "# --- base shape (previous design) ---\n"
-            f"{base_renamed}\n\n"
+            f"{base_renamed}\n"
+            "_base_result = as_solid(_base_result)\n\n"
             "# --- local replacement geometry for the edited region ---\n"
-            f"{local_renamed}\n\n"
+            f"{local_renamed}\n"
+            "_local_result = as_solid(_local_result)\n\n"
             "# --- combine: cut the edited region out of the base, then union in "
             "the new local geometry, positioned at the region's real location ---\n"
-            f"_cutter = cq.Workplane('XY').box({bx}, {by}, {bz}).translate(({cx}, {cy}, {cz}))\n"
-            f"_local_positioned = _local_result.translate(({cx}, {cy}, {cz}))\n"
-            "result = _base_result.cut(_cutter).union(_local_positioned)\n"
+            f"_cutter = Pos({cx}, {cy}, {cz}) * Box({bx}, {by}, {bz})\n"
+            f"_local_positioned = Pos({cx}, {cy}, {cz}) * _local_result\n"
+            "result = (_base_result - _cutter) + _local_positioned\n"
         )
     except Exception as e:
         raise HTTPException(500, f"Failed to assemble combined script: {str(e)}")
 
-    combined_obj, combined_err = execute_cq_script_safely(combined_script)
+    combined_obj, combined_err = execute_cad_script_safely(combined_script)
     if combined_err:
         return {
             "stage": "combine_failed",
@@ -4426,9 +6560,9 @@ async def edit_design_region(
                     "box didn't actually overlap solid material in the base shape.",
         }
 
-    mesh, stl_bytes = await mesh_from_cq_object(combined_obj)
+    mesh, stl_bytes = await mesh_from_cad_object(combined_obj)
     result = await run_analysis_v8(mesh, edit_prompt, edit_prompt, material, 1000.0, "z",
-                                    25.0, None, "machined", 0.99, False)
+                                    25.0, None, "machined", 0.99, False, cad_obj=combined_obj)
     quality = evaluate_design_quality(result, 75.0, 0, 2, 1.0)
     stl_b64 = base64.b64encode(stl_bytes).decode()
 
@@ -4460,14 +6594,14 @@ async def export_step(script: str = Form(...)):
     STL) is what makes the FreeCAD round-trip actually useful — it's a real
     B-Rep solid with editable faces, not just a triangle soup.
     """
-    if not CQ:
-        raise HTTPException(503, "CadQuery not installed")
+    if not B3D:
+        raise HTTPException(503, "build123d not installed")
 
-    obj, err = execute_cq_script_safely(script)
+    obj, err = execute_cad_script_safely(script)
     if err:
         raise HTTPException(400, f"Script failed to execute: {err}")
 
-    step_path = step_from_cq(obj)
+    step_path = step_from_cad(obj)
     try:
         with open(step_path, "rb") as f:
             step_b64 = base64.b64encode(f.read()).decode()
@@ -4853,13 +6987,13 @@ async def analyze_assembly(
 #     Understand -> Inspect -> Diagnose -> Propose -> Modify -> Verify ->
 #     Simulate -> Compare -> Refine
 #
-# instead of the "regenerate the whole CadQuery script and hope" pattern
+# instead of the "regenerate the whole build123d script and hope" pattern
 # /generate-validate-refine uses. Nothing above this line is modified —
 # this section only ADDS a new endpoint (/engineering-agent) that
 # orchestrates the frontier model (tool-calling) around the exact same
 # deterministic helpers, sandboxed executor, mesher, and analysis pipeline
 # already defined above. make_tapered_beam/make_bent_bracket/
-# execute_cq_script_safely/mesh_from_cq_object/run_analysis_v8/
+# execute_cad_script_safely/mesh_from_cad_object/run_analysis_v8/
 # evaluate_design_quality/gemini_generate_script are all reused as-is.
 #
 # Current scope (per the spec's "First Implementation Target"): the
@@ -4887,7 +7021,7 @@ AGENT_TURN_MAX_TOKENS = 3000
 
 # ----------------------------------------------------------------------
 # Safe parameter contracts (spec section 4) — reject bad numbers BEFORE
-# ever calling CadQuery/OpenCascade, with structured REJECTED feedback.
+# ever calling build123d/OpenCascade, with structured REJECTED feedback.
 # ----------------------------------------------------------------------
 
 def _validate_hole(hx, hy, hd, width, thick):
@@ -5034,7 +7168,7 @@ def _diff_params(old, new):
 
 def params_to_script_tapered_beam(params):
     return (
-        "import cadquery as cq\n"
+        "from build123d import *\n"
         "result = make_tapered_beam(\n"
         f"    length={params['length']}, base_width={params['base_width']}, base_thick={params['base_thick']},\n"
         f"    tip_width={params['tip_width']}, tip_thick={params['tip_thick']}, "
@@ -5046,7 +7180,7 @@ def params_to_script_tapered_beam(params):
 
 def params_to_script_bent_bracket(params):
     return (
-        "import cadquery as cq\n"
+        "from build123d import *\n"
         "result = make_bent_bracket(\n"
         f"    leg1_length={params['leg1_length']}, leg2_length={params['leg2_length']},\n"
         f"    width={params['width']}, thickness={params['thickness']}, "
@@ -5083,7 +7217,7 @@ class EngineeringDesignState:
         self.design_type = None     # "tapered_beam" | "bent_bracket" | "generic_script"
         self.params = None          # dict of constructor kwargs, for parametric designs
         self.script = None          # script text, for generic_script designs
-        self.obj = None             # current CadQuery object (server-side only, never sent to the model)
+        self.obj = None             # current build123d object (server-side only, never sent to the model)
         self.mesh = None            # current trimesh (server-side only)
         self.stl_bytes = None
 
@@ -5133,7 +7267,7 @@ def _revert_to_last_known_good(state):
             state.script = None
         elif design_type == "generic_script":
             script = good.get("script")
-            obj, err = execute_cq_script_safely(script)
+            obj, err = execute_cad_script_safely(script)
             if err:
                 return False
             params = None
@@ -5392,11 +7526,9 @@ async def _auto_validate_and_mesh(state):
         return {"validated": False, "meshed": False}
     brep_ok = True; brep_note = None
     try:
-        val = state.obj.val()
-        if hasattr(val, "isValid"):
-            brep_ok = bool(val.isValid())
-            if not brep_ok:
-                brep_note = "OpenCASCADE's BRepCheck_Analyzer flagged this shape as an invalid B-rep."
+        brep_ok = _b3d_is_valid(state.obj)
+        if not brep_ok:
+            brep_note = "OpenCASCADE's BRepCheck_Analyzer flagged this shape as an invalid B-rep."
     except Exception as e:
         brep_note = f"Could not run the B-rep validity check ({type(e).__name__}: {e}); proceeding to mesh export."
     if not brep_ok:
@@ -5404,7 +7536,7 @@ async def _auto_validate_and_mesh(state):
         return {"status": "REJECTED", "valid_brep": False, "reason": brep_note, "reverted": reverted,
                 "current_params": state.params}
     try:
-        mesh, stl_bytes = await mesh_from_cq_object(state.obj)
+        mesh, stl_bytes = await mesh_from_cad_object(state.obj)
     except Exception as e:
         reverted = _revert_to_last_known_good(state)
         return {"status": "REJECTED", "reason": f"STL export/mesh load failed: {type(e).__name__}: {e}",
@@ -5435,7 +7567,7 @@ async def _rebuild_beam(state, new_params, change_desc, reason, predicted_effect
     try:
         obj = make_tapered_beam(**new_params)
     except Exception as e:
-        return {"status": "REJECTED", "reason": f"CadQuery kernel rejected this change: {type(e).__name__}: {e}",
+        return {"status": "REJECTED", "reason": f"CAD kernel (build123d/OpenCASCADE) rejected this change: {type(e).__name__}: {e}",
                 "constraint": "kernel_geometric_feasibility"}
     old_params = state.params
     state.params = new_params; state.obj = obj; state.mesh = None; state.stl_bytes = None
@@ -5459,7 +7591,7 @@ async def _rebuild_bracket(state, new_params, change_desc, reason, predicted_eff
     try:
         obj = make_bent_bracket(**new_params)
     except Exception as e:
-        return {"status": "REJECTED", "reason": f"CadQuery kernel rejected this change: {type(e).__name__}: {e}",
+        return {"status": "REJECTED", "reason": f"CAD kernel (build123d/OpenCASCADE) rejected this change: {type(e).__name__}: {e}",
                 "constraint": "kernel_geometric_feasibility"}
     old_params = state.params
     state.params = new_params; state.obj = obj; state.mesh = None; state.stl_bytes = None
@@ -5477,7 +7609,7 @@ async def _rebuild_bracket(state, new_params, change_desc, reason, predicted_eff
 async def _agent_generic_script_modification(state, feature_description, reason, predicted_effect=None):
     """The 'unfamiliar geometry' fallback path (spec section 11's second
     branch). Reuses the EXISTING gemini_generate_script REFINEMENT MODE and
-    execute_cq_script_safely sandbox verbatim — zero new AI-prompting or
+    execute_cad_script_safely sandbox verbatim — zero new AI-prompting or
     sandbox-security code. Crossing over from a parametric design into a
     generic_script one is a one-way, logged transition."""
     if not reason:
@@ -5499,10 +7631,10 @@ async def _agent_generic_script_modification(state, feature_description, reason,
     except HTTPException as e:
         return {"status": "ERROR", "message": f"Script modification call failed: {e.detail}"}
 
-    obj, err = execute_cq_script_safely(new_script)
+    obj, err = execute_cad_script_safely(new_script)
     if err:
         return {"status": "REJECTED",
-                "reason": f"The modified script failed: {err} {_diagnose_cq_error(err)}",
+                "reason": f"The modified script failed: {err} {_diagnose_cad_error(err)}",
                 "note": "State unchanged; the previous working script/geometry is preserved."}
 
     state.design_type = "generic_script"; state.script = new_script; state.params = None
@@ -5774,7 +7906,7 @@ async def _tool_set_initial_design(state, design_type, reason="",
         try:
             obj = make_tapered_beam(**params)
         except Exception as e:
-            return {"status": "REJECTED", "reason": f"CadQuery kernel rejected these parameters: {type(e).__name__}: {e}"}
+            return {"status": "REJECTED", "reason": f"CAD kernel (build123d/OpenCASCADE) rejected these parameters: {type(e).__name__}: {e}"}
         state.design_type = "tapered_beam"; state.params = params; state.script = None; state.obj = obj
     elif design_type == "bent_bracket":
         missing = [n for n, v in [("leg1_length", leg1_length), ("leg2_length", leg2_length),
@@ -5792,14 +7924,14 @@ async def _tool_set_initial_design(state, design_type, reason="",
         try:
             obj = make_bent_bracket(**params)
         except Exception as e:
-            return {"status": "REJECTED", "reason": f"CadQuery kernel rejected these parameters: {type(e).__name__}: {e}"}
+            return {"status": "REJECTED", "reason": f"CAD kernel (build123d/OpenCASCADE) rejected these parameters: {type(e).__name__}: {e}"}
         state.design_type = "bent_bracket"; state.params = params; state.script = None; state.obj = obj
     elif design_type == "generic_script":
         try:
             script = await gemini_generate_script(state.original_prompt)
         except HTTPException as e:
             return {"status": "ERROR", "message": f"Script generation failed: {e.detail}"}
-        obj, err = execute_cq_script_safely(script)
+        obj, err = execute_cad_script_safely(script)
         if err:
             return {"status": "REJECTED", "reason": err}
         state.design_type = "generic_script"; state.params = None; state.script = script; state.obj = obj
@@ -5961,7 +8093,8 @@ async def _tool_run_fea(state, force_n=None, force_dir=None):
     try:
         result = await run_analysis_v8(state.mesh, state.original_prompt, state.original_prompt, state.material,
                                         fn, fd, state.operating_temp_c, state.project_description,
-                                        state.surface_finish, state.reliability, False)
+                                        state.surface_finish, state.reliability, False,
+                                        cad_obj=state.obj)
     except Exception as e:
         return {"status": "ERROR",
                 "message": f"Analysis pipeline raised: {type(e).__name__}: {e}. This usually means degenerate "
@@ -6133,7 +8266,7 @@ ENGINEERING_AGENT_TOOLS = [
      "description": "Establish the FIRST version of the design from your understanding of the engineering "
         "request. Choose design_type='tapered_beam' for a tapered/lofted member (drone arm, connecting rod, "
         "tapered spar/leg), 'bent_bracket' for a bracket with a real fold between two flat legs, or "
-        "'generic_script' to let the AI author a custom CadQuery script for geometry neither primitive "
+        "'generic_script' to let the AI author a custom build123d script for geometry neither primitive "
         "covers. Can only be called once per session.",
      "parameters": {"type": "object", "properties": {
          "design_type": {"type": "string", "enum": ["tapered_beam", "bent_bracket", "generic_script"]},
@@ -6567,8 +8700,8 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
                                  operating_temp_c=25.0, surface_finish="machined", reliability=0.99,
                                  project_description=None, max_iterations=4, min_health_score=75.0,
                                  max_critical_violations=0, max_high_violations=2, min_safety_factor=1.0):
-    if not CQ:
-        raise HTTPException(503, "CadQuery not installed on this server.")
+    if not B3D:
+        raise HTTPException(503, "build123d not installed on this server.")
 
     max_iterations = max(1, min(int(max_iterations), 6))
     max_steps = max(12, min(max_iterations * 8, 40))
@@ -6829,16 +8962,16 @@ async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_d
         elif winner["design_type"] == "bent_bracket":
             final_obj = make_bent_bracket(**winner["params"])
         else:
-            final_obj, build_err = execute_cq_script_safely(winner["script"])
+            final_obj, build_err = execute_cad_script_safely(winner["script"])
             if build_err:
                 raise RuntimeError(build_err)
-        final_mesh, final_stl = await mesh_from_cq_object(final_obj)
+        final_mesh, final_stl = await mesh_from_cad_object(final_obj)
     except Exception as e:
         raise HTTPException(502, f"Failed to rebuild the winning design for final export: {e}")
 
     final_result = await run_analysis_v8(final_mesh, prompt, prompt, material, force_n, force_dir,
                                           operating_temp_c, project_description, surface_finish,
-                                          reliability, False)
+                                          reliability, False, cad_obj=final_obj)
     final_quality = evaluate_design_quality(final_result, min_health_score, max_critical_violations,
                                              max_high_violations, min_safety_factor)
 
@@ -6902,7 +9035,7 @@ async def engineering_agent_endpoint(
     The frontier model (GPT-OSS-120B via Groq, by default — see AI_PROVIDER) reasons about
     the design and calls tools; Lumexa's deterministic geometry kernel, mesher, and solver
     remain the sole source of engineering truth. The model never declares pass/fail itself
-    and never hand-writes CadQuery for the tapered-beam/bent-bracket workflows — it only
+    and never hand-writes build123d for the tapered-beam/bent-bracket workflows — it only
     proposes named parameter changes, which are validated against a safe-parameter contract
     and applied through make_tapered_beam/make_bent_bracket, the same trusted server-side
     primitives /generate-validate-refine already relies on. Geometry outside what those two

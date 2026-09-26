@@ -5,5 +5,20 @@ trimesh
 numpy
 scipy
 matplotlib
-cadquery
 ezdxf
+
+# CAD kernel (replaces cadquery — remove cadquery from this file)
+build123d>=0.10,<0.12
+
+# SimScale cloud FEA. The SDK is installed from GitHub's source archive (no git needed
+# in the image, and far smaller/faster than a full git clone). To pin a version, replace
+# "master" with a tag from https://github.com/SimScaleGmbH/simscale-python-sdk/releases
+https://github.com/SimScaleGmbH/simscale-python-sdk/archive/refs/heads/master.zip
+
+# Reads SimScale result files (.vtu/.vtk/.med). h5py is only used for .med.
+meshio
+h5py
+
+# PyVista/VTK: optional, imported lazily and OFF unless USE_PYVISTA=1 (see README). Installing it only
+# costs disk/build time; it costs RAM only when you switch the feature on.
+pyvista

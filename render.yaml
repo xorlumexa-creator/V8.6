@@ -7,13 +7,50 @@ services:
     plan: free
     healthCheckPath: /
     envVars:
+      # --- LLM: Nemotron 3 Ultra via NVIDIA build (free) ---
       - key: AI_PROVIDER
-        value: groq
-      - key: GROQ_API_KEY
+        value: nvidia
+      - key: NVIDIA_API_KEY
         sync: false
-      - key: GROQ_API_KEY_2
+      - key: NVIDIA_MODEL
+        value: nvidia/nemotron-3-ultra-550b-a55b
+      - key: NVIDIA_TIMEOUT_S
+        value: "180"
+      - key: NVIDIA_GEN_MAX_TOKENS
+        value: "12000"
+
+      # --- SimScale cloud FEA (see SETUP.md for the one-time template) ---
+      - key: SIMSCALE_API_KEY
         sync: false
-      - key: ANALYSIS_SERVICE_URL
+      - key: SIMSCALE_TEMPLATE_PROJECT_ID
         sync: false
+      - key: SIMSCALE_TEMPLATE_SIMULATION_ID
+        sync: false
+      - key: SIMSCALE_TEMPLATE_MESH_OPERATION_ID
+        sync: false
+      - key: SIMSCALE_TEMPLATE_MATERIAL
+        value: aluminum_6061
+      - key: SIMSCALE_TIMEOUT_S
+        value: "480"
+
+      # --- PyVista (optional, OFF by default: VTK is RAM-hungry; check /pyvista-selftest first) ---
+      - key: USE_PYVISTA
+        value: "0"
+      - key: PYVISTA_RENDER
+        value: "0"
+      - key: PYVISTA_GL_BACKEND
+        value: osmesa
+
+      # --- build123d API knowledge base (RAG): shows the LLM the installed library's REAL signatures ---
+      - key: KB_ENABLED
+        value: "1"
+      - key: KB_EMBEDDINGS
+        value: "0"
+
+      # --- CORS: put your real frontend origin(s), comma-separated ---
       - key: ALLOWED_ORIGINS
         value: https://your-frontend-domain.com
+
+      # Optional: URL of the separate CalculiX analysis service (fallback if SimScale fails).
+      # Add it in the Render dashboard only if you deploy analysis_service.py:
+      #   ANALYSIS_SERVICE_URL = https://your-analysis-service.onrender.com
