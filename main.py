@@ -982,7 +982,7 @@ def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0):
             gi_api = sim.GeometryImportsApi(api_client)
             gi = gi_api.import_geometry(pid, sim.GeometryImportRequest(
                 name=tag, location=sim.GeometryImportRequestLocation(storage.storage_id),
-                format="STEP", input_unit="MM", options=opts))
+                format="STEP", input_unit="mm", options=opts))
             gi = _ss_wait(lambda: gi_api.get_geometry_import(pid, gi.geometry_import_id),
                           "geometry_import", deadline, design_related=True)
             geometry_id = gi.geometry_id
