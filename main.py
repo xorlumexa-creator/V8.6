@@ -513,39 +513,6 @@ SIMSCALE_POLL_S = float(os.environ.get("SIMSCALE_POLL_S", "6"))
 # limits and stops parallel requests from racing on the same template project.
 _simscale_lock = threading.Lock()
 
-# ── PyVista (optional; OFF by default) ──────────────────────────────────────
-# PyVista sits on VTK, which is heavy: importing it costs a large chunk of RAM (see
-# /pyvista-selftest for the real numbers on YOUR instance) — on a 512 MB Render free
-# instance that already holds OpenCascade + scipy/trimesh it can push the process over the
-# limit. So nothing is imported unless you switch it on:
-#   USE_PYVISTA=1        read SimScale result files with PyVista (more formats than meshio,
-#                        handles cell-data-only results); meshio stays as the fallback
-#   PYVISTA_RENDER=1     additionally render a von Mises stress picture (off-screen) that is
-#                        returned as result["simscale_stress_image_base64"] (PNG)
-#   PYVISTA_GL_BACKEND   osmesa (default: software GL, needs libosmesa6) | egl | auto
-USE_PYVISTA = _env_flag("USE_PYVISTA", False)
-PYVISTA_RENDER = _env_flag("PYVISTA_RENDER", False)
-PYVISTA_GL_BACKEND = os.environ.get("PYVISTA_GL_BACKEND", "osmesa").strip().lower()
-_pv = {"mod": None, "err": None}
-
-
-def _pyvista():
-    """Lazy PyVista import (VTK is only loaded the first time a feature needs it). The GL
-    backend must be chosen BEFORE vtk is imported, hence the env var here."""
-    if _pv["mod"] is None and _pv["err"] is None:
-        try:
-            if PYVISTA_GL_BACKEND == "osmesa":
-                os.environ.setdefault("VTK_DEFAULT_OPENGL_WINDOW", "vtkOSOpenGLRenderWindow")
-            elif PYVISTA_GL_BACKEND == "egl":
-                os.environ.setdefault("VTK_DEFAULT_OPENGL_WINDOW", "vtkEGLRenderWindow")
-            import pyvista as pv
-            pv.OFF_SCREEN = True
-            _pv["mod"] = pv
-        except Exception as e:
-            _pv["err"] = f"{type(e).__name__}: {str(e)[:300]}"
-    return _pv["mod"]
-
-
 def _rss_mb():
     try:
         with open("/proc/self/status") as f:
@@ -676,7 +643,102 @@ def _ss_set_force(sim, bc, fx, fy, fz):
                                       f"_ss_set_force expects; adjust that one function.")
 
 
-def _ss_patch_model(sim, template_model, body_names, fixed_names, load_names, force_xyz):
+def _ss_attr_names(node):
+    """Attribute names of a SimScale SDK model object (openapi-generated classes)."""
+    types = getattr(node, "openapi_types", None)
+    if isinstance(types, dict) and types:
+        return list(types.keys())
+    skip = ("local_vars_configuration", "discriminator", "configuration")
+    return [k.lstrip("_") for k in getattr(node, "__dict__", {}) if k.lstrip("_") not in skip]
+
+
+def _ss_stale_entities(sim, node, valid, _seen=None, _depth=0):
+    """Names of every entity referenced (via a TopologicalReference) anywhere under `node`
+    that does NOT exist in the freshly imported geometry, i.e. leftovers from the template."""
+    if node is None or isinstance(node, (str, bytes, int, float, bool)) or _depth > 14:
+        return []
+    _seen = set() if _seen is None else _seen
+    if id(node) in _seen:
+        return []
+    _seen.add(id(node))
+    if isinstance(node, sim.TopologicalReference):
+        return [e for e in (getattr(node, "entities", None) or []) if e not in valid]
+    out = []
+    if isinstance(node, (list, tuple)):
+        for x in node:
+            out += _ss_stale_entities(sim, x, valid, _seen, _depth + 1)
+    elif isinstance(node, dict):
+        for x in node.values():
+            out += _ss_stale_entities(sim, x, valid, _seen, _depth + 1)
+    else:
+        for name in _ss_attr_names(node):
+            try:
+                v = getattr(node, name)
+            except Exception:
+                continue
+            out += _ss_stale_entities(sim, v, valid, _seen, _depth + 1)
+    return out
+
+
+def _ss_drop_stale_assignments(sim, node, valid, body_names, report, path="model", _depth=0):
+    """The template was built on a DIFFERENT geometry. Besides the material / fixed support / force
+    that we re-point explicitly, it may hold other assignments (result controls such as area or
+    surface data, contacts, mesh refinements, extra BCs ...) that still name the template's
+    entities — SimScale rejects those with 'unknown Topological Entities'. Walk the whole cloned
+    model: a list item that references entities missing from the new geometry is removed; a
+    stand-alone stale reference is re-pointed at the body. Everything done is logged in `report`."""
+    if node is None or isinstance(node, (str, bytes, int, float, bool)) or _depth > 14:
+        return
+    if isinstance(node, list):
+        for i in range(len(node) - 1, -1, -1):
+            item = node[i]
+            stale = _ss_stale_entities(sim, item, valid)
+            if stale:
+                report["dropped"].append({"path": f"{path}[{i}]", "type": type(item).__name__,
+                                          "stale": sorted(set(stale))[:6]})
+                del node[i]
+            else:
+                _ss_drop_stale_assignments(sim, item, valid, body_names, report, f"{path}[{i}]", _depth + 1)
+        return
+    if isinstance(node, (tuple, dict, sim.TopologicalReference)):
+        return
+    for name in _ss_attr_names(node):
+        try:
+            v = getattr(node, name)
+        except Exception:
+            continue
+        if isinstance(v, sim.TopologicalReference):
+            stale = [e for e in (getattr(v, "entities", None) or []) if e not in valid]
+            if stale:
+                try:
+                    setattr(node, name, sim.TopologicalReference(entities=list(body_names)))
+                    report["remapped"].append({"path": f"{path}.{name}", "type": type(node).__name__,
+                                               "stale": sorted(set(stale))[:6]})
+                except Exception as e:
+                    report.setdefault("unresolved", []).append(
+                        {"path": f"{path}.{name}", "error": f"{type(e).__name__}: {e}"[:200]})
+        elif v is not None and not isinstance(v, (str, bytes, int, float, bool)):
+            _ss_drop_stale_assignments(sim, v, valid, body_names, report, f"{path}.{name}", _depth + 1)
+
+
+def _ss_setup_errors(sims_api, pid, simulation_id, swallow=False):
+    """ERROR-severity messages from SimScale's setup check (deduplicated, order kept)."""
+    try:
+        chk = sims_api.check_simulation_setup(pid, simulation_id)
+    except Exception:
+        if swallow:
+            return []
+        raise
+    out = []
+    for e in (getattr(chk, "entries", None) or []):
+        if str(getattr(e, "severity", "")).upper() == "ERROR":
+            msg = str(getattr(e, "message", e))
+            if msg not in out:
+                out.append(msg)
+    return out
+
+
+def _ss_patch_model(sim, template_model, body_names, fixed_names, load_names, force_xyz, valid_names=None):
     """Deep-copy the template's model and re-point it at the new geometry."""
     model = copy.deepcopy(template_model)
     TR = sim.TopologicalReference
@@ -698,10 +760,15 @@ def _ss_patch_model(sim, template_model, body_names, fixed_names, load_names, fo
         raise _SimScaleError(
             "setup", f"the template simulation must contain one 'Fixed support' and one 'Force' boundary "
                      f"condition (found {report}). Re-create the template in the SimScale workbench.")
+    # Anything else in the template that still names the template's own faces/bodies
+    # (result controls, contacts, extra BCs, ...) would make the setup check fail.
+    report["dropped"], report["remapped"] = [], []
+    if valid_names is None:
+        valid_names = set(body_names) | set(fixed_names) | set(load_names)
+    _ss_drop_stale_assignments(sim, model, set(valid_names), body_names, report)
     return model, report
 
 
-_VM_RE = re.compile(r"mises|sieq|vmis|equiv.*stress", re.I)
 _STRESS_TENSOR_RE = re.compile(r"stress|sigma|sief", re.I)
 _DISP_RE = re.compile(r"displacement|^u$|^d$|^depl", re.I)
 
@@ -738,94 +805,18 @@ def _ss_analyse_arrays(pts, point_data, fname):
     return out if (out["vm"] is not None or out["disp"] is not None) else None
 
 
-def _ss_fields_via_pyvista(path):
-    """Read a result file with PyVista. Also handles results stored as CELL data (converted to
-    point data) and multi-block files. Keeps the mesh (`_pv_mesh`) so it can be rendered."""
-    pv = _pyvista()
-    if pv is None:
-        raise RuntimeError(f"pyvista unavailable ({_pv['err']})")
-    mesh = pv.read(path)
-    if isinstance(mesh, pv.MultiBlock):
-        mesh = mesh.combine()
-    pts = np.asarray(mesh.points, dtype=float)
-    out = _ss_analyse_arrays(pts, {k: mesh.point_data[k] for k in mesh.point_data.keys()}, os.path.basename(path))
-    if out is None or out["vm"] is None:
-        try:
-            conv = mesh.cell_data_to_point_data()
-            out2 = _ss_analyse_arrays(np.asarray(conv.points, dtype=float),
-                                      {k: conv.point_data[k] for k in conv.point_data.keys()},
-                                      os.path.basename(path))
-            if out2 is not None and (out is None or out2["vm"] is not None):
-                out, mesh = out2, conv
-        except Exception:
-            pass
-    if out is not None:
-        out["_pv_mesh"] = mesh
-    return out
-
-
 def _ss_fields_from_file(path):
-    """PyVista first when USE_PYVISTA=1, otherwise (or if it fails) meshio."""
+    """Reads a SimScale result file with meshio. PyVista/VTK used to be an optional second
+    path here (plus an off-screen renderer for a stress-image preview) — removed. VTK's
+    off-screen rendering needs a working OSMesa/EGL context, which is exactly the kind of
+    thing that's fragile on a headless free-tier container with no GPU, and the image it
+    produced was never actually useful to the LLM anyway (Nemotron is a text model — it can't
+    "look at" a picture). meshio alone already covers every result format SimScale returns
+    for a static analysis."""
     fname = os.path.basename(path)
-    pv_err = None
-    if USE_PYVISTA:
-        try:
-            r = _ss_fields_via_pyvista(path)
-            if r:
-                return r
-        except Exception as e:
-            pv_err = f"pyvista: {type(e).__name__}: {str(e)[:120]}"
-    try:
-        import meshio
-        m = meshio.read(path)
-    except Exception as e:
-        raise RuntimeError((pv_err + "; " if pv_err else "") + f"meshio: {type(e).__name__}: {str(e)[:120]}")
+    import meshio
+    m = meshio.read(path)
     return _ss_analyse_arrays(np.asarray(m.points, dtype=float), dict(m.point_data or {}), fname)
-
-
-def _ss_render_stress_png(fields, tmpdir, force=False):
-    """Off-screen PNG of the von Mises field (surface only, hotspot marked). Returns
-    (png_bytes | None, status). Never raises — a picture must never fail an analysis."""
-    if not (PYVISTA_RENDER or force):
-        return None, "not requested (PYVISTA_RENDER=0)"
-    mesh, vm = fields.get("_pv_mesh"), fields.get("_vm_array")
-    if mesh is None or vm is None:
-        return None, "no PyVista mesh / stress array to draw (USE_PYVISTA=1 needed)"
-    pv = _pyvista()
-    if pv is None:
-        return None, f"pyvista unavailable ({_pv['err']})"
-    pl = None
-    try:
-        vm_mpa = np.asarray(vm, dtype=float)
-        vm_mpa = vm_mpa / 1e6 if float(vm_mpa.max()) > 1e5 else vm_mpa
-        m = mesh.copy(deep=False)                          # attach the array BEFORE extracting the skin so it
-        m.point_data["von_mises_mpa"] = vm_mpa             # is carried onto the surface points
-        surf = m.extract_surface()                         # skin only: far less memory than the volume mesh
-        pl = pv.Plotter(off_screen=True, window_size=(960, 640))
-        pl.set_background("white")
-        pl.add_mesh(surf, scalars="von_mises_mpa", cmap="turbo", show_edges=False,
-                    scalar_bar_args={"title": "von Mises [MPa]", "color": "black"})
-        hot = fields.get("vm_xyz")
-        if hot:
-            pl.add_mesh(pv.PolyData(np.array([hot], dtype=float)), color="black", point_size=16,
-                        render_points_as_spheres=True)
-        pl.add_text(f"Peak {float(vm_mpa.max()):.1f} MPa", position="upper_left", font_size=12, color="black")
-        pl.camera_position = "iso"
-        path = os.path.join(tmpdir, "stress.png")
-        img = pl.screenshot(path, return_img=True)
-        if img is not None and float(np.asarray(img).std()) < 1.0:
-            return None, ("render produced a blank image — GL backend problem. Try PYVISTA_GL_BACKEND="
-                          "egl or auto (libosmesa6 / libegl1 must be installed in the image).")
-        with open(path, "rb") as f:
-            return f.read(), "ok"
-    except Exception as e:
-        return None, f"{type(e).__name__}: {str(e)[:200]}"
-    finally:
-        try:
-            if pl is not None:
-                pl.close()
-        except Exception:
-            pass
 
 
 def _ss_fetch_results(sim, api_client, project_id, simulation_id, run_id, tmpdir):
@@ -838,12 +829,11 @@ def _ss_fetch_results(sim, api_client, project_id, simulation_id, run_id, tmpdir
     items = list(getattr(res, "embedded", None) or [])
     listing = [{"type": str(getattr(i, "type", None)), "category": str(getattr(i, "category", None)),
                 "name": str(getattr(i, "name", None))} for i in items]
-    if not USE_PYVISTA:
-        try:
-            import meshio  # noqa: F401
-        except ImportError:
-            raise _SimScaleError("results", "run FINISHED but `meshio` is not installed, so the result fields "
-                                            "cannot be read (pip install meshio h5py) — or set USE_PYVISTA=1.")
+    try:
+        import meshio  # noqa: F401
+    except ImportError:
+        raise _SimScaleError("results", "run FINISHED but `meshio` is not installed, so the result fields "
+                                        "cannot be read (pip install meshio h5py).")
     import urllib.request
     best = None
     tried = []
@@ -1009,12 +999,26 @@ def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0):
 
             # ── clone template -> new simulation + mesh operation ───────────────
             mark("setup")
-            model, patch_report = _ss_patch_model(sim, tpl_sim.model, body_names, fixed_names, load_names, force_xyz)
+            valid_names = set(face_names) | set(body_names)
+            model, patch_report = _ss_patch_model(sim, tpl_sim.model, body_names, fixed_names, load_names,
+                                                  force_xyz, valid_names=valid_names)
             diag["patch"] = patch_report
             simulation = sims_api.create_simulation(pid, sim.SimulationSpec(name=tag, geometry_id=geometry_id, model=model))
             simulation_id = simulation.simulation_id
+            # fail fast on entity-assignment errors BEFORE paying for the mesh (no mesh yet, so only
+            # the topological-entity complaints are meaningful at this point)
+            early = [m for m in _ss_setup_errors(sims_api, pid, simulation_id, swallow=True)
+                     if "opological" in m or "unknown entit" in m.lower()]
+            if early:
+                diag["setup_errors"] = early
+                raise _SimScaleError("setup", f"SimScale setup check reported {len(early)} entity-assignment "
+                                              f"error(s): " + "; ".join(early[:8]))
+            mesh_model = copy.deepcopy(tpl_mesh.model)
+            mesh_report = {"dropped": [], "remapped": []}
+            _ss_drop_stale_assignments(sim, mesh_model, valid_names, body_names, mesh_report, path="mesh_model")
+            diag["mesh_patch"] = mesh_report
             mesh_op = mesh_api.create_mesh_operation(
-                pid, sim.MeshOperation(name=tag, geometry_id=geometry_id, model=copy.deepcopy(tpl_mesh.model)))
+                pid, sim.MeshOperation(name=tag, geometry_id=geometry_id, model=mesh_model))
             mark("mesh")
             mesh_api.start_mesh_operation(pid, mesh_op.mesh_operation_id, simulation_id=simulation_id)
             mesh_op = _ss_wait(lambda: mesh_api.get_mesh_operation(pid, mesh_op.mesh_operation_id),
@@ -1023,13 +1027,13 @@ def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0):
             spec.mesh_id = mesh_op.mesh_id
             sims_api.update_simulation(pid, simulation_id, spec)
             try:
-                chk = sims_api.check_simulation_setup(pid, simulation_id)
-                bad = [str(getattr(e, "message", e)) for e in (getattr(chk, "entries", None) or [])
-                       if str(getattr(e, "severity", "")).upper() == "ERROR"]
-                if bad:
-                    raise _SimScaleError("setup", "SimScale setup check reported errors: " + "; ".join(bad[:4]))
+                bad = _ss_setup_errors(sims_api, pid, simulation_id)
             except AttributeError:
-                pass
+                bad = []
+            if bad:
+                diag["setup_errors"] = bad
+                raise _SimScaleError("setup", f"SimScale setup check reported {len(bad)} error(s): "
+                                              + "; ".join(bad[:8]))
 
             # ── solve ───────────────────────────────────────────────────────────
             mark("solve")
@@ -1042,9 +1046,6 @@ def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0):
             # ── results ─────────────────────────────────────────────────────────
             mark("results")
             fields, listing = _ss_fetch_results(sim, api_client, pid, simulation_id, run_id, tmpdir)
-            mark("render")
-            png, render_status = _ss_render_stress_png(fields, tmpdir)
-            diag["render"] = render_status
 
         # ── convert SI results to this file's units ─────────────────────────────
         L = max(exts)
@@ -1080,7 +1081,6 @@ def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0):
                          "template_material": SIMSCALE_TEMPLATE_MATERIAL, "requested_material": mat_key,
                          "displacement_rescaled_by_E_ratio": round(E_tpl / max(E_req, 1e-9), 4)},
             "inputs": {"force_n": force_n, "direction": force_dir},
-            "stress_image_png_base64": base64.b64encode(png).decode() if png else None,
         }
         mark("done")
         diag["elapsed_s"] = round(time.time() - t0, 1)
@@ -2135,7 +2135,7 @@ def _cerebras_request(messages, temperature=0.15, max_tokens=3000, model=None):
     return content
 
 
-def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None):
+def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None, timeout=None):
     """Low-level call to NVIDIA's NIM catalog (build.nvidia.com, OpenAI-compatible
     chat completions) — identical shape to _groq_request/_cerebras_request,
     different base URL/key. `model` (or NVIDIA_MODEL) picks which of NVIDIA's
@@ -2164,7 +2164,7 @@ def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None):
         }
     )
     try:
-        with urllib.request.urlopen(req, timeout=NVIDIA_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(req, timeout=(timeout or NVIDIA_TIMEOUT_S)) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="ignore")
@@ -3940,6 +3940,156 @@ def verify_declared_features(script: str, shape):
     return _verify_against_holes(declared, holes)
 
 
+# ═══════════════════════════════════════════════════════════════════
+# PROGRAMMATIC GEOMETRY INSPECTION (replaces the PyVista stress-image idea)
+#
+# Nemotron is a text model — it cannot reliably judge a 3D part from a picture, and a render
+# needs a GL context that is fragile on a headless free-tier container. What it CAN do well is
+# read exact numbers. So instead of drawing the part, we MEASURE the finished B-rep with
+# OpenCascade (exact volume / area / bounding box / centre of mass / topology counts / holes)
+# and hand those numbers to the model. Two layers:
+#   1. inspect_b3d_geometry(): deterministic, free, runs before the slow SimScale call.
+#      One HARD gate: the result must be exactly ONE solid (disconnected pieces mean a missed
+#      union or features that do not touch — SimScale would import them as separate bodies).
+#      Everything else is reported, not enforced.
+#   2. review_geometry_with_llm(): Nemotron compares the ORIGINAL REQUEST with the measured
+#      report ("asked 80x50x5, solid measures 80x50x12") — the one class of mistake no
+#      deterministic check can catch, because only a reader of the prompt knows what was asked.
+#      Fail-open (any error/timeout skips it), at most ONE review-triggered refinement per job,
+#      and switchable with GEOMETRY_REVIEW=0.
+# ═══════════════════════════════════════════════════════════════════
+GEOMETRY_REVIEW = os.environ.get("GEOMETRY_REVIEW", "1").strip().lower() not in ("0", "false", "no", "off")
+GEOMETRY_REVIEW_TIMEOUT_S = float(os.environ.get("GEOMETRY_REVIEW_TIMEOUT_S", "90"))
+GEOMETRY_REVIEW_MODEL = os.environ.get("GEOMETRY_REVIEW_MODEL", "").strip() or None   # default: NVIDIA_MODEL
+GEOMETRY_REVIEW_MAX_TOKENS = int(os.environ.get("GEOMETRY_REVIEW_MAX_TOKENS", "4000"))  # reasoning eats budget
+
+
+def inspect_b3d_geometry(shape):
+    """Measure the finished build123d solid. Never raises — a field whose query fails is left
+    out with an `*_error` note instead of blocking the design over a checker problem."""
+    out = {"ok": True, "issues": []}
+
+    def rnd(v, n=3):
+        return round(float(v), n)
+
+    try:
+        solids = list(shape.solids()) or [shape]
+        out["solid_count"] = len(solids)
+        if len(solids) > 1:
+            out["ok"] = False
+            vols = sorted((rnd(_b3d_prop(s_, "volume", 0.0), 2) for s_ in solids), reverse=True)
+            out["issues"].append(
+                f"The script produced {len(solids)} separate solids (volumes mm3: {vols[:6]}), not 1. A "
+                "single manufacturable part must be one connected solid — usually a union (+) was skipped, "
+                "or two features only touch at a face/edge instead of really overlapping.")
+    except Exception as e:
+        out["solid_count_error"] = f"{type(e).__name__}: {str(e)[:150]}"
+
+    out["is_valid_brep"] = bool(_b3d_is_valid(shape))
+
+    try:
+        bb = shape.bounding_box()
+        out["bounding_box_mm"] = {
+            "size": {"x": rnd(bb.size.X), "y": rnd(bb.size.Y), "z": rnd(bb.size.Z)},
+            "min": {"x": rnd(bb.min.X), "y": rnd(bb.min.Y), "z": rnd(bb.min.Z)},
+            "max": {"x": rnd(bb.max.X), "y": rnd(bb.max.Y), "z": rnd(bb.max.Z)}}
+    except Exception as e:
+        out["bounding_box_error"] = f"{type(e).__name__}: {str(e)[:150]}"
+
+    vol = _b3d_prop(shape, "volume", None)
+    if vol is not None:
+        out["volume_mm3"] = rnd(vol, 2)
+    area = _b3d_prop(shape, "area", None)
+    if area is not None:
+        out["surface_area_mm2"] = rnd(area, 2)
+
+    try:
+        c = shape.center()
+        out["center_of_mass_mm"] = {"x": rnd(c.X), "y": rnd(c.Y), "z": rnd(c.Z)}
+    except Exception as e:
+        out["center_of_mass_error"] = f"{type(e).__name__}: {str(e)[:150]}"
+
+    try:
+        out["face_count"] = len(list(shape.faces()))
+        out["edge_count"] = len(list(shape.edges()))
+        out["vertex_count"] = len(list(shape.vertices()))
+    except Exception as e:
+        out["topology_count_error"] = f"{type(e).__name__}: {str(e)[:150]}"
+
+    try:
+        out["holes"] = [{"diameter_mm": h["diameter_mm"], "axis": h["axis"], "center_mm": h["center_mm"]}
+                        for h in find_b3d_holes(shape)][:40]
+    except Exception as e:
+        out["holes_error"] = f"{type(e).__name__}: {str(e)[:150]}"
+    return out
+
+
+def geometry_report_text(gi) -> str:
+    """The measured facts as compact text — appended to refinement feedback and given to the
+    reviewer so the model can check its own claims against reality."""
+    bb = (gi.get("bounding_box_mm") or {}).get("size")
+    lines = ["MEASURED GEOMETRY of the solid your script just produced (exact OpenCascade values, not estimates):"]
+    if bb:
+        lines.append(f"- bounding box: {bb['x']} x {bb['y']} x {bb['z']} mm (X x Y x Z)")
+    if gi.get("volume_mm3") is not None:
+        lines.append(f"- volume: {gi['volume_mm3']} mm3; surface area: {gi.get('surface_area_mm2')} mm2")
+    if gi.get("center_of_mass_mm"):
+        c = gi["center_of_mass_mm"]
+        lines.append(f"- centre of mass: ({c['x']}, {c['y']}, {c['z']}) mm")
+    lines.append(f"- solids: {gi.get('solid_count')}; valid B-rep: {gi.get('is_valid_brep')}; faces: "
+                 f"{gi.get('face_count')}, edges: {gi.get('edge_count')}")
+    holes = gi.get("holes")
+    if holes is not None:
+        lines.append("- holes/bores: " + ("none" if not holes else "; ".join(
+            f"dia {h['diameter_mm']:g} axis {h['axis']} at {h['center_mm']}" for h in holes[:12])))
+    return "\n".join(lines)
+
+
+def geometry_failure_feedback(gi) -> str:
+    """Feedback for a 'geometry_inspection_failed' refinement round (hard structural failure)."""
+    return ("DETERMINISTIC GEOMETRY CHECK FAILED — measured directly on the finished solid:\n\n"
+            + "\n".join(f"- {i}" for i in gi.get("issues", [])) + "\n\n" + geometry_report_text(gi)
+            + "\n\nFix the modelling so the result is exactly one valid solid. Keep every other requirement "
+              "(dimensions, features, material) unchanged and keep the '# FEATURE:' comments.")
+
+
+def _gi_brief(gi):
+    return {k: gi.get(k) for k in ("ok", "solid_count", "is_valid_brep", "bounding_box_mm", "volume_mm3",
+                                   "surface_area_mm2", "center_of_mass_mm", "face_count", "edge_count", "issues")}
+
+
+_GEOMETRY_REVIEW_SYSTEM = (
+    "You are a strict mechanical-design reviewer. You get the ORIGINAL USER REQUEST for a CAD part and "
+    "the exact MEASURED geometry of the solid that was actually built. Decide whether the measured solid "
+    "plausibly satisfies the explicit numbers in the request: overall dimensions (allow ~3% or 0.5 mm), "
+    "hole/bore counts and diameters, and obvious scale or axis mix-ups (e.g. 5 mm thick asked, 50 mm built). "
+    "Only flag CLEAR contradictions of stated numbers. Do NOT flag things the request never specified, "
+    "do not judge strength or style, and do not invent requirements. Reply with ONLY compact JSON: "
+    '{"verdict":"pass"|"fail","issues":["one short sentence per contradiction, quoting asked vs measured"]}')
+
+
+async def review_geometry_with_llm(prompt: str, gi):
+    """Nemotron reads the request + measured numbers. Returns {"verdict","issues"} or None when
+    the review is off / errored / timed out (fail-open: a slow or broken reviewer never blocks)."""
+    if not GEOMETRY_REVIEW or not NVIDIA_API_KEY:
+        return None
+    try:
+        user = f"ORIGINAL REQUEST:\n{prompt[:3000]}\n\n{geometry_report_text(gi)}"
+        text = await asyncio.to_thread(
+            _nvidia_request,
+            [{"role": "system", "content": _GEOMETRY_REVIEW_SYSTEM}, {"role": "user", "content": user}],
+            temperature=0.0, max_tokens=GEOMETRY_REVIEW_MAX_TOKENS,
+            model=GEOMETRY_REVIEW_MODEL, timeout=GEOMETRY_REVIEW_TIMEOUT_S)
+        m = re.search(r"\{.*\}", text, re.S)
+        data = json.loads(m.group(0)) if m else None
+        if not isinstance(data, dict) or data.get("verdict") not in ("pass", "fail"):
+            return None
+        issues = [str(i)[:300] for i in (data.get("issues") or []) if i][:6]
+        return {"verdict": data["verdict"], "issues": issues}
+    except Exception:
+        return None
+
+
 def feature_failure_summary(fv) -> str:
     parts = []
     for m in fv.get("missing", []):
@@ -5103,7 +5253,6 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
             fea,simscale_diag=await asyncio.to_thread(run_simscale_fem,cad_obj,mat_key,force_n,force_dir,ctx["min_sf"])
         else:
             simscale_diag={"attempted":False,"reason":"SIMSCALE_API_KEY not set (or SIMSCALE_ENABLED=0)"}
-    stress_img=fea.pop("stress_image_png_base64",None) if isinstance(fea,dict) else None
     if fea is None:
         fea,calculix_diag=run_calculix_fem(mesh,mat_key,force_n,force_dir)
     if fea is None:
@@ -5164,7 +5313,6 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
         "calculix_used":fea.get("method","") in ("calculix_solid_tet_fem","calculix_shell_fem"),
         "simscale_used":fea.get("method","")=="simscale_static_fem",
         "simscale_diagnostic":simscale_diag,
-        "simscale_stress_image_base64":stress_img,
         "filename":filename,"part_name":part_name,"part_context":ctx,
         "geometry":{
             "dimensions_mm":{"x":round(exts[0],3),"y":round(exts[1],3),"z":round(exts[2],3)},
@@ -5435,7 +5583,6 @@ def home():
             "build123d_available":B3D,
             "cadquery_available":B3D,   # deprecated alias — kept so existing frontend health checks keep working
             "simscale_configured": SIMSCALE_ENABLED,
-            "pyvista_enabled": USE_PYVISTA, "pyvista_render": PYVISTA_RENDER,
             "api_knowledge_base": {"enabled": KB_ENABLED, "mode": _kb["mode"], "chunks": len(_kb["chunks"])},
             "simscale_template_configured": bool(SIMSCALE_TEMPLATE_PROJECT_ID and SIMSCALE_TEMPLATE_SIMULATION_ID
                                                   and SIMSCALE_TEMPLATE_MESH_OPERATION_ID),
@@ -5467,9 +5614,11 @@ def home():
             "build123d API knowledge base (RAG): the installed library's real signatures/docstrings + verified "
             "idioms, retrieved with NVIDIA embeddings + reranker and injected into every generation; failed "
             "scripts also get a static API check (GET /kb/status, /kb/search, POST /kb/lint).",
-            "Optional PyVista (USE_PYVISTA=1): reads SimScale result files (incl. cell-data-only results) "
-            "and, with PYVISTA_RENDER=1, returns a von Mises stress picture (simscale_stress_image_base64). "
-            "GET /pyvista-selftest reports the real memory cost on your instance.",
+            "Programmatic geometry inspection (replaces PyVista): exact OpenCascade measurements of every "
+            "generated solid (bbox, volume, area, centre of mass, topology counts, holes) — hard gate on "
+            "'exactly one solid', plus a Nemotron design review that checks the request against the measured "
+            "numbers (GEOMETRY_REVIEW=0 disables; GEOMETRY_REVIEW_TIMEOUT_S / _MODEL / _MAX_TOKENS tune it). "
+            "See result.geometry_inspection / result.geometry_review.",
             "GET /cad-selftest and GET /simscale-selftest — verify the build123d kernel and the SimScale "
             "wiring end-to-end (the latter compares against a closed-form cantilever).",
             "POST /generate-validate-refine-async — same loop, returns a job_id to poll at GET /job/{id} "
@@ -5561,7 +5710,7 @@ def home():
             "POST /generate-from-prompt",
             "POST /generate-validate-refine  ★ self-correcting AI design loop",
             "POST /generate-validate-refine-async  ★ same loop as a background job (poll GET /job/{id})",
-            "GET  /cad-selftest","GET  /simscale-selftest","GET  /pyvista-selftest",
+            "GET  /cad-selftest","GET  /simscale-selftest",
             "POST /engineering-agent  ★★ tool-calling reasoning agent (Understand->Inspect->"
             "Diagnose->Propose->Modify->Verify->Simulate->Compare->Refine) — tapered-beam "
             "workflow is the first implementation target, see docstring",
@@ -5879,6 +6028,7 @@ async def generate_validate_refine(
 
     iterations=[]
     kb_log=[]        # per-iteration API-knowledge-base trace (mode, reranker, titles, lint issues)
+    review_refinements_used=0   # LLM design-review may trigger at most ONE refinement round per job
     best=None        # best {"result":..., "quality":..., "script":..., "stl_b64":..., "iteration":int}
     script=None
     feedback=None
@@ -5936,6 +6086,32 @@ async def generate_validate_refine(
             feedback=feature_failure_feedback(fv)
             continue
 
+        # 2c) Programmatic geometry inspection: exact OpenCascade measurements of the finished
+        # solid. Hard gate = exactly one solid (cheap, deterministic, runs BEFORE SimScale). Then
+        # Nemotron reads the ORIGINAL REQUEST against the measured numbers and can flag clear
+        # contradictions (asked 80x50x5, built 80x50x12) — fail-open, and at most one
+        # review-triggered refinement per job so a false positive cannot eat every iteration.
+        gi=inspect_b3d_geometry(obj)
+        if not gi["ok"] and i<max_iterations:
+            iterations.append({"iteration":i,"stage":"geometry_inspection_failed",
+                               "error":"; ".join(gi["issues"]),"geometry_inspection":_gi_brief(gi),"script":script})
+            feedback=geometry_failure_feedback(gi)
+            continue
+        review=None
+        if gi["ok"] and i<max_iterations and review_refinements_used<1:
+            review=await review_geometry_with_llm(prompt,gi)
+            if review and review["verdict"]=="fail" and review["issues"]:
+                review_refinements_used+=1
+                iterations.append({"iteration":i,"stage":"geometry_review_failed",
+                                   "error":"design review: "+"; ".join(review["issues"]),
+                                   "geometry_inspection":_gi_brief(gi),"review":review,"script":script})
+                feedback=("DESIGN REVIEW FOUND THE BUILT SOLID CONTRADICTS THE REQUEST. A reviewer compared your "
+                          "original request with the exact measured geometry:\n"
+                          + "\n".join(f"- {x}" for x in review["issues"]) + "\n\n" + geometry_report_text(gi)
+                          + "\n\nFix the script so the solid matches the numbers in the request. If you are "
+                            "confident a flagged item is actually satisfied, keep it and change nothing else.")
+                continue
+
         # 3) Analyze
         try:
             mesh,stl_bytes=await mesh_from_cad_object(obj)
@@ -5959,14 +6135,19 @@ async def generate_validate_refine(
             # missing a declared hole "passed", whatever its health score
             quality["passed"]=False
             quality["reasons"].insert(0,"Declared feature(s) missing from the solid: "+feature_failure_summary(fv))
+        if not gi["ok"]:
+            # last iteration only: a multi-solid result is never a "passed" design
+            quality["passed"]=False
+            quality["reasons"].insert(0,"Geometry inspection failed: "+"; ".join(gi["issues"]))
         stl_b64=base64.b64encode(stl_bytes).decode()
         entry={"iteration":i,"stage":"analyzed","passed":quality["passed"],
                "health_score":quality["score"],"reasons":quality["reasons"],
-               "metrics":quality["metrics"],"feature_verification":_fv_brief(fv)}
+               "metrics":quality["metrics"],"feature_verification":_fv_brief(fv),
+               "geometry_inspection":_gi_brief(gi),**({"review":review} if review else {})}
         iterations.append(entry)
 
         candidate={"result":result,"quality":quality,"script":script,
-                   "stl_b64":stl_b64,"iteration":i,"fv":fv}
+                   "stl_b64":stl_b64,"iteration":i,"fv":fv,"gi":gi,"review":review}
         # A candidate that actually PASSED is always preferred over one that
         # didn't, no matter the raw score — a failing 95 (e.g. fatigue FAIL)
         # must never beat a passing 87. Only compare raw scores head-to-head
@@ -5984,7 +6165,7 @@ async def generate_validate_refine(
             break
 
         # 5) Build feedback for next round
-        feedback=summarize_analysis_for_refinement(result, quality)
+        feedback=summarize_analysis_for_refinement(result, quality)+"\n\n"+geometry_report_text(gi)
 
     if stopped_reason is None:
         stopped_reason="max_iterations_reached"
@@ -6000,6 +6181,8 @@ async def generate_validate_refine(
     result["generated_stl_base64"]=best["stl_b64"]
     result["generated_script"]=best["script"]
     result["feature_verification"]=best.get("fv")
+    result["geometry_inspection"]=best.get("gi")
+    result["geometry_review"]=best.get("review")
     result["generation_method"]="llm_build123d_v8_refined"
     result["refinement"]={
         "iterations_used":len(iterations),
@@ -6207,61 +6390,6 @@ async def cad_selftest():
     except Exception as e:
         checks.append({"check":"stl_step_export","ok":False,"error":f"{type(e).__name__}: {str(e)[:300]}"})
     return {"ok":all(c["ok"] for c in checks),"build123d_version":version,"checks":checks}
-
-
-@app.get("/pyvista-selftest")
-@_sanitize_response
-async def pyvista_selftest(render: bool = False):
-    """
-    Loads PyVista/VTK and reports what it costs on THIS instance (RSS before/after import and
-    peak RSS) — run it before enabling USE_PYVISTA on Render free (512 MB). Round-trips a
-    synthetic result file through the real SimScale result reader; with ?render=true it also
-    draws a stress picture off-screen, which is what proves the GL backend works.
-    """
-    out={"use_pyvista":USE_PYVISTA,"pyvista_render":PYVISTA_RENDER,"gl_backend":PYVISTA_GL_BACKEND,
-         "rss_mb":{"start":_rss_mb()}}
-    pv=_pyvista()
-    if pv is None:
-        out.update(ok=False,error=_pv["err"],hint="pip install pyvista (in requirements.txt) and rebuild")
-        return out
-    out["pyvista_version"]=getattr(pv,"__version__",None)
-    out["rss_mb"]["after_import"]=_rss_mb()
-    checks=[]
-    tmp=tempfile.mkdtemp(prefix="pvtest_")
-    try:
-        fields=None
-        try:
-            sph=pv.Sphere(radius=0.05).cast_to_unstructured_grid()
-            n=sph.n_points
-            sph.point_data["VonMisesStress"]=np.linspace(1e6,20e6,n)
-            disp=np.zeros((n,3)); disp[:,1]=np.linspace(0,1e-4,n)
-            sph.point_data["Displacement"]=disp
-            path=os.path.join(tmp,"res.vtu"); sph.save(path)
-            fields=_ss_fields_via_pyvista(path)
-            good=bool(fields and abs(fields["vm"]-20e6)<1 and abs(fields["disp"]-1e-4)<1e-9)
-            checks.append({"check":"read_result_file_and_find_peak_stress","ok":good,
-                           "peak_vm_pa":fields and fields["vm"],"peak_disp_m":fields and fields["disp"]})
-        except Exception as e:
-            checks.append({"check":"read_result_file_and_find_peak_stress","ok":False,"error":f"{type(e).__name__}: {str(e)[:250]}"})
-        if render and fields:
-            png,status=_ss_render_stress_png(fields,tmp,force=True)
-            checks.append({"check":"offscreen_render","ok":png is not None,"status":status,
-                           "png_kb":round(len(png)/1024,1) if png else None})
-        else:
-            checks.append({"check":"offscreen_render","ok":None,"note":"skipped — call /pyvista-selftest?render=true"})
-    finally:
-        import shutil
-        shutil.rmtree(tmp,ignore_errors=True)
-    out["rss_mb"]["end"]=_rss_mb()
-    try:
-        import resource
-        out["rss_mb"]["peak_ever"]=round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,1)
-    except Exception:
-        pass
-    out["checks"]=checks
-    out["ok"]=all(c["ok"] is not False for c in checks)
-    out["render_dict_note"]="On a 512 MB instance keep rss_mb.end + your normal working set well under 512."
-    return out
 
 
 @app.get("/simscale-selftest")
