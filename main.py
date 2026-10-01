@@ -769,6 +769,7 @@ def _ss_patch_model(sim, template_model, body_names, fixed_names, load_names, fo
     return model, report
 
 
+_VM_RE = re.compile(r"mises|sieq|vmis|equiv.*stress", re.I)
 _STRESS_TENSOR_RE = re.compile(r"stress|sigma|sief", re.I)
 _DISP_RE = re.compile(r"displacement|^u$|^d$|^depl", re.I)
 
@@ -805,89 +806,265 @@ def _ss_analyse_arrays(pts, point_data, fname):
     return out if (out["vm"] is not None or out["disp"] is not None) else None
 
 
+_SS_RESULT_EXTS = (".vtu", ".vtk", ".vtp", ".vtm", ".pvd", ".pvtu", ".case", ".xdmf", ".xmf", ".med",
+                   ".msh", ".e", ".exo", ".cgns", ".h5", ".foam", ".bin")
+
+
+def _ss_arrays_from_file(path):
+    """(points[N,3], {name: array}, cell_array_names, disp_from_nodes) from one result file.
+    meshio first (vtu/vtk/xdmf/med/...), PyVista as the fallback (EnSight .case, multiblock, ...)."""
+    low = path.lower()
+    if low.endswith(".pvd"):                       # ParaView collection -> read the last data set it lists
+        import xml.etree.ElementTree as ET
+        files = [d.get("file") for d in ET.parse(path).getroot().iter("DataSet") if d.get("file")]
+        if not files:
+            raise ValueError("empty .pvd")
+        return _ss_arrays_from_file(os.path.join(os.path.dirname(path), files[-1]))
+    errs = []
+    if not low.endswith((".case", ".vtm", ".pvtu", ".foam")):
+        try:
+            import meshio
+            m = meshio.read(path)
+            pts = np.asarray(m.points, dtype=float)
+            pdata = dict(m.point_data or {})
+            cdata = dict(m.cell_data or {})
+            if cdata and not any(_VM_RE.search(k) or _STRESS_TENSOR_RE.search(k) for k in pdata):
+                # stress only stored per element -> use element centroids as the "points"
+                cents = [pts[np.asarray(cb.data)].mean(axis=1) for cb in m.cells]
+                cpts = np.concatenate(cents) if cents else pts[:0]
+                carr = {k: np.concatenate([np.asarray(x) for x in v]) for k, v in cdata.items()}
+                if any(_VM_RE.search(k) or _STRESS_TENSOR_RE.search(k) for k in carr):
+                    nodal = _ss_analyse_arrays(pts, pdata, "")
+                    return cpts, {**carr}, sorted(cdata), (nodal or {}).get("disp")
+            return pts, pdata, sorted(cdata), None
+        except Exception as e:
+            errs.append(f"meshio {type(e).__name__}: {str(e)[:100]}")
+    try:
+        import pyvista as pv
+        d = pv.read(path)
+        if isinstance(d, pv.MultiBlock):
+            d = d.combine()
+        cnames = list(d.cell_data.keys())
+        if cnames and not any(_VM_RE.search(k) or _STRESS_TENSOR_RE.search(k) for k in d.point_data.keys()):
+            d = d.cell_data_to_point_data()
+        return (np.asarray(d.points, dtype=float),
+                {k: np.asarray(d.point_data[k]) for k in d.point_data.keys()}, cnames, None)
+    except Exception as e:
+        errs.append(f"pyvista {type(e).__name__}: {str(e)[:100]}")
+    raise ValueError("; ".join(errs))
+
+
 def _ss_fields_from_file(path):
-    """Reads a SimScale result file with meshio. PyVista/VTK used to be an optional second
-    path here (plus an off-screen renderer for a stress-image preview) — removed. VTK's
-    off-screen rendering needs a working OSMesa/EGL context, which is exactly the kind of
-    thing that's fragile on a headless free-tier container with no GPU, and the image it
-    produced was never actually useful to the LLM anyway (Nemotron is a text model — it can't
-    "look at" a picture). meshio alone already covers every result format SimScale returns
-    for a static analysis."""
-    fname = os.path.basename(path)
-    import meshio
-    m = meshio.read(path)
-    return _ss_analyse_arrays(np.asarray(m.points, dtype=float), dict(m.point_data or {}), fname)
+    """Peak von Mises / displacement from one SimScale result file (see _ss_arrays_from_file)."""
+    pts, pdata, cnames, disp_nodes = _ss_arrays_from_file(path)
+    out = _ss_analyse_arrays(pts, pdata, os.path.basename(path))
+    if out is not None and out["disp"] is None and disp_nodes is not None:
+        out["disp"] = disp_nodes
+    if out is None:
+        raise ValueError(f"no stress/displacement array (point arrays={ {k: list(np.shape(v)) for k, v in pdata.items()} }; "
+                         f"cell arrays={cnames})")
+    return out
 
 
-def _ss_fetch_results(sim, api_client, project_id, simulation_id, run_id, tmpdir):
+def _ss_item_dict(it):
+    try:
+        d = it.to_dict()
+        if isinstance(d, dict):
+            return d
+    except Exception:
+        pass
+    return {k: getattr(it, k, None) for k in _ss_attr_names(it)}
+
+
+def _ss_candidate_urls(d, prefix=""):
+    """[(key_path, url)] for every url/href string inside a nested dict/list."""
+    found = []
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if isinstance(v, str) and k in ("url", "href") and v.startswith(("http://", "https://")):
+                found.append((f"{prefix}{k}", v))
+            else:
+                found += _ss_candidate_urls(v, f"{prefix}{k}.")
+    elif isinstance(d, (list, tuple)):
+        for i, v in enumerate(d):
+            found += _ss_candidate_urls(v, f"{prefix}{i}.")
+    return found
+
+
+def _ss_http_get(url):
+    """(bytes, None) or (None, error). SimScale API urls need the key; pre-signed storage urls must not get it."""
+    import urllib.request
+    err = None
+    for headers in ({"X-API-KEY": SIMSCALE_API_KEY}, {}):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as r:
+                return r.read(), None
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)[:100]}"
+    return None, err
+
+
+def _ss_sniff_ext(data):
+    h = data[:300].lstrip()
+    if h.startswith(b"# vtk DataFile"):
+        return ".vtk"
+    if h.startswith(b"<?xml") or h.startswith(b"<VTKFile"):
+        return ".vtu" if b"VTKFile" in data[:2000] else ".xdmf"
+    if data[:8] == b"\x89HDF\r\n\x1a\n":
+        return ".h5"
+    return ".bin"
+
+
+def _ss_parse_blob(data, base, info, found, hop=0):
+    """Unpack one downloaded blob (zip / single file / JSON pointing at more urls) and add every
+    parsable field set to `found` ({"vm": best_vm_dict, "disp": best_disp_dict}). Logs into `info`."""
+    os.makedirs(base, exist_ok=True)
+    if not zipfile.is_zipfile(io.BytesIO(data)) and data.lstrip()[:1] in (b"{", b"[") and hop < 2:
+        try:
+            doc = json.loads(data.decode("utf-8", "replace"))
+        except Exception:
+            doc = None
+        if doc is not None:
+            urls = _ss_candidate_urls(doc)
+            info.setdefault("json_hop", []).append({"keys": sorted(doc)[:12] if isinstance(doc, dict) else "list",
+                                                     "urls": [k for k, _ in urls][:5]})
+            for i, (_, u) in enumerate(urls[:4]):
+                blob, err = _ss_http_get(u)
+                if blob is None:
+                    info["errors"].append(f"hop url {i}: {err}")
+                    continue
+                _ss_parse_blob(blob, os.path.join(base, f"hop{hop}_{i}"), info, found, hop + 1)
+            return
+    paths = []
+    if zipfile.is_zipfile(io.BytesIO(data)):
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            z.extractall(base)
+        for root, _, files in os.walk(base):
+            paths += [os.path.join(root, f) for f in files]
+    else:
+        p = os.path.join(base, "result" + _ss_sniff_ext(data))
+        with open(p, "wb") as f:
+            f.write(data)
+        paths = [p]
+    for p in sorted(paths):
+        size = os.path.getsize(p)
+        rel = os.path.relpath(p, base)
+        if len(info["files"]) < 25:
+            info["files"].append([rel, size])
+        if not p.lower().endswith(_SS_RESULT_EXTS):
+            continue
+        if size > 120 * 1024 * 1024:
+            info["errors"].append(f"{rel}: skipped, {size // 2**20} MB is too big for this instance")
+            continue
+        try:
+            f = _ss_fields_from_file(p)
+        except Exception as e:
+            info["errors"].append(f"{rel}: {type(e).__name__}: {str(e)[:220]}")
+            continue
+        info.setdefault("parsed", []).append(rel)
+        if f["vm"] is not None and (found.get("vm") is None or f["vm"] > found["vm"]["vm"]):
+            found["vm"] = f
+        if f["disp"] is not None and (found.get("disp") is None or f["disp"] > found["disp"]["disp"]):
+            found["disp"] = f
+
+
+def _ss_fetch_results(sim, api_client, project_id, simulation_id, run_id, tmpdir, probe=None):
     """Download the run's result items and pull peak stress/displacement out of them.
-    Returns (fields_dict, listing). This is the most SimScale-version-sensitive step:
-    if it cannot find a parsable solution field it raises with the full item listing
-    so you can see what SimScale actually returned."""
+    Returns (fields_dict, listing). `probe` (a dict, filled in place) records what SimScale actually
+    returned for every item - attributes, urls found, files downloaded, parse errors - so a failure is
+    diagnosable from the response alone. This is the most SimScale-version-sensitive step."""
+    probe = {} if probe is None else probe
     runs_api = sim.SimulationRunsApi(api_client)
     res = runs_api.get_simulation_run_results(project_id, simulation_id, run_id)
     items = list(getattr(res, "embedded", None) or [])
     listing = [{"type": str(getattr(i, "type", None)), "category": str(getattr(i, "category", None)),
                 "name": str(getattr(i, "name", None))} for i in items]
-    try:
-        import meshio  # noqa: F401
-    except ImportError:
-        raise _SimScaleError("results", "run FINISHED but `meshio` is not installed, so the result fields "
-                                        "cannot be read (pip install meshio h5py).")
-    import urllib.request
-    best = None
-    tried = []
+    probe["items"] = []
+    probe["runs_api_methods"] = [m for m in dir(runs_api) if not m.startswith("_")
+                                 and any(k in m for k in ("result", "solution", "download", "field"))]
+    found = {}
     for idx, it in enumerate(items):
-        dl = getattr(it, "download", None)
-        url = getattr(dl, "url", None) if dl is not None else None
-        if not url:
+        d = _ss_item_dict(it)
+        cands = _ss_candidate_urls(d)
+        cands.sort(key=lambda kv: 0 if kv[0].startswith("download") else 1)
+        info = {"idx": idx, "class": type(it).__name__, "type": listing[idx]["type"],
+                "category": listing[idx]["category"],
+                "attrs": sorted(k for k, v in d.items() if v is not None)[:20],
+                "urls": [k for k, _ in cands][:6], "files": [], "errors": []}
+        probe["items"].append(info)
+        kind = (info["type"] + " " + info["category"]).lower()
+        if not any(k in kind for k in ("solution", "field", "volume", "surface", "data", "result")):
+            info["skipped"] = "kind"
             continue
-        kind = (str(getattr(it, "type", "")) + " " + str(getattr(it, "category", ""))).lower()
-        if not any(k in kind for k in ("solution", "field", "volume", "surface")):
+        if not cands:
+            info["errors"].append("item carries no download url")
             continue
-        try:
-            data = None
-            for headers in ({"X-API-KEY": SIMSCALE_API_KEY}, {}):
-                try:
-                    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as r:
-                        data = r.read()
-                    break
-                except Exception:
-                    continue
-            if data is None:
-                tried.append(f"item {idx}: download failed")
+        for j, (key, url) in enumerate(cands[:3]):
+            blob, err = _ss_http_get(url)
+            if blob is None:
+                info["errors"].append(f"{key}: download failed ({err})")
                 continue
-            base = os.path.join(tmpdir, f"res_{idx}")
-            os.makedirs(base, exist_ok=True)
-            paths = []
-            if zipfile.is_zipfile(io.BytesIO(data)):
-                with zipfile.ZipFile(io.BytesIO(data)) as z:
-                    z.extractall(base)
-                for root, _, files in os.walk(base):
-                    paths += [os.path.join(root, f) for f in files]
-            else:
-                p = os.path.join(base, "result.bin")
-                with open(p, "wb") as f:
-                    f.write(data)
-                paths = [p]
-            for p in paths:
-                if not p.lower().endswith((".vtu", ".vtk", ".vtp", ".med", ".xdmf", ".msh", ".case", ".bin")):
-                    continue
-                try:
-                    f = _ss_fields_from_file(p)
-                except Exception as e:
-                    tried.append(f"{os.path.basename(p)}: {type(e).__name__}: {str(e)[:120]}")
-                    continue
-                if f and (best is None or (f["vm"] or 0) > (best["vm"] or 0)):
-                    best = f
-        except Exception as e:
-            tried.append(f"item {idx}: {type(e).__name__}: {str(e)[:120]}")
+            info["downloaded"] = [key, len(blob)]
+            try:
+                _ss_parse_blob(blob, os.path.join(tmpdir, f"res_{idx}_{j}"), info, found)
+            except Exception as e:
+                info["errors"].append(f"{key}: {type(e).__name__}: {str(e)[:150]}")
+            if found.get("vm") is not None:
+                break
+    best = found.get("vm")
+    if best is not None and best.get("disp") is None and found.get("disp") is not None:
+        best = dict(best, disp=found["disp"]["disp"])
+    probe["parsed_ok"] = best is not None
     if best is None:
+        short = json.dumps(probe["items"], default=str)
         raise _SimScaleError(
-            "results", "run FINISHED but no stress/displacement field could be parsed from the result items "
-                       f"{listing}; attempts: {tried[:6]}. Open the run in the SimScale workbench to confirm the "
-                       "setup, then adapt _ss_fetch_results/_ss_fields_from_file to the file format you see.")
+            "results", "run FINISHED but no von Mises stress could be read from the result items. What SimScale "
+                       f"returned: {short[:1400]}")
     return best, listing
+
+
+def _ss_probe(simulation_id="", run_id=""):
+    """Re-read the results of an ALREADY FINISHED run (no new solve). With no ids it picks the newest
+    finished 'lumexa_*' run in the template project."""
+    import shutil
+    out = {"project_id": SIMSCALE_TEMPLATE_PROJECT_ID}
+    tmpdir = tempfile.mkdtemp(prefix="ssprobe_")
+    try:
+        sim, api_client = _ss_client()
+        pid = SIMSCALE_TEMPLATE_PROJECT_ID
+        sims_api, runs_api = sim.SimulationsApi(api_client), sim.SimulationRunsApi(api_client)
+        if not (simulation_id and run_id):
+            page = sims_api.get_simulations(pid, limit=50)
+            sims = [x for x in (getattr(page, "embedded", None) or [])
+                    if str(getattr(x, "name", "")).startswith("lumexa_")]
+            sims.sort(key=lambda x: str(getattr(x, "created_at", "")), reverse=True)
+            out["candidates_checked"] = 0
+            for sm in sims[:12]:
+                out["candidates_checked"] += 1
+                rp = runs_api.get_simulation_runs(pid, sm.simulation_id)
+                fin = [r for r in (getattr(rp, "embedded", None) or [])
+                       if str(getattr(r, "status", "")).upper() == "FINISHED"]
+                if fin:
+                    simulation_id, run_id = sm.simulation_id, fin[-1].run_id
+                    out["picked_name"] = getattr(sm, "name", None)
+                    break
+            if not (simulation_id and run_id):
+                out["error"] = "no finished lumexa_* run found; pass ?simulation_id=&run_id="
+                return out
+        out.update(simulation_id=simulation_id, run_id=run_id)
+        probe = {}
+        out["results_probe"] = probe
+        try:
+            fields, _ = _ss_fetch_results(sim, api_client, pid, simulation_id, run_id, tmpdir, probe=probe)
+            out["parsed"] = {k: (v if not isinstance(v, (list, tuple)) else v) for k, v in fields.items()
+                             if not k.startswith("_")}
+        except _SimScaleError as e:
+            out["error"] = str(e)[:300]
+    except Exception as e:
+        out["error"] = _ss_format_exception(e)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    return out
 
 
 def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0):
@@ -1045,7 +1222,10 @@ def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0):
 
             # ── results ─────────────────────────────────────────────────────────
             mark("results")
-            fields, listing = _ss_fetch_results(sim, api_client, pid, simulation_id, run_id, tmpdir)
+            diag["simscale_ids"] = {"simulation_id": simulation_id, "run_id": run_id, "geometry_id": geometry_id}
+            probe = {}
+            diag["results_probe"] = probe
+            fields, listing = _ss_fetch_results(sim, api_client, pid, simulation_id, run_id, tmpdir, probe=probe)
 
         # ── convert SI results to this file's units ─────────────────────────────
         L = max(exts)
@@ -6422,6 +6602,17 @@ async def simscale_selftest(force_n:float=100.0, material:str=""):
         out["ratio_fem_over_theory"]={"stress":round(vm/max(expected["beam_theory_max_stress_mpa"],1e-9),3),
                                       "deflection":round(dz/max(expected["beam_theory_tip_deflection_mm"],1e-9),3)}
     return out
+
+
+@app.get("/simscale-probe")
+@_sanitize_response
+async def simscale_probe(simulation_id: str = "", run_id: str = ""):
+    """Re-reads the results of an already FINISHED SimScale run without solving again (~10-60 s).
+    No parameters = newest finished lumexa_* run. Shows every result item SimScale returned, the urls
+    found, the files downloaded and why each file did / did not parse. Use it to debug the results step."""
+    if not SIMSCALE_ENABLED:
+        raise HTTPException(503, "SIMSCALE_API_KEY not set")
+    return await asyncio.to_thread(_ss_probe, simulation_id, run_id)
 
 
 @app.post("/refine-from-external-fea")
