@@ -1206,6 +1206,46 @@ def _ss_fetch_results(sim, api_client, project_id, simulation_id, run_id, tmpdir
     return best, listing
 
 
+def _ss_sdk_info(geometry_id=""):
+    """Read-only introspection: what SimScale tells us about a geometry's faces, which selector models the SDK has
+    (geometry primitives / boxes), and what the template simulation contains (material, primitives)."""
+    out = {}
+    sim, api_client = _ss_client()
+    pid = SIMSCALE_TEMPLATE_PROJECT_ID
+    geo_api = sim.GeometriesApi(api_client)
+    try:
+        if not geometry_id:
+            page = geo_api.get_geometries(pid, limit=50)
+            gs = [g for g in (getattr(page, "embedded", None) or []) if str(getattr(g, "name", "")).startswith("lumexa_")]
+            gs.sort(key=lambda g: str(getattr(g, "created_at", "")), reverse=True)
+            if gs:
+                geometry_id = gs[0].geometry_id
+                out["geometry_name"] = getattr(gs[0], "name", None)
+        out["geometry_id"] = geometry_id
+        out["geometry"] = _ss_scrub(_ss_item_dict(geo_api.get_geometry(pid, geometry_id)))
+        m = geo_api.get_geometry_mappings(pid, geometry_id, _class="face", limit=1000)
+        items = list(getattr(m, "embedded", None) or [])
+        if items:
+            out["face_mapping_class"] = type(items[0]).__name__
+            out["face_mapping_types"] = {k: str(v) for k, v in (getattr(type(items[0]), "openapi_types", None) or {}).items()}
+        out["face_mappings"] = [_ss_scrub(_ss_item_dict(i)) for i in items[:8]]
+        out["geometry_api_methods"] = [x for x in dir(geo_api) if not x.startswith("_") and not x.endswith("_with_http_info")]
+    except Exception as e:
+        out["geometry_error"] = _ss_format_exception(e)
+    names = [n for n in dir(sim) if re.search(r"Primitive|CartesianBox|Sphere|Cylinder|TopologicalReference|GeometryMapping|BoundingBox", n)]
+    out["models"] = {n: {k: str(v) for k, v in (getattr(getattr(sim, n), "openapi_types", None) or {}).items()}
+                     for n in names[:25]}
+    try:
+        tpl = sim.SimulationsApi(api_client).get_simulation(pid, SIMSCALE_TEMPLATE_SIMULATION_ID)
+        md = _ss_scrub(_ss_item_dict(tpl.model))
+        out["template_model_attrs"] = sorted(k for k, v in md.items() if v not in (None, [], {}))
+        out["template_materials"] = json.dumps(md.get("materials"), default=str)[:1500]
+        out["template_geometry_primitives"] = json.dumps(md.get("geometry_primitives"), default=str)[:800]
+    except Exception as e:
+        out["template_error"] = _ss_format_exception(e)
+    return out
+
+
 def _ss_probe(simulation_id="", run_id=""):
     """Re-read the results of an ALREADY FINISHED run (no new solve). With no ids it picks the newest
     finished 'lumexa_*' run in the template project."""
@@ -6786,6 +6826,16 @@ async def simscale_selftest(force_n:float=100.0, material:str=""):
         out["ratio_fem_over_theory"]={"stress":round(vm/max(expected["beam_theory_max_stress_mpa"],1e-9),3),
                                       "deflection":round(dz/max(expected["beam_theory_tip_deflection_mm"],1e-9),3)}
     return out
+
+
+@app.get("/simscale-sdk")
+@_sanitize_response
+async def simscale_sdk(geometry_id: str = ""):
+    """Read-only: face-mapping details of the newest lumexa_* geometry, the SDK's selector models and the
+    template's material/primitives. Used to make face selection geometric instead of order-based."""
+    if not SIMSCALE_ENABLED:
+        raise HTTPException(503, "SIMSCALE_API_KEY not set")
+    return await asyncio.to_thread(_ss_sdk_info, geometry_id)
 
 
 @app.get("/simscale-probe")
