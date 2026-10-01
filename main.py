@@ -802,8 +802,30 @@ def _ss_analyse_arrays(pts, point_data, fname):
             if out["vm"] is None or vm[i] > out["vm"]:
                 out["vm"], out["vm_xyz"], out["_vm_array"] = float(vm[i]), pts[i].tolist(), vm
         if _DISP_RE.search(name) and out["disp"] is None and a.ndim >= 1 and len(a) == len(pts):
-            out["disp"] = float(np.linalg.norm(a.reshape(len(a), -1), axis=1).max())
-    return out if (out["vm"] is not None or out["disp"] is not None) else None
+            umag = np.linalg.norm(a.reshape(len(a), -1), axis=1)
+            out["disp"] = float(umag.max())
+            out["_umag"] = umag
+    if out["vm"] is None and out["disp"] is None:
+        return None
+    try:                                    # compact profile along the longest axis: where is it fixed, where does it peak?
+        ext = np.ptp(pts, axis=0)
+        ax = int(np.argmax(ext))
+        t = (pts[:, ax] - pts[:, ax].min()) / max(float(ext[ax]), 1e-12)
+        sl = np.minimum((t * 10).astype(int), 9)
+        vmarr, uarr = out.get("_vm_array"), out.get("_umag")
+        nz = ext[ext > 1e-9]
+        out["field_diag"] = {
+            "axis": "xyz"[ax], "n_points": int(len(pts)),
+            "bbox_min": [round(float(v), 5) for v in pts.min(axis=0)],
+            "bbox_max": [round(float(v), 5) for v in pts.max(axis=0)],
+            "approx_node_spacing": round(float((np.prod(nz) / len(pts)) ** (1.0 / len(nz))), 6) if len(nz) else None,
+            "vm_peak_by_tenth": ([round(float(vmarr[sl == k].max()), 1) if (sl == k).any() else None for k in range(10)]
+                                 if vmarr is not None else None),
+            "disp_peak_by_tenth": ([float("%.4g" % uarr[sl == k].max()) if (sl == k).any() else None for k in range(10)]
+                                   if uarr is not None else None)}
+    except Exception as e:
+        out["field_diag"] = f"unavailable: {type(e).__name__}"
+    return out
 
 
 _SS_RESULT_EXTS = (".vtu", ".vtk", ".vtp", ".vtm", ".pvd", ".pvtu", ".case", ".xdmf", ".xmf", ".med",
@@ -1419,6 +1441,7 @@ def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0):
             "simscale": {"project_id": pid, "geometry_id": geometry_id, "simulation_id": simulation_id,
                          "run_id": run_id, "mesh_id": getattr(mesh_op, "mesh_id", None),
                          "run_name": tag, "result_items": listing, "result_file": fields.get("file"),
+                         "field_diag": fields.get("field_diag"),
                          "template_material": SIMSCALE_TEMPLATE_MATERIAL, "requested_material": mat_key,
                          "displacement_rescaled_by_E_ratio": round(E_tpl / max(E_req, 1e-9), 4)},
             "inputs": {"force_n": force_n, "direction": force_dir},
