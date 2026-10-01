@@ -951,8 +951,8 @@ def _ss_parse_blob(data, base, info, found, hop=0):
         rel = os.path.relpath(p, base)
         if len(info["files"]) < 25:
             info["files"].append([rel, size])
-        if not p.lower().endswith(_SS_RESULT_EXTS):
-            continue
+        if not p.lower().endswith(_SS_RESULT_EXTS) or p.lower().endswith((".vtm", ".pvd", ".pvtu")):
+            continue                        # containers only point at member files, which are read directly
         if size > 120 * 1024 * 1024:
             info["errors"].append(f"{rel}: skipped, {size // 2**20} MB is too big for this instance")
             continue
@@ -968,6 +968,143 @@ def _ss_parse_blob(data, base, info, found, hop=0):
             found["disp"] = f
 
 
+_SS_NOISE_PARAMS = ("self", "kwargs", "async_req", "_return_http_data_only", "_preload_content",
+                    "_request_timeout")
+
+
+def _ss_scrub(v):
+    """Copy of a nested structure with every url cut down to host+path (query strings hold signatures)."""
+    if isinstance(v, dict):
+        return {k: _ss_scrub(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_ss_scrub(x) for x in v]
+    if isinstance(v, str) and v.startswith(("http://", "https://")):
+        return v.split("?")[0]
+    return v if (v is None or isinstance(v, (str, int, float, bool))) else str(v)
+
+
+def _ss_find_class(sim, pred):
+    import inspect
+    for n in sorted(dir(sim)):
+        o = getattr(sim, n, None)
+        if inspect.isclass(o) and pred(n, o):
+            return n, o
+    return None, None
+
+
+def _ss_sdk_export_surface(sim):
+    """What the INSTALLED SimScale SDK offers around results / exports (for diagnosing API drift)."""
+    import inspect
+    out = {"apis": [], "methods": {}, "models": {}}
+    for n in dir(sim):
+        o = getattr(sim, n, None)
+        if not inspect.isclass(o):
+            continue
+        if n.endswith("Api"):
+            out["apis"].append(n)
+            for m in dir(o):
+                if m.startswith("_") or m.endswith("_with_http_info"):
+                    continue
+                if any(k in m.lower() for k in ("export", "result")):
+                    try:
+                        out["methods"][f"{n}.{m}"] = str(inspect.signature(getattr(o, m)))[:160]
+                    except Exception:
+                        out["methods"][f"{n}.{m}"] = "?"
+        elif "export" in n.lower() and len(out["models"]) < 30:
+            out["models"][n] = {k: str(v) for k, v in (getattr(o, "openapi_types", None) or {}).items()}
+    return out
+
+
+def _ss_export_formats(d):
+    vals = []
+    for f in (d.get("available_export_formats") or []):
+        if isinstance(f, dict):
+            f = f.get("format") or f.get("name") or str(f)
+        vals.append(str(f))
+    pref = [f for f in vals if re.search(r"VTM|VTU|VTK|PVD", f, re.I)]
+    rest = [f for f in vals if f not in pref and not re.search(r"CSV|FOAM|ENSIGHT", f, re.I)]
+    return (pref + rest) or vals or ["VTM", "PVD"]
+
+
+def _ss_run_export(sim, api_client, pid, sid, rid, result_id, formats, info, tmpdir, found, wait_s=150):
+    """The SOLUTION_FIELD item's own `download` is only a stub (an empty archive). The real field data has to
+    be requested as an *export* (createExport -> poll -> download). The SDK method / model names are discovered
+    at run time and every step is logged in info["export"], so API drift shows up in the diagnostics."""
+    import inspect
+    exp = info["export"] = {"tried": []}
+    api_name, api_cls = _ss_find_class(sim, lambda n, o: n.endswith("Api") and hasattr(o, "create_export"))
+    if api_cls is None:
+        exp["error"] = "installed SDK has no *Api.create_export"
+        return
+    exp["api"] = api_name
+    api = api_cls(api_client)
+    known = {"project_id": pid, "simulation_id": sid, "run_id": rid, "result_id": result_id}
+
+    def build_kwargs(method, **extra):
+        kw = {}
+        for pname in inspect.signature(method).parameters:
+            if pname in _SS_NOISE_PARAMS:
+                continue
+            if pname in known:
+                kw[pname] = known[pname]
+            elif pname in extra:
+                kw[pname] = extra[pname]
+        return kw
+
+    sig = inspect.signature(api.create_export)
+    exp["create_export_params"] = [p for p in sig.parameters if p not in _SS_NOISE_PARAMS]
+    body_params = [p for p in sig.parameters if p not in known and p not in _SS_NOISE_PARAMS]
+    models = [(n, o) for n in sorted(dir(sim)) for o in [getattr(sim, n, None)]
+              if inspect.isclass(o) and not n.endswith("Api") and "export" in n.lower()
+              and "format" in (getattr(o, "openapi_types", None) or {})]
+    models.sort(key=lambda t: 0 if "request" in t[0].lower() else 1)
+    if len(body_params) != 1 or not models:
+        exp["error"] = f"cannot build the export request (body params={body_params}, models={[m[0] for m in models]})"
+        return
+    exp["request_model"] = models[0][0]
+    for fmt in formats[:4]:
+        try:
+            req = models[0][1](format=fmt)
+            resp = api.create_export(**build_kwargs(api.create_export, **{body_params[0]: req}))
+        except Exception as e:
+            exp["tried"].append({"format": fmt, "error": f"{type(e).__name__}: {str(e)[:200]}"})
+            continue
+        rd = _ss_item_dict(resp)
+        exp["tried"].append({"format": fmt, "created": _ss_scrub(rd)})
+        export_id = getattr(resp, "export_id", None)
+        get = getattr(api, "get_export", None)
+        t_end = time.time() + wait_s
+        cur = rd
+        while get is not None and export_id and time.time() < t_end:
+            status = str(cur.get("status") or "").upper()
+            if status in ("FINISHED", "COMPLETED", "READY", "SUCCEEDED") or (
+                    _ss_candidate_urls(cur) and status not in ("RUNNING", "QUEUED", "PENDING", "CREATED")):
+                break
+            if status in ("FAILED", "CANCELED", "CANCELLED"):
+                exp["tried"][-1]["failed"] = _ss_scrub(cur)
+                break
+            time.sleep(3)
+            try:
+                cur = _ss_item_dict(get(**build_kwargs(get, export_id=export_id)))
+            except Exception as e:
+                exp["tried"][-1]["poll_error"] = f"{type(e).__name__}: {str(e)[:160]}"
+                break
+        exp["tried"][-1]["final"] = _ss_scrub(cur)
+        for j, (key, url) in enumerate(_ss_candidate_urls(cur)[:3]):
+            blob, err = _ss_http_get(url)
+            if blob is None:
+                info["errors"].append(f"export {fmt} {key}: download failed ({err})")
+                continue
+            exp["tried"][-1]["downloaded"] = [key, len(blob)]
+            try:
+                _ss_parse_blob(blob, os.path.join(tmpdir, f"exp_{fmt}_{j}"), info, found)
+            except Exception as e:
+                info["errors"].append(f"export {fmt} {key}: {type(e).__name__}: {str(e)[:150]}")
+            if found.get("vm") is not None:
+                exp["used_format"] = fmt
+                return
+
+
 def _ss_fetch_results(sim, api_client, project_id, simulation_id, run_id, tmpdir, probe=None):
     """Download the run's result items and pull peak stress/displacement out of them.
     Returns (fields_dict, listing). `probe` (a dict, filled in place) records what SimScale actually
@@ -980,8 +1117,6 @@ def _ss_fetch_results(sim, api_client, project_id, simulation_id, run_id, tmpdir
     listing = [{"type": str(getattr(i, "type", None)), "category": str(getattr(i, "category", None)),
                 "name": str(getattr(i, "name", None))} for i in items]
     probe["items"] = []
-    probe["runs_api_methods"] = [m for m in dir(runs_api) if not m.startswith("_")
-                                 and any(k in m for k in ("result", "solution", "download", "field"))]
     found = {}
     for idx, it in enumerate(items):
         d = _ss_item_dict(it)
@@ -989,33 +1124,44 @@ def _ss_fetch_results(sim, api_client, project_id, simulation_id, run_id, tmpdir
         cands.sort(key=lambda kv: 0 if kv[0].startswith("download") else 1)
         info = {"idx": idx, "class": type(it).__name__, "type": listing[idx]["type"],
                 "category": listing[idx]["category"],
-                "attrs": sorted(k for k, v in d.items() if v is not None)[:20],
-                "urls": [k for k, _ in cands][:6], "files": [], "errors": []}
+                "values": _ss_scrub({k: v for k, v in d.items() if v is not None}),
+                "files": [], "errors": []}
         probe["items"].append(info)
         kind = (info["type"] + " " + info["category"]).lower()
         if not any(k in kind for k in ("solution", "field", "volume", "surface", "data", "result")):
             info["skipped"] = "kind"
             continue
-        if not cands:
-            info["errors"].append("item carries no download url")
-            continue
+        # 1) the item's own download (usually an empty stub for a SOLUTION_FIELD)
         for j, (key, url) in enumerate(cands[:3]):
             blob, err = _ss_http_get(url)
             if blob is None:
                 info["errors"].append(f"{key}: download failed ({err})")
                 continue
             info["downloaded"] = [key, len(blob)]
+            if len(blob) < 200:
+                info["blob_head_hex"] = blob[:60].hex()
             try:
                 _ss_parse_blob(blob, os.path.join(tmpdir, f"res_{idx}_{j}"), info, found)
             except Exception as e:
                 info["errors"].append(f"{key}: {type(e).__name__}: {str(e)[:150]}")
             if found.get("vm") is not None:
                 break
+        # 2) otherwise ask SimScale to build an export of that result and read that
+        if found.get("vm") is None and d.get("result_id"):
+            try:
+                _ss_run_export(sim, api_client, project_id, simulation_id, run_id, d["result_id"],
+                               _ss_export_formats(d), info, tmpdir, found)
+            except Exception as e:
+                info["errors"].append(f"export: {type(e).__name__}: {str(e)[:200]}")
     best = found.get("vm")
     if best is not None and best.get("disp") is None and found.get("disp") is not None:
         best = dict(best, disp=found["disp"]["disp"])
     probe["parsed_ok"] = best is not None
     if best is None:
+        try:
+            probe["sdk"] = _ss_sdk_export_surface(sim)
+        except Exception as e:
+            probe["sdk"] = f"{type(e).__name__}: {e}"
         short = json.dumps(probe["items"], default=str)
         raise _SimScaleError(
             "results", "run FINISHED but no von Mises stress could be read from the result items. What SimScale "
