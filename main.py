@@ -1026,7 +1026,8 @@ def _ss_export_formats(d):
     return (pref + rest) or vals or ["VTM", "PVD"]
 
 
-def _ss_run_export(sim, api_client, pid, sid, rid, result_id, formats, info, tmpdir, found, wait_s=150):
+def _ss_run_export(sim, api_client, pid, sid, rid, result_id, formats, info, tmpdir, found, wait_s=150,
+                   alt_result_ids=()):
     """The SOLUTION_FIELD item's own `download` is only a stub (an empty archive). The real field data has to
     be requested as an *export* (createExport -> poll -> download). The SDK method / model names are discovered
     at run time and every step is logged in info["export"], so API drift shows up in the diagnostics."""
@@ -1062,47 +1063,59 @@ def _ss_run_export(sim, api_client, pid, sid, rid, result_id, formats, info, tmp
         exp["error"] = f"cannot build the export request (body params={body_params}, models={[m[0] for m in models]})"
         return
     exp["request_model"] = models[0][0]
-    for fmt in formats[:4]:
-        try:
-            req = models[0][1](format=fmt)
-            resp = api.create_export(**build_kwargs(api.create_export, **{body_params[0]: req}))
-        except Exception as e:
-            exp["tried"].append({"format": fmt, "error": f"{type(e).__name__}: {str(e)[:200]}"})
-            continue
-        rd = _ss_item_dict(resp)
-        exp["tried"].append({"format": fmt, "created": _ss_scrub(rd)})
-        export_id = getattr(resp, "export_id", None)
-        get = getattr(api, "get_export", None)
-        t_end = time.time() + wait_s
-        cur = rd
-        while get is not None and export_id and time.time() < t_end:
-            status = str(cur.get("status") or "").upper()
-            if status in ("FINISHED", "COMPLETED", "READY", "SUCCEEDED") or (
-                    _ss_candidate_urls(cur) and status not in ("RUNNING", "QUEUED", "PENDING", "CREATED")):
-                break
-            if status in ("FAILED", "CANCELED", "CANCELLED"):
-                exp["tried"][-1]["failed"] = _ss_scrub(cur)
-                break
-            time.sleep(3)
+    req_cls = models[0][1]
+    req_fields = set(getattr(req_cls, "openapi_types", None) or {})
+    # the item's own result_id is tried first; the id of the parent result (visible in the item's download url)
+    # is the fallback in case SimScale wants that one
+    res_ids = [result_id] + [x for x in alt_result_ids if x and x != result_id]
+    for fmt in formats[:3]:
+        for res_id in res_ids:
+            rec = {"format": fmt, "result_id": res_id}
+            exp["tried"].append(rec)
             try:
-                cur = _ss_item_dict(get(**build_kwargs(get, export_id=export_id)))
+                kwargs = {k: v for k, v in (("format", fmt), ("result_id", res_id)) if k in req_fields}
+                req = req_cls(**kwargs)
+                resp = api.create_export(**build_kwargs(api.create_export, **{body_params[0]: req}))
             except Exception as e:
-                exp["tried"][-1]["poll_error"] = f"{type(e).__name__}: {str(e)[:160]}"
-                break
-        exp["tried"][-1]["final"] = _ss_scrub(cur)
-        for j, (key, url) in enumerate(_ss_candidate_urls(cur)[:3]):
-            blob, err = _ss_http_get(url)
-            if blob is None:
-                info["errors"].append(f"export {fmt} {key}: download failed ({err})")
+                rec["error"] = f"{type(e).__name__}: {str(e)[:80]}"
+                body = getattr(e, "body", None)
+                if body:
+                    rec["error_body"] = str(body)[:400]
                 continue
-            exp["tried"][-1]["downloaded"] = [key, len(blob)]
-            try:
-                _ss_parse_blob(blob, os.path.join(tmpdir, f"exp_{fmt}_{j}"), info, found)
-            except Exception as e:
-                info["errors"].append(f"export {fmt} {key}: {type(e).__name__}: {str(e)[:150]}")
-            if found.get("vm") is not None:
-                exp["used_format"] = fmt
-                return
+            rd = _ss_item_dict(resp)
+            rec["created"] = _ss_scrub(rd)
+            export_id = getattr(resp, "export_id", None)
+            get = getattr(api, "get_export", None)
+            t_end = time.time() + wait_s
+            cur = rd
+            while get is not None and export_id and time.time() < t_end:
+                status = str(cur.get("status") or "").upper()
+                if status in ("FAILED", "CANCELED", "CANCELLED", "ERROR") or cur.get("error_code"):
+                    rec["failed"] = _ss_scrub(cur)
+                    break
+                if _ss_candidate_urls(cur) and status not in ("RUNNING", "QUEUED", "PENDING", "CREATED"):
+                    break
+                time.sleep(3)
+                try:
+                    cur = _ss_item_dict(get(**build_kwargs(get, export_id=export_id)))
+                except Exception as e:
+                    rec["poll_error"] = f"{type(e).__name__}: {str(e)[:160]}"
+                    break
+            rec["final"] = _ss_scrub(cur)
+            for j, (key, url) in enumerate(_ss_candidate_urls(cur)[:3]):
+                blob, err = _ss_http_get(url)
+                if blob is None:
+                    info["errors"].append(f"export {fmt} {key}: download failed ({err})")
+                    continue
+                rec["downloaded"] = [key, len(blob)]
+                try:
+                    _ss_parse_blob(blob, os.path.join(tmpdir, f"exp_{fmt}_{j}"), info, found)
+                except Exception as e:
+                    info["errors"].append(f"export {fmt} {key}: {type(e).__name__}: {str(e)[:150]}")
+                if found.get("vm") is not None:
+                    exp["used_format"], exp["used_result_id"] = fmt, res_id
+                    return
+            break          # the export was created; a different result id would only duplicate it
 
 
 def _ss_fetch_results(sim, api_client, project_id, simulation_id, run_id, tmpdir, probe=None):
@@ -1149,8 +1162,10 @@ def _ss_fetch_results(sim, api_client, project_id, simulation_id, run_id, tmpdir
         # 2) otherwise ask SimScale to build an export of that result and read that
         if found.get("vm") is None and d.get("result_id"):
             try:
+                dl_url = ((d.get("download") or {}).get("url")) or ""
+                parent_ids = re.findall(r"/results/([0-9a-fA-F-]{36})/components/", dl_url)
                 _ss_run_export(sim, api_client, project_id, simulation_id, run_id, d["result_id"],
-                               _ss_export_formats(d), info, tmpdir, found)
+                               _ss_export_formats(d), info, tmpdir, found, alt_result_ids=parent_ids)
             except Exception as e:
                 info["errors"].append(f"export: {type(e).__name__}: {str(e)[:200]}")
     best = found.get("vm")
