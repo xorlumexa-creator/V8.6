@@ -4563,6 +4563,9 @@ _GEOMETRY_REVIEW_SYSTEM = (
     "the exact MEASURED geometry of the solid that was actually built. Decide whether the measured solid "
     "plausibly satisfies the explicit numbers in the request: overall dimensions (allow ~3% or 0.5 mm), "
     "hole/bore counts and diameters, and obvious scale or axis mix-ups (e.g. 5 mm thick asked, 50 mm built). "
+    "For L-brackets, angles, channels, tubes, shells, flanged plates, ribbed or bent parts, a stated "
+    "thickness / wall / sheet value is NOT an overall bounding-box dimension: never flag that no bounding-box "
+    "dimension equals it, and judge such parts only on leg / length / width numbers that must appear. "
     "Only flag CLEAR contradictions of stated numbers. Do NOT flag things the request never specified, "
     "do not judge strength or style, and do not invent requirements. Reply with ONLY compact JSON: "
     '{"verdict":"pass"|"fail","issues":["one short sentence per contradiction, quoting asked vs measured"]}')
@@ -6670,6 +6673,8 @@ async def generate_validate_refine(
     script=None
     feedback=None
     stopped_reason=None
+    fallback_candidate=None     # a solid the reviewer questioned: analysed if the refinement cannot be generated
+    last_gen_err=""
     # Groq's free tier caps at 8000 TPM — confirmed live: a refinement loop
     # burns through that in 1-2 calls, and this used to silently `break` on
     # the resulting 429 with zero indication in the response that the loop
@@ -6696,58 +6701,74 @@ async def generate_validate_refine(
                     continue
                 if iterations:
                     stopped_reason="rate_limited" if is_rate_limited else "generation_failed"
+                    last_gen_err=f"{e.status_code}: {str(e.detail)[:300]}"
                     gen_failed=True
                     break
                 raise
+        used_fallback=False
         if gen_failed:
-            break
+            iterations.append({"iteration":i,"stage":"generation_failed",
+                               "error":f"refinement generation failed ({last_gen_err})"})
+            if fallback_candidate is not None and best is None:
+                # the reviewer is advisory: do not throw away a solid that built fine because the LLM
+                # could not be reached for the refinement -- analyse it instead
+                script=fallback_candidate["script"]; obj=fallback_candidate["obj"]; fv=fallback_candidate["fv"]
+                gi=fallback_candidate["gi"]; review=fallback_candidate["review"]
+                fallback_candidate=None
+                used_fallback=True
+                stopped_reason=None
+                iterations[-1]["fallback"]="analysing the earlier solid that the design review had questioned"
+            else:
+                break
 
-        # 2) Execute
-        obj,err=execute_cad_script_safely(script)
-        if err:
-            iterations.append({"iteration":i,"stage":"execution_failed","error":err,"script":script})
-            feedback=(f"Your script FAILED TO EXECUTE with this error:\n{err}\n\n"
-                      f"Fix the root cause and return a complete, runnable script."
-                      f"{_diagnose_cad_error(err)}")
-            continue
-
-        # 2b) Deterministic feature check: do the holes/bores the script DECLARED ('# FEATURE:')
-        # actually exist in the solid? Exact and cheap, so it runs BEFORE the slow SimScale
-        # analysis — a part missing a required hole is never worth a cloud run. On the LAST
-        # iteration there is no refinement left, so analyse anyway and just record the failure.
-        fv=verify_declared_features(script,obj)
-        if not fv["ok"] and i<max_iterations:
-            iterations.append({"iteration":i,"stage":"missing_features",
-                               "error":"declared features missing from the solid: "+feature_failure_summary(fv),
-                               "feature_verification":_fv_brief(fv),"script":script})
-            feedback=feature_failure_feedback(fv)
-            continue
-
-        # 2c) Programmatic geometry inspection: exact OpenCascade measurements of the finished
-        # solid. Hard gate = exactly one solid (cheap, deterministic, runs BEFORE SimScale). Then
-        # Nemotron reads the ORIGINAL REQUEST against the measured numbers and can flag clear
-        # contradictions (asked 80x50x5, built 80x50x12) — fail-open, and at most one
-        # review-triggered refinement per job so a false positive cannot eat every iteration.
-        gi=inspect_b3d_geometry(obj)
-        if not gi["ok"] and i<max_iterations:
-            iterations.append({"iteration":i,"stage":"geometry_inspection_failed",
-                               "error":"; ".join(gi["issues"]),"geometry_inspection":_gi_brief(gi),"script":script})
-            feedback=geometry_failure_feedback(gi)
-            continue
-        review=None
-        if gi["ok"] and i<max_iterations and review_refinements_used<1:
-            review=await review_geometry_with_llm(prompt,gi)
-            if review and review["verdict"]=="fail" and review["issues"]:
-                review_refinements_used+=1
-                iterations.append({"iteration":i,"stage":"geometry_review_failed",
-                                   "error":"design review: "+"; ".join(review["issues"]),
-                                   "geometry_inspection":_gi_brief(gi),"review":review,"script":script})
-                feedback=("DESIGN REVIEW FOUND THE BUILT SOLID CONTRADICTS THE REQUEST. A reviewer compared your "
-                          "original request with the exact measured geometry:\n"
-                          + "\n".join(f"- {x}" for x in review["issues"]) + "\n\n" + geometry_report_text(gi)
-                          + "\n\nFix the script so the solid matches the numbers in the request. If you are "
-                            "confident a flagged item is actually satisfied, keep it and change nothing else.")
+        if not used_fallback:
+            # 2) Execute
+            obj,err=execute_cad_script_safely(script)
+            if err:
+                iterations.append({"iteration":i,"stage":"execution_failed","error":err,"script":script})
+                feedback=(f"Your script FAILED TO EXECUTE with this error:\n{err}\n\n"
+                          f"Fix the root cause and return a complete, runnable script."
+                          f"{_diagnose_cad_error(err)}")
                 continue
+
+            # 2b) Deterministic feature check: do the holes/bores the script DECLARED ('# FEATURE:')
+            # actually exist in the solid? Exact and cheap, so it runs BEFORE the slow SimScale
+            # analysis — a part missing a required hole is never worth a cloud run. On the LAST
+            # iteration there is no refinement left, so analyse anyway and just record the failure.
+            fv=verify_declared_features(script,obj)
+            if not fv["ok"] and i<max_iterations:
+                iterations.append({"iteration":i,"stage":"missing_features",
+                                   "error":"declared features missing from the solid: "+feature_failure_summary(fv),
+                                   "feature_verification":_fv_brief(fv),"script":script})
+                feedback=feature_failure_feedback(fv)
+                continue
+
+            # 2c) Programmatic geometry inspection: exact OpenCascade measurements of the finished
+            # solid. Hard gate = exactly one solid (cheap, deterministic, runs BEFORE SimScale). Then
+            # Nemotron reads the ORIGINAL REQUEST against the measured numbers and can flag clear
+            # contradictions (asked 80x50x5, built 80x50x12) — fail-open, and at most one
+            # review-triggered refinement per job so a false positive cannot eat every iteration.
+            gi=inspect_b3d_geometry(obj)
+            if not gi["ok"] and i<max_iterations:
+                iterations.append({"iteration":i,"stage":"geometry_inspection_failed",
+                                   "error":"; ".join(gi["issues"]),"geometry_inspection":_gi_brief(gi),"script":script})
+                feedback=geometry_failure_feedback(gi)
+                continue
+            review=None
+            if gi["ok"] and i<max_iterations and review_refinements_used<1:
+                review=await review_geometry_with_llm(prompt,gi)
+                if review and review["verdict"]=="fail" and review["issues"]:
+                    review_refinements_used+=1
+                    fallback_candidate={"script":script,"obj":obj,"fv":fv,"gi":gi,"review":review}
+                    iterations.append({"iteration":i,"stage":"geometry_review_failed",
+                                       "error":"design review: "+"; ".join(review["issues"]),
+                                       "geometry_inspection":_gi_brief(gi),"review":review,"script":script})
+                    feedback=("DESIGN REVIEW FOUND THE BUILT SOLID CONTRADICTS THE REQUEST. A reviewer compared your "
+                              "original request with the exact measured geometry:\n"
+                              + "\n".join(f"- {x}" for x in review["issues"]) + "\n\n" + geometry_report_text(gi)
+                              + "\n\nFix the script so the solid matches the numbers in the request. If you are "
+                                "confident a flagged item is actually satisfied, keep it and change nothing else.")
+                    continue
 
         # 3) Analyze
         try:
@@ -6816,7 +6837,8 @@ async def generate_validate_refine(
         last=iterations[-1] if iterations else {}
         raise HTTPException(502, "AI failed to produce a valid CAD design after "
                                   f"{len(iterations)} attempt(s). Last error: "
-                                  f"{last.get('error','unknown')}")
+                                  f"{last.get('error','unknown')} (loop stopped: {stopped_reason}"
+                                  + (f"; last generation error: {last_gen_err}" if last_gen_err else "") + ")")
 
     result=best["result"]
     result["generated_stl_base64"]=best["stl_b64"]
