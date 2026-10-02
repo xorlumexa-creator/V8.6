@@ -5726,6 +5726,120 @@ def _repair_watertight_mesh(mesh):
     return mesh, bool(mesh.is_watertight)
 
 
+def _apply_plan_to_fea(fea, tp_results):
+    """A valid plan verdict (real FEM, plan-chosen loads) replaces the generic analytical numbers, so fatigue, the
+    rule engine and the report all work from the governing test instead of the legacy fixed 1000 N case."""
+    valid = [r for r in (tp_results or {}).get("results", [])
+             if r.get("status") in ("PASS", "FAIL") and (r.get("metrics") or {}).get("von_mises_mpa") is not None]
+    if not valid:
+        return fea
+    worst = min(valid, key=lambda r: r["metrics"].get("safety_factor") if r["metrics"].get("safety_factor") is not None else 1e9)
+    m = worst["metrics"]
+    fea["stress"] = dict(fea.get("stress") or {}, von_mises_mpa=m["von_mises_mpa"])
+    fea["von_mises_mpa"] = m["von_mises_mpa"]
+    if m.get("safety_factor") is not None:
+        fea["safety_factor"] = m["safety_factor"]
+    if m.get("max_deflection_mm") is not None:
+        fea["deflection_mm"] = m["max_deflection_mm"]
+    fea["status"] = worst["status"]
+    fea["method"] = "test_plan_simscale"
+    fea["governing_test"] = worst["test_id"]
+    return fea
+
+
+async def _llm_text(system_prompt, turns, max_tokens=1800, temperature=0.1):
+    """Plain-text completion through whichever provider AI_PROVIDER selects (same dispatch as script generation)."""
+    msgs = [{"role": "system", "content": system_prompt}] + turns
+    if AI_PROVIDER == "claude":
+        return await asyncio.to_thread(_claude_request, system_prompt, turns, temperature=temperature, max_tokens=max_tokens)
+    if AI_PROVIDER == "gemini":
+        return await asyncio.to_thread(_gemini_request, system_prompt, turns, temperature=temperature, max_tokens=max_tokens)
+    if AI_PROVIDER == "groq":
+        return await asyncio.to_thread(_groq_request, msgs, temperature=temperature, max_tokens=max_tokens)
+    if AI_PROVIDER == "cerebras":
+        return await asyncio.to_thread(_cerebras_request, msgs, temperature=temperature, max_tokens=max_tokens)
+    if AI_PROVIDER == "nvidia":      # reasoning model: hidden thinking counts against max_tokens
+        return await asyncio.to_thread(_nvidia_request, msgs, temperature=temperature,
+                                       max_tokens=max(max_tokens, NVIDIA_GEN_MAX_TOKENS))
+    if AI_PROVIDER == "openrouter":
+        return await asyncio.to_thread(_openrouter_request, msgs, temperature=temperature, max_tokens=max_tokens)
+    return await asyncio.to_thread(_lovable_request, msgs, temperature=temperature, max_tokens=max_tokens)
+
+
+_PLAN_SYSTEM = ("You are a mechanical test engineer. You are shown a part request and the MEASURED geometry of the "
+                "solid that was built from it. Decide how the part will really be used and write the test plan that "
+                "verifies it. Output ONLY the JSON object - no prose, no markdown.\n\n")
+
+
+async def generate_test_plan(prompt, cad_obj, material="auto", previous_plan=None):
+    """The LLM writes the test plan for a built part. The plan is dry-run against the real faces first (instant)
+    and sent back for correction if a selector is unusable. Returns a plan dict or None (caller then falls back
+    to the legacy fixed load case). A plan from an earlier iteration is reused when it still resolves."""
+    try:
+        err = None
+        if previous_plan is not None:
+            chk = await run_plan_tests(cad_obj, previous_plan, dry_run=True)
+            if chk.get("overall") == "RESOLVED":
+                return previous_plan
+            err = chk.get("error") or next((r.get("error") for r in chk.get("results", []) if r.get("error")), None)
+        summary = TP.face_summary(TP.describe_faces(cad_obj))
+        hint = f"\nPreferred material: {material}." if material and material != "auto" else ""
+        user = (f"PART REQUEST:\n{prompt[:2500]}{hint}\n\nMEASURED GEOMETRY (mm):\n{json.dumps(summary)}\n"
+                + (f"\nThe previous test plan no longer fits this geometry: {err}\n" if err else "")
+                + "\nOutput ONLY the JSON test plan.")
+        turns = [{"role": "user", "content": user}]
+        system = _PLAN_SYSTEM + TP.schema_prompt(MATERIALS)
+        for _ in range(2):
+            text = await _llm_text(system, turns)
+            m = re.search(r"\{.*\}", text or "", re.S)
+            try:
+                plan = TP.parse_plan(m.group(0) if m else text)
+                chk = await run_plan_tests(cad_obj, plan, dry_run=True)
+                if chk.get("overall") == "RESOLVED":
+                    return plan
+                msg = chk.get("error") or next((r.get("error") for r in chk.get("results", []) if r.get("error")), "invalid")
+            except TP.PlanError as e:
+                msg = str(e)
+            turns += [{"role": "assistant", "content": text or ""},
+                      {"role": "user", "content": f"Your test plan was rejected: {msg}\nOutput the corrected JSON only."}]
+    except Exception:
+        pass
+    return None
+
+
+def _plan_feedback_lines(result):
+    """Test-plan section of the refinement feedback the LLM receives."""
+    tp = result.get("test_plan_results") or {}
+    if not tp.get("results"):
+        return []
+    out = ["", f"TEST PLAN RESULTS (overall {tp.get('overall')}) - real FEM on the built solid, loads/fixtures from the plan:"]
+    for r in tp["results"]:
+        st = r.get("status")
+        out.append(f"- test '{r.get('test_id')}': {st}")
+        lc = r.get("load_case") or {}
+        for l in lc.get("loads", []):
+            out.append(f"    load '{l['id']}': {l['force_n']} N on {l['faces']} face(s); {lc.get('fixed_faces')} fixed face(s)")
+        m = r.get("metrics") or {}
+        if m:
+            out.append(f"    von Mises {m.get('von_mises_mpa')} MPa, safety factor {m.get('safety_factor')}, "
+                       f"max deflection {m.get('max_deflection_mm')} mm, hotspot at {m.get('hotspot_mm')} mm")
+        for c in r.get("criteria", []):
+            out.append(f"    criterion {c['name']}: {c['actual']} (required {c['required']}) -> {'ok' if c['pass'] else 'FAILED'}")
+        for w in r.get("warnings", []):
+            out.append(f"    WARNING: {w}")
+        if st == "FAIL":
+            out.append("    FIX: strengthen the part where the hotspot is (thicker section, fillets, ribs, larger radius at "
+                       "the stress raiser) WITHOUT moving or removing the fixed and loaded faces - the plan selects them "
+                       "by position/normal and must still find them.")
+        elif st == "INVALID":
+            out.append("    The numbers are not trustworthy (boundary-condition check failed); do not redesign on them.")
+        elif st == "NOT_RUN":
+            out.append(f"    not run: {r.get('reason')} (design_related={r.get('design_related')})")
+        elif st == "PLAN_ERROR":
+            out.append(f"    plan error: {r.get('error')}")
+    return out
+
+
 async def run_analysis_v8(mesh, filename, part_name, mat_key,
                            force_n=1000, force_dir="z", T_op=25.0,
                            proj=None, surface_finish="machined",
@@ -5749,7 +5863,9 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
     # SimScale's own success/failure detail is in result["simscale_diagnostic"].
     fea=None;simscale_diag=None;calculix_diag=None
     if cad_obj is not None:
-        if SIMSCALE_ENABLED:
+        if test_plan is not None:
+            simscale_diag={"attempted":False,"reason":"a test plan drives the FEM (see test_plan_results); the legacy fixed load case is skipped"}
+        elif SIMSCALE_ENABLED:
             fea,simscale_diag=await asyncio.to_thread(run_simscale_fem,cad_obj,mat_key,force_n,force_dir,ctx["min_sf"])
         else:
             simscale_diag={"attempted":False,"reason":"SIMSCALE_API_KEY not set (or SIMSCALE_ENABLED=0)"}
@@ -5773,6 +5889,7 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
     tp_results=None
     if test_plan is not None and cad_obj is not None:
         tp_results=await run_plan_tests(cad_obj,test_plan,ctx["min_sf"])
+        _apply_plan_to_fea(fea,tp_results)
     vm=fea["stress"]["von_mises_mpa"]
     fat=full_marin_fatigue(mat_key,max(vm,1.0),surface=surface_finish,
                             reliability=reliability,size_mm=min(exts),
@@ -5817,6 +5934,7 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
         "simscale_used":fea.get("method","")=="simscale_static_fem",
         "simscale_diagnostic":simscale_diag,
         "test_plan_results":tp_results,
+        "test_plan":test_plan,
         "filename":filename,"part_name":part_name,"part_context":ctx,
         "geometry":{
             "dimensions_mm":{"x":round(exts[0],3),"y":round(exts[1],3),"z":round(exts[2],3)},
@@ -5893,6 +6011,16 @@ def evaluate_design_quality(result: dict, min_health_score: float = 75.0,
     is_wt = (result.get("geometry", {}) or {}).get("is_watertight", True)
 
     reasons = []
+    tp = result.get("test_plan_results") or {}
+    plan_authoritative = tp.get("overall") in ("PASS", "FAIL")      # valid FEM verdict -> it replaces the generic SF check
+    for r in tp.get("results", []):
+        if r.get("status") == "FAIL":
+            bad = [c for c in r.get("criteria", []) if not c.get("pass")]
+            reasons.append(f"Test '{r.get('test_id')}' FAILED: " + "; ".join(
+                f"{c['name']} {c['actual']} (required {c['required']})" for c in bad) + ".")
+        elif r.get("status") == "NOT_RUN" and r.get("design_related"):
+            reasons.append(f"Test '{r.get('test_id')}' could not run - SimScale rejected the geometry at "
+                           f"{r.get('failed_stage')}: {r.get('reason')}")
     ss_diag = result.get("simscale_diagnostic") or {}
     if ss_diag.get("attempted") and ss_diag.get("design_related"):
         # SimScale itself rejected the geometry (import / mesh / solve) — that is a
@@ -5906,9 +6034,9 @@ def evaluate_design_quality(result: dict, min_health_score: float = 75.0,
         reasons.append(f"{n_crit} CRITICAL rule violation(s) found (max allowed {max_critical}).")
     if n_high > max_high:
         reasons.append(f"{n_high} HIGH-severity rule violation(s) found (max allowed {max_high}).")
-    if sfv < min_safety_factor:
+    if sfv < min_safety_factor and not plan_authoritative:
         reasons.append(f"FEA safety factor {sfv:.2f} is below minimum {min_safety_factor}.")
-    if fea_status == "FAIL":
+    if fea_status == "FAIL" and not plan_authoritative:
         reasons.append("FEA status is FAIL.")
     if fat_status == "FAIL":
         reasons.append("Fatigue analysis status is FAIL.")
@@ -5941,6 +6069,7 @@ def evaluate_design_quality(result: dict, min_health_score: float = 75.0,
             "fatigue_status": fat_status,
             "is_watertight": is_wt,
             "fea_method": fea.get("method"),
+            "test_plan": tp.get("overall"),
         }
     }
 
@@ -5959,6 +6088,7 @@ def summarize_analysis_for_refinement(result: dict, quality: dict) -> str:
     lines = []
     lines.append(f"HEALTH SCORE: {quality['score']} ({result.get('health_score',{}).get('label','?')})")
     lines.append(f"PASSED: {quality['passed']}")
+    lines += _plan_feedback_lines(result)
     lines.append("")
     lines.append("WHY IT FAILED (fix all of these):" if not quality["passed"] else "Minor issues to polish:")
     for r in quality["reasons"]:
@@ -6503,6 +6633,7 @@ async def generate_validate_refine(
     max_high_violations:int=Form(2),
     min_safety_factor:float=Form(1.0),
     run_topology:bool=Form(False),
+    use_test_plan:bool=Form(False),
 ):
     """
     ★ THE CORE VIBE-ENGINEERING LOOP ★
@@ -6527,6 +6658,8 @@ async def generate_validate_refine(
       - min_safety_factor: minimum FEA safety factor (default 1.0)
     """
     if not B3D: raise HTTPException(503,"build123d not installed")
+    use_test_plan=(use_test_plan is True)     # direct calls may leave a Form() default object here
+    plan_cache=None
     if max_iterations<1: max_iterations=1
     if max_iterations>6: max_iterations=6  # hard cap: cost + latency safety
 
@@ -6619,10 +6752,14 @@ async def generate_validate_refine(
         # 3) Analyze
         try:
             mesh,stl_bytes=await mesh_from_cad_object(obj)
+            plan=None
+            if use_test_plan and obj is not None:
+                plan=await generate_test_plan(prompt,obj,material,previous_plan=plan_cache)
+                plan_cache=plan or plan_cache
             result=await run_analysis_v8(mesh,prompt,prompt,material,force_n,force_dir,
                                           operating_temp_c,project_description,
                                           surface_finish,reliability,run_topology,
-                                          cad_obj=obj)
+                                          cad_obj=obj,test_plan=plan)
         except Exception as e:
             iterations.append({"iteration":i,"stage":"analysis_failed","error":str(e),"script":script})
             feedback=(f"The generated geometry exported, but the analysis pipeline raised:\n{str(e)}\n\n"
@@ -6777,6 +6914,7 @@ async def generate_validate_refine_async(
     max_high_violations:int=Form(2),
     min_safety_factor:float=Form(1.0),
     run_topology:bool=Form(False),
+    use_test_plan:bool=Form(False),
 ):
     """
     Same self-correcting loop as /generate-validate-refine, but as a background job.
@@ -6795,7 +6933,7 @@ async def generate_validate_refine_async(
                 project_description=project_description,max_iterations=max_iterations,
                 min_health_score=min_health_score,max_critical_violations=max_critical_violations,
                 max_high_violations=max_high_violations,min_safety_factor=min_safety_factor,
-                run_topology=run_topology)
+                run_topology=run_topology,use_test_plan=use_test_plan)
             JOB_STORE[job_id]={"status":"complete","result":result,"created":time.time()}
         except HTTPException as e:
             JOB_STORE[job_id]={"status":"error","error":f"{e.status_code}: {e.detail}","created":time.time()}
