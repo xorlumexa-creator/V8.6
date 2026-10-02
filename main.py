@@ -41,6 +41,7 @@
 # analytical model remain as automatic fallbacks.
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks
+import test_plan as TP
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 import trimesh
@@ -741,7 +742,8 @@ def _ss_setup_errors(sims_api, pid, simulation_id, swallow=False):
     return out
 
 
-def _ss_patch_model(sim, template_model, body_names, fixed_names, load_names, force_xyz, valid_names=None):
+def _ss_patch_model(sim, template_model, body_names, fixed_names, load_names, force_xyz, valid_names=None,
+                    extra_loads=()):
     """Deep-copy the template's model and re-point it at the new geometry."""
     model = copy.deepcopy(template_model)
     TR = sim.TopologicalReference
@@ -759,10 +761,20 @@ def _ss_patch_model(sim, template_model, body_names, fixed_names, load_names, fo
             bc.topological_reference = TR(entities=list(load_names))
             _ss_set_force(sim, bc, *force_xyz)
             report["force_bcs"] += 1
+            force_tpl = bc
     if not report["fixed_support_bcs"] or not report["force_bcs"]:
         raise _SimScaleError(
             "setup", f"the template simulation must contain one 'Fixed support' and one 'Force' boundary "
                      f"condition (found {report}). Re-create the template in the SimScale workbench.")
+    # additional loads (test plans with several forces): clone the template's Force BC once per extra load
+    for k, (names, xyz) in enumerate(extra_loads, start=2):
+        clone = copy.deepcopy(force_tpl)
+        clone.topological_reference = TR(entities=list(names))
+        _ss_set_force(sim, clone, *xyz)
+        if hasattr(clone, "name") and getattr(clone, "name", None):
+            clone.name = f"{clone.name} {k}"
+        model.boundary_conditions.append(clone)
+        report["force_bcs"] += 1
     # Anything else in the template that still names the template's own faces/bodies
     # (result controls, contacts, extra BCs, ...) would make the setup check fail.
     report["dropped"], report["remapped"] = [], []
@@ -810,6 +822,7 @@ def _ss_analyse_arrays(pts, point_data, fname):
             out["_umag"] = umag
     if out["vm"] is None and out["disp"] is None:
         return None
+    out["_pts"] = pts
     try:                                    # compact profile along the longest axis: where is it fixed, where does it peak?
         ext = np.ptp(pts, axis=0)
         ax = int(np.argmax(ext))
@@ -1268,6 +1281,43 @@ def _ss_bc_check(field_diag, axis):
         return None
 
 
+def _ss_bc_check_points(fields, fixed_pts_mm, load_pts_mm, max_extent_mm):
+    """Plan-mode sanity check, independent of part shape: mesh nodes sitting on the faces we FIXED must barely
+    move, and the loaded faces must move clearly more than the fixed ones."""
+    try:
+        pts, u = fields.get("_pts"), fields.get("_umag")
+        fd = fields.get("field_diag")
+        if pts is None or u is None or not fixed_pts_mm:
+            return None
+        k = float(fields["points_extent"]) / max(max_extent_mm, 1e-9)      # coordinate units per mm (0.001 = metres)
+        spacing = (fd or {}).get("approx_node_spacing") if isinstance(fd, dict) else None
+        r = 1.25 * (spacing or 1.5 * k)
+        def near(pts_mm):
+            q = np.asarray(pts_mm, dtype=float) * k
+            hit = np.zeros(len(pts), dtype=bool)
+            for i in range(0, len(q), 64):
+                d = np.linalg.norm(pts[:, None, :] - q[None, i:i + 64, :], axis=2).min(axis=1)
+                hit |= d <= r
+            return hit
+        fx = near(fixed_pts_mm)
+        if not fx.any():
+            return {"ok": False, "reason": "no mesh nodes found on the fixed faces (face selection or units are off)"}
+        peak = float(u.max())
+        fixed_u = float(u[fx].max())
+        out = {"ok": bool(fixed_u <= 0.25 * peak), "fixed_faces_disp_over_peak": round(fixed_u / max(peak, 1e-30), 3)}
+        if load_pts_mm:
+            lm = near(load_pts_mm)
+            if lm.any():
+                ratio = float(u[lm].mean()) / max(float(u[fx].mean()), 1e-30)
+                out["loaded_over_fixed_mean_disp"] = round(ratio, 1)
+                out["ok"] = bool(out["ok"] and ratio >= 3.0)
+        if not out["ok"]:
+            out["reason"] = "the fixed faces move (or the loaded faces do not move more) - faces were probably mismatched"
+        return out
+    except Exception as e:
+        return {"ok": None, "reason": f"check unavailable: {type(e).__name__}"}
+
+
 def _ss_probe(simulation_id="", run_id=""):
     """Re-read the results of an ALREADY FINISHED run (no new solve). With no ids it picks the newest
     finished 'lumexa_*' run in the template project."""
@@ -1312,7 +1362,7 @@ def _ss_probe(simulation_id="", run_id=""):
     return out
 
 
-def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0):
+def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0, load_case=None):
     """
     Blocking (call it via asyncio.to_thread). Returns (fem_result_or_None, diag)
     exactly like run_calculix_fem: never raises, and `diag` always explains what
@@ -1354,13 +1404,21 @@ def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0):
             bb = cad_obj.bounding_box()
             exts = [bb.size.X, bb.size.Y, bb.size.Z]
             axis = int(np.argmax(exts))
-            lo_idx, hi_idx, n_faces = _ss_pick_end_faces(cad_obj, axis, exts)
-            if not lo_idx or not hi_idx:
-                raise _SimScaleError("setup", "could not identify two opposite end faces to fix / load "
-                                              "(part has no usable ends along its longest axis).")
-            fa = {"x": 0, "y": 1, "z": 2}.get((force_dir or "z").lower(), 2)
-            force_xyz = [0.0, 0.0, 0.0]
-            force_xyz[fa] = float(force_n)
+            if load_case:
+                # test-plan mode: faces / forces were chosen geometrically by the plan, nothing is guessed here
+                n_faces = len(list(cad_obj.faces()))
+                lo_idx = list(load_case["fixed_idx"])
+                hi_idx = list(load_case["loads"][0]["face_idx"])
+                force_xyz = [float(v) for v in load_case["loads"][0]["force_xyz"]]
+                fa = int(np.argmax(np.abs(force_xyz)))
+            else:
+                lo_idx, hi_idx, n_faces = _ss_pick_end_faces(cad_obj, axis, exts)
+                if not lo_idx or not hi_idx:
+                    raise _SimScaleError("setup", "could not identify two opposite end faces to fix / load "
+                                                  "(part has no usable ends along its longest axis).")
+                fa = {"x": 0, "y": 1, "z": 2}.get((force_dir or "z").lower(), 2)
+                force_xyz = [0.0, 0.0, 0.0]
+                force_xyz[fa] = float(force_n)
 
             # ── SimScale session + template ─────────────────────────────────────
             mark("connect")
@@ -1418,12 +1476,14 @@ def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0):
                 raise _SimScaleError("map_entities", "SimScale returned no body/volume entity to assign a material to.")
             fixed_names = [face_names[i] for i in lo_idx]
             load_names = [face_names[i] for i in hi_idx]
+            extra_loads = ([([face_names[i] for i in l["face_idx"]], l["force_xyz"]) for l in load_case["loads"][1:]]
+                           if load_case else [])
 
             # ── clone template -> new simulation + mesh operation ───────────────
             mark("setup")
             valid_names = set(face_names) | set(body_names)
             model, patch_report = _ss_patch_model(sim, tpl_sim.model, body_names, fixed_names, load_names,
-                                                  force_xyz, valid_names=valid_names)
+                                                  force_xyz, valid_names=valid_names, extra_loads=extra_loads)
             diag["patch"] = patch_report
             simulation = sims_api.create_simulation(pid, sim.SimulationSpec(name=tag, geometry_id=geometry_id, model=model))
             simulation_id = simulation.simulation_id
@@ -1506,9 +1566,16 @@ def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0):
                          "field_diag": fields.get("field_diag"),
                          "template_material": SIMSCALE_TEMPLATE_MATERIAL, "requested_material": mat_key,
                          "displacement_rescaled_by_E_ratio": round(E_tpl / max(E_req, 1e-9), 4)},
-            "inputs": {"force_n": force_n, "direction": force_dir},
+            "inputs": ({"load_case": load_case["id"], "forces_n": [l["force_xyz"] for l in load_case["loads"]]}
+                       if load_case else {"force_n": force_n, "direction": force_dir}),
         }
-        bc = _ss_bc_check(fields.get("field_diag"), axis)
+        if load_case:
+            fem["note"] = (f"SimScale cloud linear-static FEM. Load case from test plan '{load_case['id']}': "
+                           f"{len(load_case['fixed_idx'])} fixed face(s), {len(load_case['loads'])} load(s). "
+                           "Peak stress at a fixed/loaded face edge can include a local singularity -- judge by "
+                           "where the hotspot is, not just its magnitude.")
+        bc = (_ss_bc_check_points(fields, load_case["fixed_pts_mm"], load_case["load_pts_mm"], max(exts))
+              if load_case else _ss_bc_check(fields.get("field_diag"), axis))
         fem["simscale"]["bc_check"] = bc
         if bc is not None and not bc["ok"]:
             fem["numerically_suspect"] = True
@@ -5663,7 +5730,7 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
                            force_n=1000, force_dir="z", T_op=25.0,
                            proj=None, surface_finish="machined",
                            reliability=0.99, run_topo=False,
-                           topo_volfrac=0.5, cad_obj=None):
+                           topo_volfrac=0.5, cad_obj=None, test_plan=None):
     mesh, was_auto_repaired = _repair_watertight_mesh(mesh)
     vol=sf(mesh.volume);exts=[sf(e) for e in mesh.extents]
     se=sorted(exts);asp=se[2]/se[0] if se[0]>0 else 0;is_wt=bool(mesh.is_watertight)
@@ -5703,6 +5770,9 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
         fea["deflection_mm"]=fea.get("deflection_mm",0)
         fea["min_section_area_mm2"]=fea.get("min_section_area_mm2",0)
 
+    tp_results=None
+    if test_plan is not None and cad_obj is not None:
+        tp_results=await run_plan_tests(cad_obj,test_plan,ctx["min_sf"])
     vm=fea["stress"]["von_mises_mpa"]
     fat=full_marin_fatigue(mat_key,max(vm,1.0),surface=surface_finish,
                             reliability=reliability,size_mm=min(exts),
@@ -5746,6 +5816,7 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
         "calculix_used":fea.get("method","") in ("calculix_solid_tet_fem","calculix_shell_fem"),
         "simscale_used":fea.get("method","")=="simscale_static_fem",
         "simscale_diagnostic":simscale_diag,
+        "test_plan_results":tp_results,
         "filename":filename,"part_name":part_name,"part_context":ctx,
         "geometry":{
             "dimensions_mm":{"x":round(exts[0],3),"y":round(exts[1],3),"z":round(exts[2],3)},
@@ -6854,6 +6925,97 @@ async def simscale_selftest(force_n:float=100.0, material:str=""):
                     "simscale":fem.get("simscale")}
         out["ratio_fem_over_theory"]={"stress":round(vm/max(expected["beam_theory_max_stress_mpa"],1e-9),3),
                                       "deflection":round(dz/max(expected["beam_theory_tip_deflection_mm"],1e-9),3)}
+    return out
+
+
+async def run_plan_tests(cad_obj, plan, default_min_sf=2.0, dry_run=False):
+    """Run an LLM-written test plan against a build123d solid. Faces are chosen geometrically from the plan;
+    nothing (forces, directions, faces) is passed in by hand. dry_run only resolves the selectors."""
+    try:
+        plan = TP.parse_plan(plan)
+    except TP.PlanError as e:
+        return {"overall": "PLAN_ERROR", "error": str(e), "results": []}
+    descs = TP.describe_faces(cad_obj)
+    results = []
+    for test in plan["tests"]:
+        try:
+            case = TP.build_load_case(test, descs, MATERIALS)
+        except TP.PlanError as e:
+            results.append({"test_id": str(test.get("id", "?")), "status": "PLAN_ERROR", "error": str(e)})
+            continue
+        if dry_run:
+            results.append({"test_id": case["id"], "status": "RESOLVED", "material": case["material"],
+                            "fixed_faces": case["fixed_idx"], "criteria": case["criteria"],
+                            "loads": [{"id": l["id"], "faces": l["face_idx"],
+                                       "force_n": [round(v, 2) for v in l["force_xyz"]]} for l in case["loads"]]})
+            continue
+        if not SIMSCALE_ENABLED:
+            results.append(TP.evaluate(case, None, {"reason": "SIMSCALE_API_KEY not set"}, default_min_sf))
+            continue
+        fem, diag = await asyncio.to_thread(run_simscale_fem, cad_obj, case["material"], 0, "z",
+                                            case["criteria"].get("min_safety_factor", default_min_sf), case)
+        r = TP.evaluate(case, fem, diag, default_min_sf)
+        r["elapsed_s"] = diag.get("elapsed_s")
+        results.append(r)
+    return {"plan_version": TP.PLAN_VERSION, "overall": TP.overall(results), "results": results,
+            "geometry": TP.face_summary(descs)}
+
+
+@app.get("/test-plan-schema")
+async def test_plan_schema():
+    """What the LLM must output after generating a part: the prompt block, an example, supported test types."""
+    return {"prompt_block": TP.schema_prompt(MATERIALS), "example_plan": TP.EXAMPLE_PLAN,
+            "supported_tests": list(TP.SUPPORTED_TESTS)}
+
+
+@app.post("/run-test-plan")
+@_sanitize_response
+async def run_test_plan(file: UploadFile = File(...), plan: str = Form(...), dry_run: bool = Form(False)):
+    """STEP file + test-plan JSON -> verdicts. dry_run=true only resolves the face selectors (instant)."""
+    if not B3D:
+        raise HTTPException(503, "build123d not installed")
+    data = await file.read()
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "part.step")
+        with open(path, "wb") as f:
+            f.write(data)
+        try:
+            obj = b3d.import_step(path)
+        except Exception as e:
+            raise HTTPException(400, f"could not read STEP file: {type(e).__name__}: {str(e)[:200]}")
+        return await run_plan_tests(obj, plan, dry_run=dry_run)
+
+
+@app.get("/test-plan-selftest")
+@_sanitize_response
+async def test_plan_selftest(force_n: float = 100.0, material: str = "", dry_run: bool = True):
+    """Cantilever driven ONLY by a test plan (no force/face arguments). dry_run=true (default) is instant and
+    shows which faces the selectors picked; dry_run=false runs SimScale (several minutes) and compares with
+    beam theory."""
+    if not B3D:
+        raise HTTPException(503, "build123d not installed")
+    mat_key = material or SIMSCALE_TEMPLATE_MATERIAL
+    if mat_key not in MATERIALS:
+        mat_key = "aluminum_6061"
+    L, h, b = 100.0, 20.0, 10.0
+    beam = b3d.Pos(L / 2, 0, 0) * b3d.Box(L, h, b)
+    plan = {"version": 1, "tests": [{
+        "id": "cantilever", "type": "static_stress", "material": mat_key,
+        "constraints": [{"id": "root", "type": "fixed", "faces": {"at": "min_x", "normal": "-x"}}],
+        "loads": [{"id": "tip", "type": "force", "faces": {"at": "max_x", "normal": "+x"},
+                   "force_n": force_n, "direction": "+y"}],
+        "criteria": {"min_safety_factor": 2.0}}]}
+    out = await run_plan_tests(beam, plan, dry_run=dry_run)
+    E = MATERIALS[mat_key]["youngs_modulus_gpa"] * 1e3
+    exp = {"beam_theory_max_stress_mpa": round(6 * force_n * L / (b * h ** 2), 3),
+           "beam_theory_tip_deflection_mm": round(4 * force_n * L ** 3 / (E * b * h ** 3), 5)}
+    out["expected"] = exp
+    r = (out.get("results") or [{}])[0]
+    m = r.get("metrics") or {}
+    if m.get("von_mises_mpa") is not None:
+        out["ratio_fem_over_theory"] = {
+            "stress": round(m["von_mises_mpa"] / max(exp["beam_theory_max_stress_mpa"], 1e-9), 3),
+            "deflection": round((m.get("max_deflection_mm") or 0) / max(exp["beam_theory_tip_deflection_mm"], 1e-9), 3)}
     return out
 
 
