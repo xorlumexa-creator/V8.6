@@ -595,7 +595,10 @@ def _ss_mappings(sim, api_client, project_id, geometry_id, klass):
     except TypeError:
         m = geo_api.get_geometry_mappings(project_id, geometry_id, _class=klass)
     items = list(getattr(m, "embedded", None) or [])
-    return [getattr(i, "name", None) for i in items if getattr(i, "name", None)]
+    names = [getattr(i, "name", None) for i in items if getattr(i, "name", None)]
+    # SimScale returns the names sorted as TEXT (..._TE13, _TE23, _TE27, _TE3, _TE31 ...), which is NOT the
+    # B-rep order. Parasolid numbers entities in B-rep order, so sort numerically (instance, body, TE).
+    return sorted(names, key=lambda n: ([int(x) for x in re.findall(r"\d+", n)], n))
 
 
 def _ss_pick_end_faces(shape, axis, exts):
@@ -1246,6 +1249,25 @@ def _ss_sdk_info(geometry_id=""):
     return out
 
 
+def _ss_bc_check(field_diag, axis):
+    """Sanity-check that the faces we fixed / loaded really are the intended ends: the fixed (min) end must
+    barely move and the displacement must peak at the loaded (max) end. Uses the along-axis profile."""
+    try:
+        if not isinstance(field_diag, dict) or field_diag.get("axis") != "xyz"[axis]:
+            return None
+        u = field_diag.get("disp_peak_by_tenth")
+        if not u or u[0] is None or u[-1] is None:
+            return None
+        peak = max(v for v in u if v is not None)
+        if peak <= 0:
+            return None
+        fixed_r, load_r = u[0] / peak, u[-1] / peak
+        return {"ok": bool(fixed_r <= 0.15 and load_r >= 0.6),
+                "fixed_end_disp_over_peak": round(fixed_r, 3), "load_end_disp_over_peak": round(load_r, 3)}
+    except Exception:
+        return None
+
+
 def _ss_probe(simulation_id="", run_id=""):
     """Re-read the results of an ALREADY FINISHED run (no new solve). With no ids it picks the newest
     finished 'lumexa_*' run in the template project."""
@@ -1486,6 +1508,13 @@ def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0):
                          "displacement_rescaled_by_E_ratio": round(E_tpl / max(E_req, 1e-9), 4)},
             "inputs": {"force_n": force_n, "direction": force_dir},
         }
+        bc = _ss_bc_check(fields.get("field_diag"), axis)
+        fem["simscale"]["bc_check"] = bc
+        if bc is not None and not bc["ok"]:
+            fem["numerically_suspect"] = True
+            fem["note"] += (" WARNING: boundary-condition sanity check FAILED (the intended fixed end moves and/or "
+                            "the loaded end does not) -- the SimScale faces were probably mismatched; do not "
+                            "trust these numbers.")
         mark("done")
         diag["elapsed_s"] = round(time.time() - t0, 1)
         return fem, diag
