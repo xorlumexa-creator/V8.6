@@ -2379,7 +2379,17 @@ NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
 # Nemotron 3 Ultra is a large reasoning model on a shared free tier: a design script can take
 # well over a minute. Raise/lower via env if you see read timeouts.
-NVIDIA_TIMEOUT_S = float(os.environ.get("NVIDIA_TIMEOUT_S", "180"))
+NVIDIA_TIMEOUT_S = float(os.environ.get("NVIDIA_TIMEOUT_S", "360"))   # TOTAL time allowed for one call
+NVIDIA_STREAM = os.environ.get("NVIDIA_STREAM", "1").strip() != "0"   # stream tokens: a long think no longer trips the read timeout
+NVIDIA_STALL_S = float(os.environ.get("NVIDIA_STALL_S", "60"))        # abort only if NO data arrives for this long
+NVIDIA_THINKING = os.environ.get("NVIDIA_THINKING", "").strip().lower()   # Nemotron Ultra: ""=model default | on | off
+NVIDIA_REASONING_BUDGET = int(os.environ.get("NVIDIA_REASONING_BUDGET", "0") or 0)   # cap on hidden thinking tokens (0 = none)
+
+# Direct DeepSeek API (api-docs.deepseek.com) - separate key, independent of NVIDIA NIM model churn.
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_API_URL = os.environ.get("DEEPSEEK_API_URL", "https://api.deepseek.com/chat/completions").strip()
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash").strip()
+DEEPSEEK_THINKING = os.environ.get("DEEPSEEK_THINKING", "").strip().lower()   # ""=omit | enabled | disabled
 NVIDIA_GEN_MAX_TOKENS = int(os.environ.get("NVIDIA_GEN_MAX_TOKENS", "12000"))
 
 # Optional "strategic advisor" second model for the Engineering Agent — called
@@ -2635,7 +2645,77 @@ def _cerebras_request(messages, temperature=0.15, max_tokens=3000, model=None):
     return content
 
 
-def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None, timeout=None):
+def _nvidia_extra_body(model, thinking=None):
+    """Nemotron 3 Ultra thinking controls (NVIDIA sample: chat_template_kwargs.enable_thinking + reasoning_budget).
+    Other models get nothing extra, so unknown fields can never break them. thinking: True/False/None(=env)."""
+    if "nemotron-3-ultra" not in (model or "").lower():
+        return {}
+    th = thinking if thinking is not None else {"on": True, "off": False}.get(NVIDIA_THINKING)
+    ex = {}
+    if th is False:
+        ex["chat_template_kwargs"] = {"enable_thinking": False, "force_nonempty_content": True}
+    elif th is True:
+        ex["chat_template_kwargs"] = {"enable_thinking": True}
+    if th is not False and NVIDIA_REASONING_BUDGET > 0:
+        ex["reasoning_budget"] = NVIDIA_REASONING_BUDGET
+    return ex
+
+
+def _nvidia_stream_read(req, total_s):
+    """Read an OpenAI-style SSE stream. Only answer text (delta.content) is kept; thinking text is dropped.
+    Fails on a stall (no bytes for NVIDIA_STALL_S) or when total_s is exceeded - never on a merely long think."""
+    import urllib.request, urllib.error
+    t0 = time.time()
+    parts, finish, think_chars = [], None, 0
+    try:
+        with urllib.request.urlopen(req, timeout=NVIDIA_STALL_S) as resp:
+            for raw in resp:
+                if time.time() - t0 > total_s:
+                    raise HTTPException(504, f"NVIDIA NIM call exceeded {total_s:.0f}s total "
+                                             f"(answer so far: {sum(len(x) for x in parts)} chars, "
+                                             f"thinking: {think_chars} chars)")
+                line = raw.decode("utf-8", "ignore").strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    ev = json.loads(chunk)
+                except ValueError:
+                    continue
+                ch = (ev.get("choices") or [{}])[0]
+                delta = ch.get("delta") or {}
+                if isinstance(delta.get("content"), str):
+                    parts.append(delta["content"])
+                if delta.get("reasoning_content"):
+                    think_chars += len(delta["reasoning_content"])
+                if ch.get("finish_reason"):
+                    finish = ch["finish_reason"]
+    except HTTPException:
+        raise
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        if e.code == 429:
+            raise HTTPException(429, f"NVIDIA NIM rate limit exceeded: {body}")
+        raise HTTPException(502, f"NVIDIA NIM error ({e.code}): {body}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"NVIDIA NIM connection error: {str(e)}")
+    except TimeoutError:
+        raise HTTPException(504, f"NVIDIA NIM stalled: no data for {NVIDIA_STALL_S:.0f}s after "
+                                 f"{time.time() - t0:.0f}s (thinking: {think_chars} chars)")
+    except Exception as e:
+        raise HTTPException(502, f"NVIDIA NIM stream failed: {type(e).__name__}: {e}")
+    content = "".join(parts)
+    if not content.strip():
+        hint = (" finish_reason=length: it spent the whole token budget thinking - set NVIDIA_REASONING_BUDGET "
+                "or NVIDIA_THINKING=off." if finish == "length" else "")
+        raise HTTPException(502, f"NVIDIA NIM returned empty content (finish_reason={finish}, "
+                                 f"thinking: {think_chars} chars).{hint}")
+    return content
+
+
+def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None, timeout=None, thinking=None):
     """Low-level call to NVIDIA's NIM catalog (build.nvidia.com, OpenAI-compatible
     chat completions) — identical shape to _groq_request/_cerebras_request,
     different base URL/key. `model` (or NVIDIA_MODEL) picks which of NVIDIA's
@@ -2647,12 +2727,17 @@ def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None, tim
         raise HTTPException(500, "NVIDIA_API_KEY is not configured on the server. "
                                    "Set it as a secret/env var in your deployment.")
 
-    payload = json.dumps({
-        "model": model or NVIDIA_MODEL,
+    _mdl = model or NVIDIA_MODEL
+    _body = {
+        "model": _mdl,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
-    }).encode()
+    }
+    _body.update(_nvidia_extra_body(_mdl, thinking))
+    if NVIDIA_STREAM:
+        _body["stream"] = True
+    payload = json.dumps(_body).encode()
 
     req = urllib.request.Request(
         NVIDIA_API_URL, data=payload,
@@ -2660,9 +2745,11 @@ def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None, tim
             "Content-Type": "application/json",
             "Authorization": f"Bearer {NVIDIA_API_KEY}",
             "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
-            "Accept": "application/json",
+            "Accept": "text/event-stream" if NVIDIA_STREAM else "application/json",
         }
     )
+    if NVIDIA_STREAM:
+        return _nvidia_stream_read(req, float(timeout or NVIDIA_TIMEOUT_S))
     try:
         with urllib.request.urlopen(req, timeout=(timeout or NVIDIA_TIMEOUT_S)) as resp:
             data = json.loads(resp.read())
@@ -2701,6 +2788,44 @@ def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None, tim
                 "NVIDIA_GEN_MAX_TOKENS." if finish == "length" else "")
         raise HTTPException(502, f"NVIDIA NIM returned empty/null content.{hint} "
                                   f"Raw response: {json.dumps(data)[:500]}")
+    return content
+
+
+def _deepseek_request(messages, temperature=0.1, max_tokens=6000, model=None, timeout=90):
+    """Direct call to DeepSeek's own API (OpenAI-compatible /chat/completions). Needs DEEPSEEK_API_KEY.
+    Thinking text arrives in a separate reasoning_content field, so reading "content" excludes it."""
+    import urllib.request, urllib.error
+
+    if not DEEPSEEK_API_KEY:
+        raise HTTPException(500, "DEEPSEEK_API_KEY is not configured on the server.")
+    body = {"model": model or DEEPSEEK_MODEL, "messages": messages,
+            "temperature": temperature, "max_tokens": max_tokens, "stream": False}
+    if DEEPSEEK_THINKING in ("enabled", "disabled"):
+        body["thinking"] = {"type": DEEPSEEK_THINKING}
+    req = urllib.request.Request(
+        DEEPSEEK_API_URL, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                 "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode(errors="ignore")
+        raise HTTPException(429 if e.code == 429 else 502, f"DeepSeek API error ({e.code}): {raw[:500]}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"DeepSeek connection error: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"DeepSeek request failed: {type(e).__name__}: {e}")
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(502, f"Unexpected DeepSeek response shape: {json.dumps(data)[:500]}")
+    if not content or not isinstance(content, str):
+        fin = (data.get("choices") or [{}])[0].get("finish_reason")
+        raise HTTPException(502, f"DeepSeek returned empty content (finish_reason={fin}). "
+                                 f"Raw: {json.dumps(data)[:400]}")
     return content
 
 
@@ -5751,9 +5876,9 @@ def _apply_plan_to_fea(fea, tp_results):
 
 
 # The test plan is a short JSON answer: a fast model is enough and a 550B reasoning model just times out.
-# On NVIDIA NIM the plan therefore goes to PLAN_MODEL first (default DeepSeek V4 Flash) and falls back to
+# On NVIDIA NIM the plan therefore goes to PLAN_MODEL first (default DeepSeek V4 Flash 0731; the original v4-flash id reached end of life 2026-08-07) and falls back to
 # NVIDIA_MODEL if that call fails. Override with PLAN_MODEL=<nim model id> (set PLAN_MODEL=none to disable).
-PLAN_MODEL = os.environ.get("PLAN_MODEL", "deepseek-ai/deepseek-v4-flash").strip()
+PLAN_MODEL = os.environ.get("PLAN_MODEL", "deepseek-ai/deepseek-v4-flash-0731").strip()
 PLAN_TIMEOUT_S = float(os.environ.get("PLAN_TIMEOUT_S", "90"))
 _LLM_LAST = {}
 
@@ -5761,7 +5886,17 @@ _LLM_LAST = {}
 async def _llm_text(system_prompt, turns, max_tokens=1800, temperature=0.1):
     """Plain-text completion through whichever provider AI_PROVIDER selects (same dispatch as script generation)."""
     _LLM_LAST.clear()
+    _LLM_LAST["provider"] = AI_PROVIDER
     msgs = [{"role": "system", "content": system_prompt}] + turns
+    if DEEPSEEK_API_KEY:     # direct DeepSeek first (remove the key to disable); NVIDIA stays as fallback
+        try:
+            out = await asyncio.to_thread(_deepseek_request, msgs, temperature=temperature,
+                                          max_tokens=max(max_tokens, 6000), timeout=PLAN_TIMEOUT_S)
+            _LLM_LAST["provider"] = "deepseek"
+            _LLM_LAST["model"] = DEEPSEEK_MODEL
+            return out
+        except HTTPException as e:
+            _LLM_LAST["deepseek_error"] = f"{e.status_code} {str(e.detail)[:200]}"
     if AI_PROVIDER == "claude":
         return await asyncio.to_thread(_claude_request, system_prompt, turns, temperature=temperature, max_tokens=max_tokens)
     if AI_PROVIDER == "gemini":
@@ -5782,7 +5917,8 @@ async def _llm_text(system_prompt, turns, max_tokens=1800, temperature=0.1):
                 _LLM_LAST["fallback_reason"] = f"{PLAN_MODEL}: {e.status_code} {str(e.detail)[:160]}"
         _LLM_LAST["model"] = NVIDIA_MODEL
         return await asyncio.to_thread(_nvidia_request, msgs, temperature=temperature,
-                                       max_tokens=max(max_tokens, NVIDIA_GEN_MAX_TOKENS))
+                                       max_tokens=max(max_tokens, NVIDIA_GEN_MAX_TOKENS),
+                                       thinking=False)      # plan = short JSON: no hidden thinking needed
     if AI_PROVIDER == "openrouter":
         return await asyncio.to_thread(_openrouter_request, msgs, temperature=temperature, max_tokens=max_tokens)
     return await asyncio.to_thread(_lovable_request, msgs, temperature=temperature, max_tokens=max_tokens)
@@ -7218,6 +7354,25 @@ async def test_plan_selftest(force_n: float = 100.0, material: str = "", dry_run
             "stress": round(m["von_mises_mpa"] / max(exp["beam_theory_max_stress_mpa"], 1e-9), 3),
             "deflection": round((m.get("max_deflection_mm") or 0) / max(exp["beam_theory_tip_deflection_mm"], 1e-9), 3)}
     return out
+
+
+@app.get("/deepseek-selftest")
+@_sanitize_response
+async def deepseek_selftest():
+    """One tiny call to the direct DeepSeek API: is the key valid, which model, how fast. No SimScale."""
+    import time as _t
+    info = {"key_set": bool(DEEPSEEK_API_KEY), "model": DEEPSEEK_MODEL, "url": DEEPSEEK_API_URL,
+            "thinking": DEEPSEEK_THINKING or "(default)"}
+    if not DEEPSEEK_API_KEY:
+        return {**info, "ok": False, "error": "DEEPSEEK_API_KEY is not set on the server"}
+    t0 = _t.time()
+    try:
+        out = await asyncio.to_thread(
+            _deepseek_request, [{"role": "user", "content": 'Reply with exactly this JSON: {"ok": true}'}],
+            temperature=0, max_tokens=2000, timeout=PLAN_TIMEOUT_S)
+        return {**info, "ok": True, "seconds": round(_t.time() - t0, 1), "reply_head": out[:200]}
+    except HTTPException as e:
+        return {**info, "ok": False, "seconds": round(_t.time() - t0, 1), "error": f"{e.status_code}: {str(e.detail)[:400]}"}
 
 
 @app.get("/test-plan-llm-selftest")
