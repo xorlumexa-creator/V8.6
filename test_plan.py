@@ -52,10 +52,12 @@ def schema_prompt(materials):
         "After the part, output a TEST PLAN as JSON (no prose) describing how this part must be verified.\n"
         "Think about the real use: where is it held, what loads act on it, how big, what must not happen.\n"
         "Never use face indices. Select faces geometrically; all selector keys are optional and AND-combined:\n"
-        '  "at": one of min_x,max_x,min_y,max_y,min_z,max_z   (face lies on that side of the part bounding box)\n'
-        '  "normal": one of +x,-x,+y,-y,+z,-z                (planar face with that outward normal)\n'
+        '  "at": one of min_x,max_x,min_y,max_y,min_z,max_z   (plane: lies on that side of the part bounding box;\n'
+        '                                                      cylinder/hole: the hole reaches that side of the part)\n'
+        '  "normal": one of +x,-x,+y,-y,+z,-z                (PLANAR faces only - holes have no normal, never use it for them)\n'
         '  "shape": "plane" | "cylinder"                      (cylinder = holes, bores, pins)\n'
         '  "diameter_mm": [min, max]                          (for cylinders, approximate)\n'
+        '  Holes: select with shape "cylinder" + diameter_mm (+ optional "at" or "inside_box_mm"); do not add "normal".\n'
         '  "area_mm2": [min, max]\n'
         '  "inside_box_mm": [x0,y0,z0,x1,y1,z1]               (face centre inside this box, mm)\n'
         '  "pick": "largest" | "smallest", "count": n          (applied last)\n'
@@ -189,6 +191,7 @@ def select_faces(descs, selector, label="selector"):
     span = max(hi[k] - lo[k] for k in range(3))
     tol = max(span * 2e-3, 1e-3)
     cand = list(descs)
+    want = None
 
     if "shape" in selector:
         want = str(selector["shape"]).upper().replace("PLANAR", "PLANE").replace("CYLINDRICAL", "CYLINDER")
@@ -199,8 +202,9 @@ def select_faces(descs, selector, label="selector"):
         key = str(selector["normal"]).lower()
         if key not in DIRS:
             raise PlanError(f"{label}: normal must be one of {list(DIRS)}.")
-        t = DIRS[key]
-        cand = [d for d in cand if d["normal"] and sum(a * b for a, b in zip(d["normal"], t)) >= math.cos(math.radians(20))]
+        if want != "CYLINDER":      # a hole/bore has no single face normal - for cylinders "normal" is simply ignored
+            t = DIRS[key]
+            cand = [d for d in cand if d["normal"] and sum(a * b for a, b in zip(d["normal"], t)) >= math.cos(math.radians(20))]
     if "at" in selector:
         side = str(selector["at"]).lower()
         if side not in SIDES:
@@ -209,6 +213,8 @@ def select_faces(descs, selector, label="selector"):
         want_hi = side.startswith("max")
         ref = hi[ax] if want_hi else lo[ax]
         def on_side(d):
+            if d["geom"] == "CYLINDER":     # a hole is not a thin face: "at" = the hole reaches that side of the part
+                return (ref - d["bbox_max"][ax] <= tol) if want_hi else (d["bbox_min"][ax] - ref <= tol)
             thin = d["bbox_max"][ax] - d["bbox_min"][ax] <= tol
             pos = d["bbox_max"][ax] if want_hi else d["bbox_min"][ax]
             return thin and abs(pos - ref) <= tol
