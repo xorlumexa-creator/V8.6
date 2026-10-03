@@ -5774,39 +5774,50 @@ _PLAN_SYSTEM = ("You are a mechanical test engineer. You are shown a part reques
                 "verifies it. Output ONLY the JSON object - no prose, no markdown.\n\n")
 
 
-async def generate_test_plan(prompt, cad_obj, material="auto", previous_plan=None):
+async def generate_test_plan(prompt, cad_obj, material="auto", previous_plan=None, diag=None):
     """The LLM writes the test plan for a built part. The plan is dry-run against the real faces first (instant)
     and sent back for correction if a selector is unusable. Returns a plan dict or None (caller then falls back
-    to the legacy fixed load case). A plan from an earlier iteration is reused when it still resolves."""
+    to the legacy fixed load case). `diag` (dict, filled in place) records WHY a plan was not produced."""
+    diag = {} if diag is None else diag
+    diag["attempts"] = []
     try:
         err = None
         if previous_plan is not None:
             chk = await run_plan_tests(cad_obj, previous_plan, dry_run=True)
             if chk.get("overall") == "RESOLVED":
+                diag["reused_previous_plan"] = True
                 return previous_plan
             err = chk.get("error") or next((r.get("error") for r in chk.get("results", []) if r.get("error")), None)
+        diag["stage"] = "describe_faces"
         summary = TP.face_summary(TP.describe_faces(cad_obj))
+        diag["n_faces"] = summary.get("n_faces")
         hint = f"\nPreferred material: {material}." if material and material != "auto" else ""
         user = (f"PART REQUEST:\n{prompt[:2500]}{hint}\n\nMEASURED GEOMETRY (mm):\n{json.dumps(summary)}\n"
                 + (f"\nThe previous test plan no longer fits this geometry: {err}\n" if err else "")
                 + "\nOutput ONLY the JSON test plan.")
         turns = [{"role": "user", "content": user}]
         system = _PLAN_SYSTEM + TP.schema_prompt(MATERIALS)
+        diag["stage"] = "llm"
         for _ in range(2):
             text = await _llm_text(system, turns)
+            att = {"llm_reply_head": (text or "")[:300]}
+            diag["attempts"].append(att)
             m = re.search(r"\{.*\}", text or "", re.S)
             try:
-                plan = TP.parse_plan(m.group(0) if m else text)
+                plan = TP.parse_plan(m.group(0) if m else (text or ""))
                 chk = await run_plan_tests(cad_obj, plan, dry_run=True)
                 if chk.get("overall") == "RESOLVED":
+                    diag["stage"] = "ok"
                     return plan
                 msg = chk.get("error") or next((r.get("error") for r in chk.get("results", []) if r.get("error")), "invalid")
             except TP.PlanError as e:
                 msg = str(e)
+            att["rejected"] = str(msg)[:400]
             turns += [{"role": "assistant", "content": text or ""},
                       {"role": "user", "content": f"Your test plan was rejected: {msg}\nOutput the corrected JSON only."}]
-    except Exception:
-        pass
+        diag["error"] = "plan rejected twice"
+    except Exception as e:
+        diag["error"] = f"{type(e).__name__}: {str(e)[:300]}"
     return None
 
 
@@ -6774,13 +6785,16 @@ async def generate_validate_refine(
         try:
             mesh,stl_bytes=await mesh_from_cad_object(obj)
             plan=None
+            plan_diag={}
             if use_test_plan and obj is not None:
-                plan=await generate_test_plan(prompt,obj,material,previous_plan=plan_cache)
+                plan=await generate_test_plan(prompt,obj,material,previous_plan=plan_cache,diag=plan_diag)
                 plan_cache=plan or plan_cache
             result=await run_analysis_v8(mesh,prompt,prompt,material,force_n,force_dir,
                                           operating_temp_c,project_description,
                                           surface_finish,reliability,run_topology,
                                           cad_obj=obj,test_plan=plan)
+            if use_test_plan:
+                result["test_plan_diag"]=plan_diag
         except Exception as e:
             iterations.append({"iteration":i,"stage":"analysis_failed","error":str(e),"script":script})
             feedback=(f"The generated geometry exported, but the analysis pipeline raised:\n{str(e)}\n\n"
@@ -7176,6 +7190,30 @@ async def test_plan_selftest(force_n: float = 100.0, material: str = "", dry_run
         out["ratio_fem_over_theory"] = {
             "stress": round(m["von_mises_mpa"] / max(exp["beam_theory_max_stress_mpa"], 1e-9), 3),
             "deflection": round((m.get("max_deflection_mm") or 0) / max(exp["beam_theory_tip_deflection_mm"], 1e-9), 3)}
+    return out
+
+
+@app.get("/test-plan-llm-selftest")
+@_sanitize_response
+async def test_plan_llm_selftest(shape: str = "bracket", prompt: str = ""):
+    """Does the LLM produce a usable test plan? One LLM call, no SimScale (10-60 s). shape=bracket (L-bracket
+    with two holes) or cantilever. Shows the plan, what the selectors resolved to, and why it failed if it did."""
+    if not B3D:
+        raise HTTPException(503, "build123d not installed")
+    if shape == "cantilever":
+        part = b3d.Pos(50, 0, 0) * b3d.Box(100, 20, 10)
+        prompt = prompt or "Steel cantilever beam 100x20x10 mm, fixed at one end, 100 N at the free end"
+    else:
+        part = b3d.Pos(40, 20, 2.5) * b3d.Box(80, 40, 5) + b3d.Pos(2.5, 20, 25) * b3d.Box(5, 40, 40)
+        for x, y in ((55, 10), (55, 30)):
+            part = part - b3d.Pos(x, y, 2.5) * b3d.Cylinder(3, 8)
+        prompt = prompt or ("Aluminum L-bracket 80x40x5 mm, two 6 mm holes in the base, wall-mounted, "
+                            "carries a 300 N load on the free arm")
+    diag = {}
+    plan = await generate_test_plan(prompt, part, "auto", diag=diag)
+    out = {"provider": AI_PROVIDER, "prompt": prompt, "plan": plan, "diag": diag}
+    if plan is not None:
+        out["resolved"] = await run_plan_tests(part, plan, dry_run=True)
     return out
 
 
