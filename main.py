@@ -5771,7 +5771,10 @@ async def _llm_text(system_prompt, turns, max_tokens=1800, temperature=0.1):
 
 _PLAN_SYSTEM = ("You are a mechanical test engineer. You are shown a part request and the MEASURED geometry of the "
                 "solid that was built from it. Decide how the part will really be used and write the test plan that "
-                "verifies it. Output ONLY the JSON object - no prose, no markdown.\n\n")
+                "verifies it. Choose load directions from the real use case: a force at the tip of an arm or cantilever "
+                "normally acts PERPENDICULAR to it (bending), a hanging weight acts along gravity, a clamp or bolt "
+                "pattern is the fixed set - fix only faces that are really held. "
+                "Output ONLY the JSON object - no prose, no markdown.\n\n")
 
 
 async def generate_test_plan(prompt, cad_obj, material="auto", previous_plan=None, diag=None):
