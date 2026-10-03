@@ -5750,8 +5750,17 @@ def _apply_plan_to_fea(fea, tp_results):
     return fea
 
 
+# The test plan is a short JSON answer: a fast model is enough and a 550B reasoning model just times out.
+# On NVIDIA NIM the plan therefore goes to PLAN_MODEL first (default DeepSeek V4 Flash) and falls back to
+# NVIDIA_MODEL if that call fails. Override with PLAN_MODEL=<nim model id> (set PLAN_MODEL=none to disable).
+PLAN_MODEL = os.environ.get("PLAN_MODEL", "deepseek-ai/deepseek-v4-flash").strip()
+PLAN_TIMEOUT_S = float(os.environ.get("PLAN_TIMEOUT_S", "90"))
+_LLM_LAST = {}
+
+
 async def _llm_text(system_prompt, turns, max_tokens=1800, temperature=0.1):
     """Plain-text completion through whichever provider AI_PROVIDER selects (same dispatch as script generation)."""
+    _LLM_LAST.clear()
     msgs = [{"role": "system", "content": system_prompt}] + turns
     if AI_PROVIDER == "claude":
         return await asyncio.to_thread(_claude_request, system_prompt, turns, temperature=temperature, max_tokens=max_tokens)
@@ -5761,7 +5770,17 @@ async def _llm_text(system_prompt, turns, max_tokens=1800, temperature=0.1):
         return await asyncio.to_thread(_groq_request, msgs, temperature=temperature, max_tokens=max_tokens)
     if AI_PROVIDER == "cerebras":
         return await asyncio.to_thread(_cerebras_request, msgs, temperature=temperature, max_tokens=max_tokens)
-    if AI_PROVIDER == "nvidia":      # reasoning model: hidden thinking counts against max_tokens
+    if AI_PROVIDER == "nvidia":      # reasoning models: hidden thinking counts against max_tokens
+        if PLAN_MODEL and PLAN_MODEL.lower() != "none" and PLAN_MODEL != NVIDIA_MODEL:
+            try:
+                out = await asyncio.to_thread(_nvidia_request, msgs, temperature=temperature,
+                                              max_tokens=max(max_tokens, 6000), model=PLAN_MODEL,
+                                              timeout=PLAN_TIMEOUT_S)
+                _LLM_LAST["model"] = PLAN_MODEL
+                return out
+            except HTTPException as e:
+                _LLM_LAST["fallback_reason"] = f"{PLAN_MODEL}: {e.status_code} {str(e.detail)[:160]}"
+        _LLM_LAST["model"] = NVIDIA_MODEL
         return await asyncio.to_thread(_nvidia_request, msgs, temperature=temperature,
                                        max_tokens=max(max_tokens, NVIDIA_GEN_MAX_TOKENS))
     if AI_PROVIDER == "openrouter":
@@ -5802,8 +5821,12 @@ async def generate_test_plan(prompt, cad_obj, material="auto", previous_plan=Non
         system = _PLAN_SYSTEM + TP.schema_prompt(MATERIALS)
         diag["stage"] = "llm"
         for _ in range(2):
-            text = await _llm_text(system, turns)
-            att = {"llm_reply_head": (text or "")[:300]}
+            try:
+                text = await _llm_text(system, turns)
+            except HTTPException as e:
+                diag["attempts"].append({"llm_error": f"{e.status_code}: {str(e.detail)[:240]}", **_LLM_LAST})
+                continue
+            att = {"llm_reply_head": (text or "")[:300], **_LLM_LAST}
             diag["attempts"].append(att)
             m = re.search(r"\{.*\}", text or "", re.S)
             try:
@@ -5818,7 +5841,8 @@ async def generate_test_plan(prompt, cad_obj, material="auto", previous_plan=Non
             att["rejected"] = str(msg)[:400]
             turns += [{"role": "assistant", "content": text or ""},
                       {"role": "user", "content": f"Your test plan was rejected: {msg}\nOutput the corrected JSON only."}]
-        diag["error"] = "plan rejected twice"
+        diag["error"] = ("LLM call failed twice" if all("llm_error" in a for a in diag["attempts"])
+                         else "plan rejected twice")
     except Exception as e:
         diag["error"] = f"{type(e).__name__}: {str(e)[:300]}"
     return None
