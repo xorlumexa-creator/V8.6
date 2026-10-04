@@ -173,6 +173,182 @@ def face_summary(descs, limit=24):
 
 
 # --------------------------------------------------------------------------------------------------
+# issue localization: turn "hotspot at (x,y,z)" into words the LLM can act on
+# --------------------------------------------------------------------------------------------------
+_AXN = "xyz"
+
+
+def _facing(n):
+    """'+Z' for an axis-aligned normal, else the rounded vector."""
+    k = max(range(3), key=lambda i: abs(n[i]))
+    if abs(n[k]) >= 0.94:
+        return ("+" if n[k] > 0 else "-") + _AXN[k].upper()
+    return "(" + ", ".join(f"{v:.2f}" for v in n) + ")"
+
+
+def _box_dist(p, d):
+    """Distance from point p to the face's bounding box (0 when inside)."""
+    return math.sqrt(sum(max(d["bbox_min"][k] - p[k], 0.0, p[k] - d["bbox_max"][k]) ** 2 for k in range(3)))
+
+
+def _face_label(d, roles):
+    if d["geom"] == "CYLINDER" and d.get("diameter"):
+        txt = f"hole/bore dia {d['diameter']:.1f} mm at ({d['center'][0]:.1f}, {d['center'][1]:.1f}, {d['center'][2]:.1f})"
+    elif d["geom"] == "PLANE" and d["normal"]:
+        sp = ", ".join(f"{_AXN[k]} {d['bbox_min'][k]:.0f}-{d['bbox_max'][k]:.0f}" if d["bbox_max"][k] - d["bbox_min"][k] > 0.5
+                       else f"{_AXN[k]}={d['bbox_min'][k]:.0f}" for k in range(3))
+        txt = f"flat face facing {_facing(d['normal'])} ({sp})"
+    else:
+        txt = f"curved/other face near ({d['center'][0]:.0f}, {d['center'][1]:.0f}, {d['center'][2]:.0f})"
+    r = roles.get(d["idx"])
+    return txt + (f" [{r}]" if r else "")
+
+
+def localize(descs, case, hotspot, zone=None, metrics=None):
+    """Describe WHERE the peak stress is, in terms of part features, and what usually causes that. Pure geometry;
+    never raises (returns None when it cannot say anything)."""
+    try:
+        if not hotspot or len(hotspot) != 3 or not descs:
+            return None
+        p = [float(v) for v in hotspot]
+        lo, hi = part_bbox(descs)
+        ext = [max(hi[k] - lo[k], 1e-9) for k in range(3)]
+        tol = max(1.0, 0.03 * max(ext))
+        roles = {}
+        for i in (case or {}).get("fixed_idx", []):
+            roles[i] = "FIXED"
+        for l in (case or {}).get("loads", []):
+            for i in l.get("face_idx", []):
+                roles[i] = f"LOADED by {l.get('id', 'load')}"
+
+        # faces the hotspot lies on (flat faces: within tol of the plane and inside its box)
+        on = []
+        for d in descs:
+            if d["geom"] == "PLANE" and d["normal"]:
+                dist = abs(sum(d["normal"][k] * (p[k] - d["center"][k]) for k in range(3)))
+                if dist <= tol and _box_dist(p, d) <= tol:
+                    on.append(d)
+        # edge / corner: two or more flat faces that are not parallel
+        edge = None
+        for i, a in enumerate(on):
+            for b in on[i + 1:]:
+                if abs(sum(a["normal"][k] * b["normal"][k] for k in range(3))) < 0.9:
+                    edge = (a, b)
+                    break
+            if edge:
+                break
+
+        # nearest hole and its distance from the hole wall
+        holes = [d for d in descs if d["geom"] == "CYLINDER" and d.get("diameter")]
+        near_hole = None
+        if holes:
+            def hd(d):
+                return max(0.0, math.dist(p, d["center"]) - d["diameter"] / 2)
+            h = min(holes, key=hd)
+            near_hole = (h, hd(h))
+
+        def role_dist(tag):
+            best = None
+            for i, r in roles.items():
+                if r.startswith(tag):
+                    dd = _box_dist(p, descs[i])
+                    if best is None or dd < best[1]:
+                        best = (descs[i], dd)
+            return best
+        d_fixed, d_load = role_dist("FIXED"), role_dist("LOADED")
+
+        # section thickness at the hotspot: distance to the opposite-facing flat face behind it
+        thick = None
+        for a in on:
+            k = max(range(3), key=lambda i: abs(a["normal"][i]))
+            for o in descs:
+                if o is a or o["geom"] != "PLANE" or not o["normal"]:
+                    continue
+                if sum(a["normal"][j] * o["normal"][j] for j in range(3)) > -0.9:
+                    continue
+                if all(o["bbox_min"][j] - tol <= p[j] <= o["bbox_max"][j] + tol for j in range(3) if j != k):
+                    t = abs(p[k] - o["center"][k])
+                    if t > 0.3 and (thick is None or t < thick):
+                        thick = t
+
+        if thick and thick > 0.5 * max(ext):      # that is a length through the part, not a wall thickness
+            thick = None
+
+        # where on the part
+        pos = []
+        for k in range(3):
+            f = (p[k] - lo[k]) / ext[k]
+            if p[k] - lo[k] <= tol:
+                pos.append(f"at the min-{_AXN[k].upper()} side")
+            elif hi[k] - p[k] <= tol:
+                pos.append(f"at the max-{_AXN[k].upper()} side")
+            else:
+                pos.append(f"{f * 100:.0f}% along {_AXN[k].upper()}")
+        out = {"hotspot_mm": [round(v, 1) for v in p], "position": "; ".join(pos),
+               "on_faces": [_face_label(d, roles) for d in on],
+               "at_edge_between": [_face_label(edge[0], roles), _face_label(edge[1], roles)] if edge else None,
+               "section_thickness_mm": round(thick, 1) if thick else None,
+               "nearest_hole": ({"label": _face_label(near_hole[0], roles), "gap_mm": round(near_hole[1], 1)}
+                                if near_hole else None),
+               "dist_to_fixed_mm": round(d_fixed[1], 1) if d_fixed else None,
+               "dist_to_load_mm": round(d_load[1], 1) if d_load else None}
+        if zone and zone.get("min") and zone.get("max"):
+            out["hot_zone"] = ("stress within 15% of the peak spans " +
+                               ", ".join(f"{_AXN[k]} {zone['min'][k]:.0f}-{zone['max'][k]:.0f}" for k in range(3)) +
+                               f" mm ({zone.get('n_nodes', '?')} of {zone.get('n_total', '?')} nodes)")
+
+        # likely cause, from where it sits
+        hints = []
+        t_ref = thick or 5.0
+        if near_hole and near_hole[1] <= max(0.6 * near_hole[0]["diameter"], 2.0):
+            if roles.get(near_hole[0]["idx"]) == "FIXED":
+                hints.append("Peak is at the wall of a FIXED hole: part of it is the rigid-hole constraint, but the real "
+                             "fix is more material around the mounting holes (thicker section / boss / pad, larger "
+                             "edge distance).")
+            else:
+                hints.append("Peak is at the edge of a hole: stress concentration (about 2-3x nominal). Add material "
+                             "around it (boss/pad/thicker wall), increase edge distance, or move it away from the "
+                             "high-stress path.")
+        if edge:
+            hints.append("Peak sits on an edge/corner between two faces: if it is an inside corner, add a fillet of "
+                         f"radius >= {max(2.0, 0.5 * t_ref):.0f} mm there (sharp inside corners multiply stress); if it is an "
+                         "outer edge the real driver is section bending - see below.")
+        if d_load and d_load[1] <= max(2.0, 0.05 * max(ext)):
+            hints.append("Peak is where the load enters: spread the load over a larger pad or thicken locally.")
+        elif d_fixed and d_fixed[1] <= max(2.0, 0.05 * max(ext)) and not (near_hole and roles.get(near_hole[0]['idx']) == 'FIXED'):
+            hints.append("Peak is at the fixed support: partly a constraint effect; add a fillet or a thicker "
+                         "section where the part meets the support.")
+        if not hints or (d_fixed and d_load and d_fixed[1] > 2 * t_ref and d_load[1] > 2 * t_ref):
+            hints.append(f"Peak is away from holes/supports/load: it is bending of a thin section"
+                         + (f" (about {thick:.1f} mm thick here)" if thick else "")
+                         + ". Bending stress scales with 1/thickness^2: thicken THIS section, or add a rib/gusset "
+                           "along the span between the support and the load.")
+        out["likely_cause"] = hints
+
+        lines = [f"WHERE: peak stress at ({p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f}) mm = {out['position']}."]
+        if on:
+            lines.append("  On: " + " AND ".join(out["on_faces"]) + ".")
+        if edge:
+            lines.append("  It is on the edge/corner between those two faces.")
+        if thick:
+            lines.append(f"  Section thickness at this spot is about {thick:.1f} mm.")
+        if near_hole:
+            lines.append(f"  Nearest hole wall is {near_hole[1]:.1f} mm away: {out['nearest_hole']['label']}.")
+        if d_fixed:
+            lines.append(f"  {d_fixed[1]:.0f} mm from the fixed support.")
+        if d_load:
+            lines.append(f"  {d_load[1]:.0f} mm from the loaded face.")
+        if out.get("hot_zone"):
+            lines.append("  " + out["hot_zone"][0].upper() + out["hot_zone"][1:] + ".")
+        for h in hints:
+            lines.append("  LIKELY CAUSE/FIX: " + h)
+        out["text"] = "\n".join(lines)
+        return out
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------------------------------
 # face selection
 # --------------------------------------------------------------------------------------------------
 def _in_range(v, rng):
@@ -372,7 +548,8 @@ def evaluate(case, fem, diag, default_min_sf=2.0):
     status = "INVALID" if warnings else ("PASS" if rows and all(r["pass"] for r in rows) else "FAIL")
     return {**base, "status": status, "solver": "simscale",
             "metrics": {"von_mises_mpa": vm, "safety_factor": sf, "max_deflection_mm": defl,
-                        "hotspot_mm": (fem.get("critical_section") or {}).get("hotspot_xyz_mm")},
+                        "hotspot_mm": (fem.get("critical_section") or {}).get("hotspot_xyz_mm"),
+                        "hot_zone_mm": (fem.get("critical_section") or {}).get("hot_zone_mm")},
             "criteria": rows, "warnings": warnings,
             "mesh": {"nodes": (ss.get("field_diag") or {}).get("n_points") if isinstance(ss.get("field_diag"), dict) else None}}
 
