@@ -823,6 +823,16 @@ def _ss_analyse_arrays(pts, point_data, fname):
     if out["vm"] is None and out["disp"] is None:
         return None
     out["_pts"] = pts
+    try:                                    # hot zone: where is the stress within 15% of the peak? (one point may be an artifact)
+        _va = out.get("_vm_array")
+        if _va is not None and out.get("vm") and len(_va) == len(pts):
+            _m = _va >= 0.85 * out["vm"]
+            if _m.any():
+                _zp = pts[_m]
+                out["vm_zone"] = {"min": _zp.min(axis=0).tolist(), "max": _zp.max(axis=0).tolist(),
+                                  "n_nodes": int(_m.sum()), "n_total": int(len(pts))}
+    except Exception:
+        pass
     try:                                    # compact profile along the longest axis: where is it fixed, where does it peak?
         ext = np.ptp(pts, axis=0)
         ax = int(np.argmax(ext))
@@ -1545,9 +1555,13 @@ def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0, 
         sfv = Sy / max(vm_mpa, 1e-6)
         xyz = fields.get("vm_xyz")
         xyz_mm = [round(float(c) * scale, 2) for c in xyz] if xyz else None
+        _vz = fields.get("vm_zone")
+        zone_mm = ({"min": [round(float(c) * scale, 1) for c in _vz["min"]],
+                    "max": [round(float(c) * scale, 1) for c in _vz["max"]],
+                    "n_nodes": _vz["n_nodes"], "n_total": _vz["n_total"]} if _vz else None)
         crit = {"axis": "xyz"[axis], "position_mm": (xyz_mm[axis] if xyz_mm else None),
                 "strengthen_factor_approx": round(min_sf / sfv, 2) if sfv > 0 else None,
-                "hotspot_xyz_mm": xyz_mm}
+                "hotspot_xyz_mm": xyz_mm, "hot_zone_mm": zone_mm}
         fem = {
             "method": "simscale_static_fem",
             "note": ("SimScale cloud linear-static FEM. Load case: fixed at the min-"
@@ -6009,6 +6023,40 @@ async def generate_test_plan(prompt, cad_obj, material="auto", previous_plan=Non
     return None
 
 
+def _plan_targets(r):
+    """Numbers the LLM can design to: how much the failing metric must improve and what that means for thickness."""
+    try:
+        need_stress, need_defl = 1.0, 1.0
+        for c in r.get("criteria", []):
+            if c.get("pass"):
+                continue
+            m = re.search(r"([0-9.]+)", str(c.get("required", "")))
+            if not m or not isinstance(c.get("actual"), (int, float)):
+                continue
+            req, act = float(m.group(1)), float(c["actual"])
+            if req <= 0 or act <= 0:
+                continue
+            if c.get("name") == "safety_factor":
+                need_stress = max(need_stress, req / act)
+            elif c.get("name") == "von_mises_mpa":
+                need_stress = max(need_stress, act / req)
+            elif c.get("name") == "deflection_mm":
+                need_defl = max(need_defl, act / req)
+        out = []
+        if need_stress > 1.0:
+            t = need_stress ** 0.5
+            out.append(f"    TARGET: peak stress must drop by at least {(1 - 1 / need_stress) * 100:.0f}% "
+                       f"(x{need_stress:.2f}). If the hotspot is bending-dominated, stress ~ 1/thickness^2, so that section "
+                       f"needs about x{t:.2f} thickness; aim for x{t * 1.1:.2f} to leave margin. Fillets at inside corners "
+                       "typically buy 10-30% on their own.")
+        if need_defl > 1.0:
+            out.append(f"    TARGET: deflection must drop by x{need_defl:.2f}; stiffness ~ thickness^3, so about "
+                       f"x{need_defl ** (1 / 3):.2f} thickness (or add a rib).")
+        return out
+    except Exception:
+        return []
+
+
 def _plan_feedback_lines(result):
     """Test-plan section of the refinement feedback the LLM receives."""
     tp = result.get("test_plan_results") or {}
@@ -6029,10 +6077,15 @@ def _plan_feedback_lines(result):
             out.append(f"    criterion {c['name']}: {c['actual']} (required {c['required']}) -> {'ok' if c['pass'] else 'FAILED'}")
         for w in r.get("warnings", []):
             out.append(f"    WARNING: {w}")
+        loc = r.get("localization")
+        if loc and loc.get("text"):
+            out.extend("    " + ln for ln in loc["text"].split("\n"))
         if st == "FAIL":
+            out.extend(_plan_targets(r))
             out.append("    FIX: strengthen the part where the hotspot is (thicker section, fillets, ribs, larger radius at "
                        "the stress raiser) WITHOUT moving or removing the fixed and loaded faces - the plan selects them "
-                       "by position/normal and must still find them.")
+                       "by position/normal and must still find them. Change the region named above; leave parts that "
+                       "are not the problem alone.")
         elif st == "INVALID":
             out.append("    The numbers are not trustworthy (boundary-condition check failed); do not redesign on them.")
         elif st == "NOT_RUN":
@@ -6240,7 +6293,10 @@ def evaluate_design_quality(result: dict, min_health_score: float = 75.0,
         reasons.append(f"FEA safety factor {sfv:.2f} is below minimum {min_safety_factor}.")
     if fea_status == "FAIL" and not plan_authoritative:
         reasons.append("FEA status is FAIL.")
-    if fat_status == "FAIL":
+    if fat_status == "FAIL" and not plan_authoritative:
+        # the generic fatigue check treats the peak stress as fully reversed cyclic stress; when a test plan with
+        # real loads is in charge (static_stress only for now) that would fail every static design, so it is
+        # informational there (still reported in metrics.fatigue_status)
         reasons.append("Fatigue analysis status is FAIL.")
     if not is_wt:
         # FIX: this used to branch on a "was_repaired" flag read from
@@ -7318,6 +7374,9 @@ async def run_plan_tests(cad_obj, plan, default_min_sf=2.0, dry_run=False):
                                             case["criteria"].get("min_safety_factor", default_min_sf), case)
         r = TP.evaluate(case, fem, diag, default_min_sf)
         r["elapsed_s"] = diag.get("elapsed_s")
+        _m = r.get("metrics") or {}
+        if _m.get("hotspot_mm"):
+            r["localization"] = TP.localize(descs, case, _m.get("hotspot_mm"), _m.get("hot_zone_mm"), _m)
         results.append(r)
     return {"plan_version": TP.PLAN_VERSION, "overall": TP.overall(results), "results": results,
             "geometry": TP.face_summary(descs)}
