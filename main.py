@@ -6023,6 +6023,34 @@ async def generate_test_plan(prompt, cad_obj, material="auto", previous_plan=Non
     return None
 
 
+def _verification_gate(use_test_plan, result, plan_diag, quality):
+    """A run that asked for a test plan only counts as PASSED with a real FEM verdict. Without one (plan missing,
+    SimScale not run, boundary-condition check failed) the analytical fallback numbers are not trusted - they once
+    gave a safety factor of 330 for a 700 N bracket. Mutates `quality`; returns (verified, unverifiable) where
+    unverifiable means more redesign rounds cannot help (infrastructure / untrustworthy solve)."""
+    quality.setdefault("metrics", {})["verified"] = True
+    if not use_test_plan:
+        return True, False
+    tp = result.get("test_plan_results") or {}
+    overall = tp.get("overall")
+    if overall in ("PASS", "FAIL"):
+        return True, False
+    rs = tp.get("results") or []
+    if rs:
+        r0 = rs[0]
+        why = r0.get("reason") or r0.get("error") or r0.get("status") or overall
+    else:
+        why = (plan_diag or {}).get("error") or tp.get("error") or "no test plan could be generated"
+    design_related = any(r.get("design_related") for r in rs)
+    quality["passed"] = False
+    quality["metrics"]["verified"] = False
+    quality.setdefault("reasons", []).insert(
+        0, f"UNVERIFIED: the test plan gave no valid FEM verdict (overall {overall or 'no plan'}: {str(why)[:220]}). "
+           "The analytical fallback numbers are not trusted for a pass.")
+    unverifiable = (overall in ("NOT_RUN", "INVALID")) and not design_related
+    return False, unverifiable
+
+
 def _plan_targets(r):
     """Numbers the LLM can design to: how much the failing metric must improve and what that means for thickness."""
     try:
@@ -7059,6 +7087,7 @@ async def generate_validate_refine(
             # last iteration only: a multi-solid result is never a "passed" design
             quality["passed"]=False
             quality["reasons"].insert(0,"Geometry inspection failed: "+"; ".join(gi["issues"]))
+        verified,unverifiable=_verification_gate(use_test_plan,result,plan_diag,quality)
         stl_b64=base64.b64encode(stl_bytes).decode()
         entry={"iteration":i,"stage":"analyzed","passed":quality["passed"],
                "health_score":quality["score"],"reasons":quality["reasons"],
@@ -7082,6 +7111,9 @@ async def generate_validate_refine(
 
         if quality["passed"]:
             stopped_reason="quality_gate_passed"
+            break
+        if unverifiable:
+            stopped_reason="verification_unavailable"      # SimScale/solve problem, not a design problem
             break
 
         # 5) Build feedback for next round
