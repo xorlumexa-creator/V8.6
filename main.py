@@ -1384,6 +1384,84 @@ def _ss_probe(simulation_id="", run_id=""):
     return out
 
 
+def _ss_export_audit(n=10):
+    """For the newest n lumexa_* simulations: is the run FINISHED, and does SimScale still let us EXPORT its
+    result? Tells apart 'every run after #K is locked' (plan/quota) from 'random runs are locked' (something
+    else), and pages through ALL simulations (a single page of 50 can hide the newest ones)."""
+    import inspect
+    pid = SIMSCALE_TEMPLATE_PROJECT_ID
+    out = {"project_id": pid, "rows": []}
+    try:
+        sim, api_client = _ss_client()
+        sims_api, runs_api = sim.SimulationsApi(api_client), sim.SimulationRunsApi(api_client)
+        ex_api = sim.SimulationResultExportsApi(api_client)
+        try:
+            pinfo = sim.ProjectsApi(api_client).get_project(pid)
+            out["project_info"] = _ss_scrub({k: v for k, v in _ss_item_dict(pinfo).items()
+                                             if v is not None and not isinstance(v, (list, dict))})
+        except Exception as e:
+            out["project_info_error"] = f"{type(e).__name__}: {str(e)[:120]}"
+        allsims = []
+        paged = "page" in inspect.signature(sims_api.get_simulations).parameters
+        for pg in range(1, 15):
+            kw = {"limit": 50}
+            if paged:
+                kw["page"] = pg
+            got = list(getattr(sims_api.get_simulations(pid, **kw), "embedded", None) or [])
+            allsims += got
+            if not paged or len(got) < 50:
+                break
+        out["simulations_in_project"] = len(allsims)
+        mine = [x for x in allsims if str(getattr(x, "name", "")).startswith("lumexa_")]
+        mine.sort(key=lambda x: str(getattr(x, "created_at", "")), reverse=True)
+        out["lumexa_simulations"] = len(mine)
+        for sm in mine[:max(1, min(int(n), 20))]:
+            row = {"name": getattr(sm, "name", None), "created_at": str(getattr(sm, "created_at", None))[:19]}
+            out["rows"].append(row)
+            try:
+                runs = list(getattr(runs_api.get_simulation_runs(pid, sm.simulation_id), "embedded", None) or [])
+                row["runs"] = len(runs)
+                if not runs:
+                    row["export"] = "no run"
+                    continue
+                runs.sort(key=lambda r: str(getattr(r, "created_at", "")))
+                r = runs[-1]
+                row["run_status"] = str(getattr(r, "status", None))
+                if row["run_status"].upper() != "FINISHED":
+                    row["export"] = "not finished"
+                    continue
+                items = list(getattr(runs_api.get_simulation_run_results(pid, sm.simulation_id, r.run_id),
+                                     "embedded", None) or [])
+                rid = None
+                for it in items:
+                    d = _ss_item_dict(it)
+                    if d.get("result_id") and "SOLUTION" in str(d.get("category", "")).upper() + str(d.get("type", "")).upper():
+                        rid = d["result_id"]
+                        break
+                if not rid:
+                    row["export"] = "no solution result item"
+                    continue
+                row["result_id"] = rid[:8]
+                try:
+                    ex_api.create_export(pid, sim.CreateExportRequest(format="VTK", result_id=rid))
+                    row["export"] = "OK"
+                except Exception as e:
+                    body = str(getattr(e, "body", "") or "")
+                    m = re.search(r'"code"\s*:\s*"([^"]+)"', body)
+                    row["export"] = (m.group(1) if m else f"{type(e).__name__}: {str(e)[:60]}")
+                    row["http"] = getattr(e, "status", None)
+            except Exception as e:
+                row["export"] = f"error: {type(e).__name__}: {str(e)[:80]}"
+        ok = [r for r in out["rows"] if r.get("export") == "OK"]
+        locked = [r for r in out["rows"] if "locked" in str(r.get("export"))]
+        out["summary"] = {"checked": len(out["rows"]), "export_ok": len(ok), "export_locked": len(locked),
+                          "newest_ok": ok[0]["created_at"] if ok else None,
+                          "oldest_locked": locked[-1]["created_at"] if locked else None}
+    except Exception as e:
+        out["error"] = _ss_format_exception(e)
+    return out
+
+
 def run_simscale_fem(cad_obj, mat_key, force_n=1000, force_dir="z", min_sf=2.0, load_case=None):
     """
     Blocking (call it via asyncio.to_thread). Returns (fem_result_or_None, diag)
@@ -2761,7 +2839,7 @@ def _nvidia_stream_read(req, total_s):
     return content
 
 
-def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None, timeout=None, thinking=None):
+def _nvidia_request_once(messages, temperature=0.15, max_tokens=3000, model=None, timeout=None, thinking=None):
     """Low-level call to NVIDIA's NIM catalog (build.nvidia.com, OpenAI-compatible
     chat completions) — identical shape to _groq_request/_cerebras_request,
     different base URL/key. `model` (or NVIDIA_MODEL) picks which of NVIDIA's
@@ -2878,6 +2956,36 @@ def _deepseek_request(messages, temperature=0.1, max_tokens=6000, model=None, ti
         raise HTTPException(502, f"DeepSeek returned empty content (finish_reason={fin}). "
                                  f"Raw: {json.dumps(data)[:400]}")
     return content
+
+
+_NVIDIA_RETRY_WAITS_S = (6, 15, 30)       # waits before re-asking after a transient NVIDIA error
+_NVIDIA_TRANSIENT_MARKERS = ("overloaded", "temporarily", "service_unavailable", "(503)", "(502)", "(500)",
+                             "\"code\": 503", "\"code\": 502", "bad gateway", "rate limit")
+
+
+def _nvidia_is_transient(e):
+    """Overload / rate-limit style errors that usually clear within seconds. Dead models (410), bad keys (401/403),
+    bad requests (400/404) and our own timeouts are NOT retried here."""
+    if getattr(e, "status_code", None) == 429:
+        return True
+    d = str(getattr(e, "detail", e)).lower()
+    return any(m in d for m in _NVIDIA_TRANSIENT_MARKERS)
+
+
+def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None, timeout=None, thinking=None):
+    """_nvidia_request_once + retries with backoff on transient overload errors (NVIDIA's free endpoint returns
+    'Service temporarily overloaded' now and then; one such blip used to kill a whole design job)."""
+    for attempt in range(len(_NVIDIA_RETRY_WAITS_S) + 1):
+        try:
+            return _nvidia_request_once(messages, temperature=temperature, max_tokens=max_tokens,
+                                        model=model, timeout=timeout, thinking=thinking)
+        except HTTPException as e:
+            if attempt < len(_NVIDIA_RETRY_WAITS_S) and _nvidia_is_transient(e):
+                print(f"[nvidia] transient error ({str(e.detail)[:120]}) - retry {attempt + 1}/"
+                      f"{len(_NVIDIA_RETRY_WAITS_S)} in {_NVIDIA_RETRY_WAITS_S[attempt]}s", flush=True)
+                time.sleep(_NVIDIA_RETRY_WAITS_S[attempt])
+                continue
+            raise
 
 
 def _openrouter_request(messages, temperature=0.15, max_tokens=3000, model=None, timeout=60):
@@ -7546,6 +7654,16 @@ async def simscale_probe(simulation_id: str = "", run_id: str = ""):
     if not SIMSCALE_ENABLED:
         raise HTTPException(503, "SIMSCALE_API_KEY not set")
     return await asyncio.to_thread(_ss_probe, simulation_id, run_id)
+
+
+@app.get("/simscale-export-audit")
+@_sanitize_response
+async def simscale_export_audit(n: int = 10):
+    """Which of the newest lumexa_* SimScale runs can still be exported and which are locked (export-source-locked)?
+    No solving; ~10-60 s. Also reports how many simulations the project holds and basic project info."""
+    if not SIMSCALE_ENABLED:
+        raise HTTPException(503, "SIMSCALE_API_KEY not set")
+    return await asyncio.to_thread(_ss_export_audit, n)
 
 
 @app.post("/refine-from-external-fea")
