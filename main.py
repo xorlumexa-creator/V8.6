@@ -2661,12 +2661,16 @@ def _nvidia_extra_body(model, thinking=None):
     return ex
 
 
+class _NvidiaStreamEmpty(Exception):
+    """The stream ended without any answer text (not an HTTP error) - caller retries once without streaming."""
+
+
 def _nvidia_stream_read(req, total_s):
     """Read an OpenAI-style SSE stream. Only answer text (delta.content) is kept; thinking text is dropped.
     Fails on a stall (no bytes for NVIDIA_STALL_S) or when total_s is exceeded - never on a merely long think."""
     import urllib.request, urllib.error
     t0 = time.time()
-    parts, finish, think_chars = [], None, 0
+    parts, finish, think_chars, n_events, raw_other = [], None, 0, 0, []
     try:
         with urllib.request.urlopen(req, timeout=NVIDIA_STALL_S) as resp:
             for raw in resp:
@@ -2676,6 +2680,8 @@ def _nvidia_stream_read(req, total_s):
                                              f"thinking: {think_chars} chars)")
                 line = raw.decode("utf-8", "ignore").strip()
                 if not line.startswith("data:"):
+                    if line and sum(len(x) for x in raw_other) < 4000:
+                        raw_other.append(line)          # not SSE (e.g. a plain JSON body) - keep for fallback/diagnosis
                     continue
                 chunk = line[5:].strip()
                 if chunk == "[DONE]":
@@ -2684,12 +2690,16 @@ def _nvidia_stream_read(req, total_s):
                     ev = json.loads(chunk)
                 except ValueError:
                     continue
-                ch = (ev.get("choices") or [{}])[0]
+                n_events += 1
+                if isinstance(ev, dict) and ev.get("error") and not ev.get("choices"):
+                    raise HTTPException(502, f"NVIDIA NIM stream error: {json.dumps(ev.get('error'))[:400]}")
+                ch = ((ev.get("choices") or [{}])[0]) if isinstance(ev, dict) else {}
                 delta = ch.get("delta") or {}
                 if isinstance(delta.get("content"), str):
                     parts.append(delta["content"])
-                if delta.get("reasoning_content"):
-                    think_chars += len(delta["reasoning_content"])
+                think = delta.get("reasoning_content") or delta.get("reasoning")
+                if think:
+                    think_chars += len(think)
                 if ch.get("finish_reason"):
                     finish = ch["finish_reason"]
     except HTTPException:
@@ -2707,11 +2717,21 @@ def _nvidia_stream_read(req, total_s):
     except Exception as e:
         raise HTTPException(502, f"NVIDIA NIM stream failed: {type(e).__name__}: {e}")
     content = "".join(parts)
+    if not content.strip() and n_events == 0 and raw_other:      # server ignored stream=true and sent plain JSON
+        try:
+            alt = json.loads("".join(raw_other))
+            alt_c = alt["choices"][0]["message"]["content"]
+            if isinstance(alt_c, str) and alt_c.strip():
+                return alt_c
+        except Exception:
+            pass
     if not content.strip():
-        hint = (" finish_reason=length: it spent the whole token budget thinking - set NVIDIA_REASONING_BUDGET "
-                "or NVIDIA_THINKING=off." if finish == "length" else "")
-        raise HTTPException(502, f"NVIDIA NIM returned empty content (finish_reason={finish}, "
-                                 f"thinking: {think_chars} chars).{hint}")
+        if finish == "length":
+            raise HTTPException(502, f"NVIDIA NIM returned empty content (finish_reason=length, thinking: "
+                                     f"{think_chars} chars). It spent the whole token budget thinking - set "
+                                     "NVIDIA_REASONING_BUDGET or NVIDIA_THINKING=off.")
+        raise _NvidiaStreamEmpty(f"empty stream: events={n_events}, finish={finish}, thinking={think_chars} chars, "
+                                 f"after {time.time() - t0:.0f}s, other_lines={' | '.join(raw_other)[:300]!r}")
     return content
 
 
@@ -2735,21 +2755,26 @@ def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None, tim
         "max_tokens": max_tokens,
     }
     _body.update(_nvidia_extra_body(_mdl, thinking))
-    if NVIDIA_STREAM:
-        _body["stream"] = True
-    payload = json.dumps(_body).encode()
 
-    req = urllib.request.Request(
-        NVIDIA_API_URL, data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {NVIDIA_API_KEY}",
-            "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
-            "Accept": "text/event-stream" if NVIDIA_STREAM else "application/json",
-        }
-    )
+    def _mk_req(stream):
+        bd = dict(_body)
+        if stream:
+            bd["stream"] = True
+        return urllib.request.Request(
+            NVIDIA_API_URL, data=json.dumps(bd).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {NVIDIA_API_KEY}",
+                "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
+                "Accept": "text/event-stream" if stream else "application/json",
+            })
+
     if NVIDIA_STREAM:
-        return _nvidia_stream_read(req, float(timeout or NVIDIA_TIMEOUT_S))
+        try:
+            return _nvidia_stream_read(_mk_req(True), float(timeout or NVIDIA_TIMEOUT_S))
+        except _NvidiaStreamEmpty as e:
+            print(f"[nvidia] {e} - retrying once without streaming", flush=True)
+    req = _mk_req(False)
     try:
         with urllib.request.urlopen(req, timeout=(timeout or NVIDIA_TIMEOUT_S)) as resp:
             data = json.loads(resp.read())
