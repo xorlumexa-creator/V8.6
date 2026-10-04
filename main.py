@@ -1016,6 +1016,7 @@ def _ss_parse_blob(data, base, info, found, hop=0):
             found["disp"] = f
 
 
+_SS_LOCK_BACKOFF_S = (8, 15, 25, 40, 60)     # waits (s) before re-asking when SimScale answers export-source-locked
 _SS_NOISE_PARAMS = ("self", "kwargs", "async_req", "_return_http_data_only", "_preload_content",
                     "_request_timeout")
 
@@ -1120,15 +1121,26 @@ def _ss_run_export(sim, api_client, pid, sid, rid, result_id, formats, info, tmp
         for res_id in res_ids:
             rec = {"format": fmt, "result_id": res_id}
             exp["tried"].append(rec)
-            try:
-                kwargs = {k: v for k, v in (("format", fmt), ("result_id", res_id)) if k in req_fields}
-                req = req_cls(**kwargs)
-                resp = api.create_export(**build_kwargs(api.create_export, **{body_params[0]: req}))
-            except Exception as e:
-                rec["error"] = f"{type(e).__name__}: {str(e)[:80]}"
-                body = getattr(e, "body", None)
-                if body:
-                    rec["error_body"] = str(body)[:400]
+            resp = None
+            for attempt in range(len(_SS_LOCK_BACKOFF_S) + 1):
+                try:
+                    kwargs = {k: v for k, v in (("format", fmt), ("result_id", res_id)) if k in req_fields}
+                    req = req_cls(**kwargs)
+                    resp = api.create_export(**build_kwargs(api.create_export, **{body_params[0]: req}))
+                    break
+                except Exception as e:
+                    body = getattr(e, "body", None)
+                    if "export-source-locked" in f"{body} {e}" and attempt < len(_SS_LOCK_BACKOFF_S):
+                        # SimScale says the result is locked right now (seen once, right after a run finished);
+                        # waiting and asking again is the only sensible move
+                        rec["locked_retries"] = attempt + 1
+                        time.sleep(_SS_LOCK_BACKOFF_S[attempt])
+                        continue
+                    rec["error"] = f"{type(e).__name__}: {str(e)[:80]}"
+                    if body:
+                        rec["error_body"] = str(body)[:400]
+                    break
+            if resp is None:
                 continue
             rd = _ss_item_dict(resp)
             rec["created"] = _ss_scrub(rd)
