@@ -156,6 +156,25 @@ def part_bbox(descs):
             [max(d["bbox_max"][k] for d in descs) for k in range(3)])
 
 
+def min_thickness(descs):
+    """Smallest wall thickness we can see: the gap between two parallel, opposite-facing flat faces that overlap.
+    Used to size the FEM mesh (at least ~2 element layers through it). None when no such pair exists."""
+    pl = [d for d in descs if d["geom"] == "PLANE" and d["normal"]]
+    best = None
+    for i, a in enumerate(pl):
+        for b in pl[i + 1:]:
+            if sum(x * y for x, y in zip(a["normal"], b["normal"])) > -0.95:
+                continue
+            inplane = [k for k in range(3) if abs(a["normal"][k]) < 0.5]
+            if not all(min(a["bbox_max"][k], b["bbox_max"][k]) - max(a["bbox_min"][k], b["bbox_min"][k]) > 0.5
+                       for k in inplane):
+                continue
+            t = abs(sum(a["normal"][k] * (b["center"][k] - a["center"][k]) for k in range(3)))
+            if t > 0.3 and (best is None or t < best):
+                best = t
+    return best
+
+
 def face_summary(descs, limit=24):
     """Compact description of the faces so the LLM can write better selectors (shown on selector errors)."""
     lo, hi = part_bbox(descs)
@@ -519,12 +538,12 @@ def evaluate(case, fem, diag, default_min_sf=2.0):
                           "loads": [{"id": l["id"], "faces": len(l["face_idx"]),
                                      "force_n": [round(v, 2) for v in l["force_xyz"]]} for l in case["loads"]]}}
     if fem is None:
-        return {**base, "status": "NOT_RUN", "solver": "simscale",
+        return {**base, "status": "NOT_RUN", "solver": (diag or {}).get("solver", "simscale"),
                 "reason": (diag or {}).get("reason"), "failed_stage": (diag or {}).get("failed_stage"),
                 "design_related": bool((diag or {}).get("design_related")),
                 "hint": "If design_related is true the geometry itself was rejected; otherwise it is an "
                         "infrastructure problem and the design is not to blame."}
-    ss = fem.get("simscale") or {}
+    ss = fem.get("solver_meta") or fem.get("simscale") or {}
     vm = (fem.get("stress") or {}).get("von_mises_mpa")
     sf, defl = fem.get("safety_factor"), fem.get("deflection_mm")
     warnings = []
@@ -546,12 +565,12 @@ def evaluate(case, fem, diag, default_min_sf=2.0):
         rows.append({"name": "von_mises_mpa", "required": f"<= {crit['max_von_mises_mpa']}", "actual": vm,
                      "pass": vm <= crit["max_von_mises_mpa"]})
     status = "INVALID" if warnings else ("PASS" if rows and all(r["pass"] for r in rows) else "FAIL")
-    return {**base, "status": status, "solver": "simscale",
+    return {**base, "status": status, "solver": fem.get("solver", "simscale"),
             "metrics": {"von_mises_mpa": vm, "safety_factor": sf, "max_deflection_mm": defl,
                         "hotspot_mm": (fem.get("critical_section") or {}).get("hotspot_xyz_mm"),
                         "hot_zone_mm": (fem.get("critical_section") or {}).get("hot_zone_mm")},
             "criteria": rows, "warnings": warnings,
-            "mesh": {"nodes": (ss.get("field_diag") or {}).get("n_points") if isinstance(ss.get("field_diag"), dict) else None}}
+            "mesh": {"nodes": (ss.get("mesh") or {}).get("nodes") or ((ss.get("field_diag") or {}).get("n_points") if isinstance(ss.get("field_diag"), dict) else None)}}
 
 
 def overall(results):

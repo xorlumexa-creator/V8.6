@@ -6029,7 +6029,7 @@ def _apply_plan_to_fea(fea, tp_results):
     if m.get("max_deflection_mm") is not None:
         fea["deflection_mm"] = m["max_deflection_mm"]
     fea["status"] = worst["status"]
-    fea["method"] = "test_plan_simscale"
+    fea["method"] = "test_plan_" + str(worst.get("solver") or "simscale")
     fea["governing_test"] = worst["test_id"]
     return fea
 
@@ -7498,6 +7498,176 @@ async def simscale_selftest(force_n:float=100.0, material:str=""):
     return out
 
 
+# ── CalculiX solver service (see analysis_service/): unlimited runs, no SimScale quota ─────────────────────────────
+CCX_SERVICE_URL = os.environ.get("CCX_SERVICE_URL", "").strip().rstrip("/")
+CCX_API_KEY = os.environ.get("CCX_API_KEY", "").strip()
+CCX_TIMEOUT_S = float(os.environ.get("CCX_TIMEOUT_S", "900"))
+FEA_SOLVER = os.environ.get("FEA_SOLVER", "auto").strip().lower()     # auto | calculix | simscale
+
+
+def _multipart(fields, files):
+    b = "----lumexa" + uuid.uuid4().hex
+    parts = []
+    for k, v in fields.items():
+        parts.append((f'--{b}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n').encode() + str(v).encode() + b"\r\n")
+    for k, (fn, data) in files.items():
+        parts.append((f'--{b}\r\nContent-Disposition: form-data; name="{k}"; filename="{fn}"\r\n'
+                      "Content-Type: application/octet-stream\r\n\r\n").encode() + data + b"\r\n")
+    parts.append(f"--{b}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={b}"
+
+
+def _ccx_call(path, fields=None, files=None, timeout=60):
+    """GET (no body) or multipart POST to the solver service; returns the parsed JSON or raises RuntimeError."""
+    import urllib.request, urllib.error
+    headers = {"X-API-KEY": CCX_API_KEY, "ngrok-skip-browser-warning": "1", "User-Agent": "LumexaBackend/1.0"}
+    data = None
+    if fields is not None or files is not None:
+        data, headers["Content-Type"] = _multipart(fields or {}, files or {})
+    req = urllib.request.Request(CCX_SERVICE_URL + path, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"solver service HTTP {e.code}: {e.read().decode(errors='ignore')[:300]}")
+    except Exception as e:
+        raise RuntimeError(f"solver service unreachable ({type(e).__name__}: {str(e)[:160]})")
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise RuntimeError(f"solver service returned non-JSON: {raw[:200]!r}")
+
+
+def run_ccx_service_fem(cad_obj, mat_key, load_case, descs, min_sf=2.0):
+    """Blocking. Same contract as run_simscale_fem(load_case=...): returns (fem_or_None, diag), never raises."""
+    import shutil
+    t0 = time.time()
+    diag = {"attempted": True, "solver": "calculix", "stages": [], "reason": None}
+
+    def mark(stage, **kw):
+        diag["stages"].append({"stage": stage, "t_s": round(time.time() - t0, 1), **kw})
+    try:
+        if not CCX_SERVICE_URL:
+            diag.update(attempted=False, reason="CCX_SERVICE_URL not set")
+            return None, diag
+        if cad_obj is None:
+            diag.update(attempted=False, reason="no B-rep available (analysis of an uploaded mesh)")
+            return None, diag
+        mark("wake")                                   # a sleeping service / tunnel needs up to ~1-2 min
+        last = None
+        for _ in range(12):
+            try:
+                h = _ccx_call("/health", timeout=40)
+                last = None
+                break
+            except RuntimeError as e:
+                last = e
+                time.sleep(8)
+        if last is not None:
+            diag.update(reason=str(last), failed_stage="wake", design_related=False)
+            return None, diag
+        if not h.get("ok"):
+            diag.update(reason=f"solver service is up but not ready: {json.dumps(h)[:300]}", failed_stage="wake",
+                        design_related=False)
+            return None, diag
+        mark("export_step")
+        tmpdir = tempfile.mkdtemp(prefix="ccx_")
+        try:
+            path = os.path.join(tmpdir, "part.step")
+            _b3d_write_step(cad_obj, path)
+            step_bytes = open(path, "rb").read()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        mat = MATERIALS.get(mat_key, MATERIALS["aluminum_6061"])
+
+        def fdesc(i):
+            d = descs[i]
+            return {"center": [float(v) for v in d["center"]], "area": float(d["area"]),
+                    "bbox_min": [float(v) for v in d["bbox_min"]], "bbox_max": [float(v) for v in d["bbox_max"]],
+                    "geom": d["geom"]}
+        lo, hi = TP.part_bbox(descs)
+        case = {"material": {"E_mpa": float(mat["youngs_modulus_gpa"]) * 1000.0, "nu": float(mat["poissons_ratio"]),
+                             "name": mat_key},
+                "bbox_mm": {"min": [float(v) for v in lo], "max": [float(v) for v in hi]},
+                "min_thickness_mm": TP.min_thickness(descs),
+                "faces": {"fixed": [fdesc(i) for i in load_case["fixed_idx"]],
+                          "loads": [{"id": l["id"], "force_xyz": [float(v) for v in l["force_xyz"]],
+                                     "faces": [fdesc(i) for i in l["face_idx"]]} for l in load_case["loads"]]}}
+        mark("solve")
+        try:
+            resp = _ccx_call("/solve", fields={"case": json.dumps(case)}, files={"step": ("part.step", step_bytes)},
+                             timeout=CCX_TIMEOUT_S)
+        except RuntimeError as e:
+            diag.update(reason=str(e), failed_stage="solve", design_related=False)
+            return None, diag
+        if not resp.get("ok"):
+            diag.update(reason=f"CalculiX service [{resp.get('stage')}]: {resp.get('reason')}",
+                        failed_stage=resp.get("stage"), design_related=bool(resp.get("design_related")))
+            return None, diag
+        res = resp["result"]
+        mark("results", **{k: v for k, v in (resp.get("timings") or {}).items()})
+        vm = float(res["vm_mpa"])
+        Sy = float(mat["yield_strength_mpa"])
+        sfv = Sy / max(vm, 1e-6)
+        bb = cad_obj.bounding_box()
+        exts = [bb.size.X, bb.size.Y, bb.size.Z]
+        axis = int(np.argmax(exts))
+        hs = [round(float(c), 2) for c in res["hotspot_xyz_mm"]]
+        z = res.get("hot_zone_mm")
+        zone = ({"min": [round(float(c), 1) for c in z["min"]], "max": [round(float(c), 1) for c in z["max"]],
+                 "n_nodes": z["n_nodes"], "n_total": z["n_total"]} if z else None)
+        bc = res.get("bc_check") or {}
+        fem = {
+            "method": "calculix_static_fem", "solver": "calculix",
+            "note": (f"CalculiX linear-static FEM (10-node tets). Load case from test plan '{load_case['id']}': "
+                     f"{len(load_case['fixed_idx'])} fixed face(s), {len(load_case['loads'])} load(s). Peak stress at a "
+                     "fixed/loaded face edge can include a local singularity -- judge by where the hotspot is, not "
+                     "just its magnitude."),
+            "stress": {"von_mises_mpa": round(vm, 3), "axial_mpa": 0.0, "bending_mpa": 0.0, "shear_mpa": 0.0,
+                       "stress_concentration_kt": 1.0},
+            "deflection_mm": round(float(res.get("disp_mm") or 0.0), 4),
+            "safety_factor": round(sfv, 3),
+            "critical_section": {"axis": "xyz"[axis], "position_mm": hs[axis],
+                                 "strengthen_factor_approx": round(min_sf / sfv, 2) if sfv > 0 else None,
+                                 "hotspot_xyz_mm": hs, "hot_zone_mm": zone},
+            "numerically_suspect": bool(vm <= 0 or vm > 50 * Sy or (bc and not bc.get("ok"))),
+            "solver_meta": {"bc_check": bc, "mesh": res.get("mesh"), "timings": resp.get("timings"),
+                            "versions": res.get("versions")},
+            "inputs": {"load_case": load_case["id"], "forces_n": [l["force_xyz"] for l in load_case["loads"]]},
+        }
+        if bc and not bc.get("ok"):
+            fem["note"] += " WARNING: sanity check FAILED (" + str(bc.get("reason")) + ") -- do not trust these numbers."
+        mark("done")
+        diag["elapsed_s"] = round(time.time() - t0, 1)
+        return fem, diag
+    except Exception as e:
+        diag.update(reason=f"{type(e).__name__}: {e}", failed_stage="adapter", design_related=False)
+        diag["elapsed_s"] = round(time.time() - t0, 1)
+        return None, diag
+
+
+def run_plan_fem(cad_obj, case, default_min_sf, descs):
+    """Pick the solver for one test: CalculiX service first (unlimited), SimScale as the fallback when the service
+    is unreachable. FEA_SOLVER=calculix|simscale pins one of them."""
+    min_sf = case["criteria"].get("min_safety_factor", default_min_sf)
+    ccx_diag = None
+    if CCX_SERVICE_URL and FEA_SOLVER in ("auto", "calculix"):
+        fem, diag = run_ccx_service_fem(cad_obj, case["material"], case, descs, min_sf)
+        if fem is not None or diag.get("design_related") or FEA_SOLVER == "calculix":
+            return fem, diag
+        ccx_diag = diag
+    if SIMSCALE_ENABLED and FEA_SOLVER in ("auto", "simscale"):
+        fem, diag = run_simscale_fem(cad_obj, case["material"], 0, "z", min_sf, case)
+        diag["solver"] = "simscale"
+        if fem is None and ccx_diag:
+            diag["reason"] = f"{diag.get('reason')} (the CalculiX service also failed: {ccx_diag.get('reason')})"
+        return fem, diag
+    if ccx_diag:
+        return None, ccx_diag
+    return None, {"attempted": False, "solver": "none",
+                  "reason": "no FEA solver configured: set CCX_SERVICE_URL (CalculiX service) or SIMSCALE_API_KEY"}
+
+
 async def run_plan_tests(cad_obj, plan, default_min_sf=2.0, dry_run=False):
     """Run an LLM-written test plan against a build123d solid. Faces are chosen geometrically from the plan;
     nothing (forces, directions, faces) is passed in by hand. dry_run only resolves the selectors."""
@@ -7519,11 +7689,7 @@ async def run_plan_tests(cad_obj, plan, default_min_sf=2.0, dry_run=False):
                             "loads": [{"id": l["id"], "faces": l["face_idx"],
                                        "force_n": [round(v, 2) for v in l["force_xyz"]]} for l in case["loads"]]})
             continue
-        if not SIMSCALE_ENABLED:
-            results.append(TP.evaluate(case, None, {"reason": "SIMSCALE_API_KEY not set"}, default_min_sf))
-            continue
-        fem, diag = await asyncio.to_thread(run_simscale_fem, cad_obj, case["material"], 0, "z",
-                                            case["criteria"].get("min_safety_factor", default_min_sf), case)
+        fem, diag = await asyncio.to_thread(run_plan_fem, cad_obj, case, default_min_sf, descs)
         r = TP.evaluate(case, fem, diag, default_min_sf)
         r["elapsed_s"] = diag.get("elapsed_s")
         _m = r.get("metrics") or {}
@@ -7654,6 +7820,30 @@ async def simscale_probe(simulation_id: str = "", run_id: str = ""):
     if not SIMSCALE_ENABLED:
         raise HTTPException(503, "SIMSCALE_API_KEY not set")
     return await asyncio.to_thread(_ss_probe, simulation_id, run_id)
+
+
+@app.get("/ccx-health")
+@_sanitize_response
+async def ccx_health():
+    """Is the CalculiX solver service reachable, and are gmsh + ccx installed there?"""
+    if not CCX_SERVICE_URL:
+        raise HTTPException(503, "CCX_SERVICE_URL not set")
+    try:
+        return await asyncio.to_thread(_ccx_call, "/health", None, None, 90)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+
+
+@app.get("/ccx-selftest")
+@_sanitize_response
+async def ccx_selftest():
+    """Cantilever solved by the CalculiX service and compared with beam theory (deflection ratio ~1, stress ~1-1.3)."""
+    if not CCX_SERVICE_URL:
+        raise HTTPException(503, "CCX_SERVICE_URL not set")
+    try:
+        return await asyncio.to_thread(_ccx_call, "/selftest", None, None, CCX_TIMEOUT_S)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
 
 
 @app.get("/simscale-export-audit")
