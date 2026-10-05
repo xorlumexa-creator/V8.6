@@ -13,16 +13,38 @@ import time
 
 import numpy as np
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 
 import fem_core as FC
 
 app = FastAPI(title="Lumexa CalculiX solver")
+
+
+@app.exception_handler(Exception)
+async def _crash_handler(request, exc):
+    """Never answer a bare 'Internal Server Error': return the error and the tail of the traceback as JSON, so a
+    problem can be read straight from curl without digging through the server's terminal."""
+    import traceback
+    tail = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    return JSONResponse(status_code=500, content={
+        "ok": False, "stage": "crash", "reason": f"{type(exc).__name__}: {str(exc)[:300]}",
+        "trace_tail": "".join(tail)[-1800:]})
 CCX_BIN = os.environ.get("CCX_BIN", "ccx")
 CCX_THREADS = os.environ.get("CCX_THREADS", "2")
 CCX_TIMEOUT_S = float(os.environ.get("CCX_TIMEOUT_S", "600"))
 MAX_NODES = int(os.environ.get("MAX_NODES", "12000"))
 API_KEY = os.environ.get("CCX_API_KEY", "").strip()
 _lock = threading.Lock()          # one solve at a time: keeps memory predictable on small machines
+
+
+def _gmsh_init(gmsh):
+    """FastAPI runs these endpoints in worker threads, but gmsh.initialize() installs a Ctrl-C handler by default,
+    which Python only allows in the main thread ("signal only works in main thread"). interruptible=False skips it;
+    older gmsh versions without that argument get the plain call."""
+    try:
+        gmsh.initialize(interruptible=False)
+    except TypeError:
+        gmsh.initialize()
 
 
 class SolveError(Exception):
@@ -62,7 +84,7 @@ def solve_case(step_path, case, workdir, gmsh=None):
     mat = case["material"]
     exp_lo, exp_hi = np.asarray(case["bbox_mm"]["min"], float), np.asarray(case["bbox_mm"]["max"], float)
     exp_ext = float(np.linalg.norm(exp_hi - exp_lo))
-    gmsh.initialize()
+    _gmsh_init(gmsh)
     try:
         gmsh.option.setNumber("General.Terminal", 0)
         gmsh.model.add("part")
@@ -246,7 +268,7 @@ def selftest(x_api_key: str = Header(default="")):
     gmsh = _gmsh()
     work = tempfile.mkdtemp(prefix="ccx_self_")
     try:
-        gmsh.initialize()
+        _gmsh_init(gmsh)
         try:
             gmsh.option.setNumber("General.Terminal", 0)
             gmsh.model.add("box")
