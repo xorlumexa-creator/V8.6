@@ -52,18 +52,24 @@ def write_inp(path, node_ids, coords, elem_ids, elem_conn_ccx, fixed_nodes, forc
     lines.append("*ELEMENT, TYPE=C3D10, ELSET=EALL")
     for eid, conn in zip(elem_ids, elem_conn_ccx):
         lines.append(f"{int(eid)}, " + ", ".join(str(int(v)) for v in conn))
+    fx_nodes = [int(n) for n in sorted(fixed_nodes) if int(n) in used]
+    if fx_nodes:                                           # node set of the fixed faces (for the reaction totals)
+        lines.append("*NSET, NSET=NFIX")
+        for i in range(0, len(fx_nodes), 10):
+            lines.append(", ".join(str(n) for n in fx_nodes[i:i + 10]))
     lines += ["*MATERIAL, NAME=MAT", "*ELASTIC", f"{E_mpa:.9g}, {nu:.6g}",
               "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT", "*BOUNDARY"]
-    for n in sorted(fixed_nodes):
-        if int(n) in used:
-            lines.append(f"{int(n)}, 1, 3")
+    for n in fx_nodes:
+        lines.append(f"{n}, 1, 3")
     lines += ["*STEP", "*STATIC", "*CLOAD"]
     for n in sorted(forces):
         if int(n) in used:
             for dof, f in enumerate(forces[n], start=1):
                 if abs(f) > 0.0:
                     lines.append(f"{int(n)}, {dof}, {f:.9g}")
-    lines += ["*NODE FILE", "U, RF", "*EL FILE", "S", "*END STEP"]     # RF: reaction forces -> equilibrium check
+    if fx_nodes:                                           # total reaction of the fixed set -> equilibrium check (.dat)
+        lines += ["*NODE PRINT, NSET=NFIX, TOTALS=ONLY", "RF"]
+    lines += ["*NODE FILE", "U, RF", "*EL FILE", "S", "*END STEP"]
     with open(path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
 
@@ -144,12 +150,33 @@ def bc_sanity(disp, fixed_nodes, load_nodes_by_load, force_by_load, tol_fixed=0.
     return out
 
 
-def equilibrium(reactions, force_by_load):
+def parse_dat_totals(text):
+    """Total reaction force (fx, fy, fz) of the fixed node set from CalculiX's .dat file (*NODE PRINT, TOTALS=ONLY).
+    The value sits on the first numeric line after 'total force (fx,fy,fz) ...'. The last one in the file wins."""
+    lines = text.splitlines()
+    found = None
+    for i, ln in enumerate(lines):
+        if "total force" in ln.lower():
+            for nxt in lines[i + 1:i + 5]:
+                parts = nxt.split()
+                if len(parts) >= 3:
+                    try:
+                        found = tuple(float(x) for x in parts[:3])
+                        break
+                    except ValueError:
+                        continue
+    return found
+
+
+def equilibrium(reactions, force_by_load, total=None):
     """Sum of the reaction forces must cancel the applied loads. A big mismatch means a load or a constraint was
     not applied the way we think (the strongest single check there is for an FE setup)."""
-    if not reactions:
+    if total is not None:
+        R = np.asarray(total, float)
+    elif reactions:
+        R = np.sum(np.array(list(reactions.values()), float), axis=0)
+    else:
         return None
-    R = np.sum(np.array(list(reactions.values()), float), axis=0)
     F = np.sum([np.asarray(f, float) for f in force_by_load.values()], axis=0)
     nf = float(np.linalg.norm(F))
     if nf <= 0:

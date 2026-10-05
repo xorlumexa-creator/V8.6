@@ -207,8 +207,18 @@ def solve_case(step_path, case, workdir, gmsh=None):
     bc = FC.bc_sanity(res["DISP"], fixed_nodes, load_nodes, force_by_load)
     bc["face_matching"] = {"fixed": fixed_m, "loads": load_m}
     bc["applied_force_n"] = total
-    eq = FC.equilibrium(res.get("FORC"), force_by_load)
+    dat_total = None
+    dat_path = os.path.join(workdir, "job.dat")
+    if os.path.exists(dat_path):
+        dat_total = FC.parse_dat_totals(open(dat_path, errors="ignore").read())
+    eq = FC.equilibrium(res.get("FORC"), force_by_load, total=dat_total)
     if eq is not None:
+        eq["source"] = "dat_totals" if dat_total is not None else "frd_forc"
+        rf = res.get("FORC") or {}
+        if rf:                                              # what the .frd RF block says (diagnostic only)
+            arr = np.array(list(rf.values()), float)
+            eq["frd_forc"] = {"nodes": int(len(rf)), "sum": [round(float(v), 3) for v in arr.sum(axis=0)],
+                              "max_abs": [round(float(v), 3) for v in np.abs(arr).max(axis=0)]}
         bc["equilibrium"] = eq
         if eq["error_pct"] > 3.0:
             bc["ok"] = False
