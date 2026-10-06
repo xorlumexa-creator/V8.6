@@ -3273,6 +3273,76 @@ def _claude_request(system, messages, temperature=0.15, max_tokens=3000, model=N
     except (KeyError, TypeError):
         raise HTTPException(502, f"Unexpected Claude API response shape: {json.dumps(data)[:500]}")
 
+_PY_LINE_START = re.compile(r"^\s*(?:from\s+\w|import\s+\w|#|@|def\s|class\s|[A-Za-z_][A-Za-z0-9_\.]*\s*(?:=|\())")
+
+
+def _py_parses(src):
+    try:
+        ast.parse(src)
+        return True
+    except Exception:
+        return False
+
+
+def _looks_like_prose(line):
+    """A line of English in the middle of a script (chain-of-thought that leaked into the answer)."""
+    st = line.strip()
+    if not st:
+        return False
+    if re.match(r"^\d+[\.\)]\s", st) or st.startswith(("- ", "* ", "> ")):
+        return True
+    words = st.split()
+    code_marks = sum(st.count(c) for c in "=()[]{}:")
+    return len(words) >= 7 and code_marks <= 1 and st[-1] in ".:;!?,"
+
+
+def _clean_python_script(text: str) -> str:
+    """Turn an LLM reply into a Python script even when it carries prose: prefers a fenced block that parses, handles
+    a fence that was never closed (reply cut off), drops leading chatter, then deletes prose lines that break the
+    parse (reasoning that leaked into the answer), and as a last resort cuts the script where the prose starts."""
+    t = (text or "").strip()
+    fenced = re.findall(r"```[a-zA-Z0-9_+-]*\n(.*?)```", t, flags=re.S)
+    for c in sorted(fenced, key=len, reverse=True):
+        if _py_parses(c.strip()):
+            return c.strip()
+    if fenced:
+        base = max(fenced, key=len).strip()
+    elif "```" in t:
+        last_open = t.rfind("```")
+        base = re.sub(r"^[a-zA-Z0-9_+-]*\n", "", t[last_open + 3:]).strip()
+        if len(base) < 40:                                  # that fence was a closing one: use the text before it
+            base = re.sub(r"^```[a-zA-Z0-9_+-]*\n", "", t[:last_open].strip()).strip()
+    else:
+        base = t
+    lines = base.splitlines()
+    for i, ln in enumerate(lines):                          # drop chatter before the first line of code
+        if _PY_LINE_START.match(ln) and not _looks_like_prose(ln):
+            lines = lines[i:]
+            break
+    cand = "\n".join(lines)
+    if _py_parses(cand):
+        return cand
+    work = list(lines)
+    for _ in range(60):                                     # delete the offending prose lines, one by one
+        try:
+            ast.parse("\n".join(work))
+            return "\n".join(work)
+        except SyntaxError as e:
+            n = (e.lineno or 0) - 1
+            if 0 <= n < len(work) and _looks_like_prose(work[n]):
+                del work[n]
+                continue
+            break
+        except Exception:
+            break
+    for i, ln in enumerate(lines):                          # last resort: cut where the prose starts
+        if i >= 3 and _looks_like_prose(ln):
+            head = "\n".join(lines[:i])
+            if _py_parses(head):
+                return head
+    return _clean_code_block(text, ("python",))
+
+
 def _clean_code_block(text: str, lang_hints=("python","json")) -> str:
     t = text.strip()
     # If the model wrapped the code in prose, take the largest fenced block instead.
@@ -4043,7 +4113,7 @@ async def gemini_generate_script(prompt: str, previous_script: Optional[str] = N
             temperature=0.15, max_tokens=GEN_MAX_TOKENS
         )
 
-    return _clean_code_block(text, ("python",))
+    return _clean_python_script(text)
 
 async def gemini_vision_estimate(img_b64: str, mime_type: str, description: str) -> dict:
     """Estimate part parameters from an image via whichever provider AI_PROVIDER selects."""
@@ -6230,10 +6300,13 @@ def _plan_feedback_lines(result):
             out.extend("    " + ln for ln in loc["text"].split("\n"))
         if st == "FAIL":
             out.extend(_plan_targets(r))
-            out.append("    FIX: strengthen the part where the hotspot is (thicker section, fillets, ribs, larger radius at "
+            out.append("    FIX: strengthen the part where the hotspot is (fillets, ribs/gussets, local thickening, larger radius at "
                        "the stress raiser) WITHOUT moving or removing the fixed and loaded faces - the plan selects them "
                        "by position/normal and must still find them. Change the region named above; leave parts that "
-                       "are not the problem alone.")
+                       "are not the problem alone. KEEP every dimension the user stated (lengths, widths, thickness, "
+                       "hole sizes and positions) exactly as requested: strengthen only by adding material inside "
+                       "that envelope (fillets, ribs/gussets, local thickening around the hotspot), never by "
+                       "changing a stated dimension - the design review checks the part against the request.")
         elif st == "INVALID":
             out.append("    The numbers are not trustworthy (boundary-condition check failed); do not redesign on them.")
         elif st == "NOT_RUN":
@@ -7086,7 +7159,14 @@ async def generate_validate_refine(
     # always record *why* the loop stopped in result["refinement"]["stopped_reason"].
     RATE_LIMIT_MAX_TOTAL_WAIT=90.0  # seconds, kept under typical client timeouts
 
-    for i in range(1, max_iterations+1):
+    # Rounds that only produced a broken script / a rejected design (no analysis) must not eat the refinement budget:
+    # a near-pass in round 2 was once lost because rounds 3-4 were spent on syntax errors. Up to
+    # LOOP_EXTRA_ATTEMPTS additional attempts are allowed on top of max_iterations analysed rounds.
+    extra_attempts=int(os.environ.get("LOOP_EXTRA_ATTEMPTS","3") or 0)
+    analysed_rounds=0
+    for i in range(1, max_iterations+extra_attempts+1):
+        if analysed_rounds>=max_iterations:
+            break
         # 1) Generate or refine the script
         rate_limit_wait_remaining=RATE_LIMIT_MAX_TOTAL_WAIT
         gen_failed=False
@@ -7214,6 +7294,7 @@ async def generate_validate_refine(
                "metrics":quality["metrics"],"feature_verification":_fv_brief(fv),
                "geometry_inspection":_gi_brief(gi),**({"review":review} if review else {})}
         iterations.append(entry)
+        analysed_rounds+=1
 
         candidate={"result":result,"quality":quality,"script":script,
                    "stl_b64":stl_b64,"iteration":i,"fv":fv,"gi":gi,"review":review}
@@ -7240,7 +7321,7 @@ async def generate_validate_refine(
         feedback=summarize_analysis_for_refinement(result, quality)+"\n\n"+geometry_report_text(gi)
 
     if stopped_reason is None:
-        stopped_reason="max_iterations_reached"
+        stopped_reason="max_iterations_reached" if analysed_rounds>=max_iterations else "too_many_failed_attempts"
 
     if best is None:
         # Every iteration failed to even produce geometry — surface the last error.
@@ -7259,6 +7340,7 @@ async def generate_validate_refine(
     result["generation_method"]="llm_build123d_v8_refined"
     result["refinement"]={
         "iterations_used":len(iterations),
+        "analysed_rounds":analysed_rounds,
         "max_iterations":max_iterations,
         "best_iteration":best["iteration"],
         "passed_quality_gate":best["quality"]["passed"],
