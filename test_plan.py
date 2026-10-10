@@ -18,7 +18,30 @@ import math
 import re
 
 PLAN_VERSION = 1
-SUPPORTED_TESTS = ("static_stress",)
+SUPPORTED_TESTS = ("static_stress", "buckling", "thermal_stress")
+
+# Strength retention vs temperature, as a fraction of the room-temperature yield strength. APPROXIMATE handbook trends
+# for typical heat-treated conditions - NOT supplier data. Materials without an entry cannot be used in thermal tests.
+HOT_YIELD = {
+    "aluminum_6061":  [(20, 1.00), (100, 0.95), (150, 0.85), (200, 0.50), (250, 0.20), (300, 0.10)],
+    "aluminum_7075":  [(20, 1.00), (100, 0.93), (150, 0.70), (200, 0.35), (250, 0.12), (300, 0.08)],
+    "steel_4340":     [(20, 1.00), (200, 0.95), (300, 0.90), (400, 0.85), (500, 0.70), (600, 0.40)],
+    "titanium_6al4v": [(20, 1.00), (100, 0.90), (200, 0.80), (300, 0.72), (400, 0.66), (500, 0.60)],
+    "inconel_718":    [(20, 1.00), (200, 0.93), (400, 0.88), (600, 0.85), (650, 0.83), (700, 0.60)],
+}
+
+
+def yield_fraction(mat, t_c):
+    """(fraction of room-temperature yield at t_c, inside_data_range). Linear interpolation between the knots."""
+    pts = HOT_YIELD.get(mat)
+    if not pts or t_c is None:
+        return 1.0, False
+    if t_c <= pts[0][0]:
+        return pts[0][1], True
+    for (t0, f0), (t1, f1) in zip(pts, pts[1:]):
+        if t_c <= t1:
+            return f0 + (f1 - f0) * (t_c - t0) / (t1 - t0), True
+    return pts[-1][1], False
 SIDES = ("min_x", "max_x", "min_y", "max_y", "min_z", "max_z")
 DIRS = {"+x": (1, 0, 0), "-x": (-1, 0, 0), "+y": (0, 1, 0), "-y": (0, -1, 0), "+z": (0, 0, 1), "-z": (0, 0, -1)}
 SELECTOR_KEYS = ("at", "normal", "shape", "diameter_mm", "area_mm2", "inside_box_mm", "pick", "count")
@@ -65,10 +88,20 @@ def schema_prompt(materials):
         '  fixed underside is far too stiff and hides real stress. Fix a plane only for parts that are clamped, glued or\n'
         '  welded flat, or have no holes there, and say so in the rationale.\n'
         f"Supported test types: {', '.join(SUPPORTED_TESTS)}.  Constraint: type \"fixed\".\n"
+        '  "static_stress": strength under the loads (constraints + loads).\n'
+        '  "buckling": for slender members in COMPRESSION (columns, struts, long thin ribs, thin walls). Same constraints and\n'
+        '     loads as static_stress; the load you give is the reference load and the result is a buckling factor = critical\n'
+        '     load / reference load. Criterion "min_buckling_factor" (default 3). Use the real compressive load.\n'
+        '  "thermal_stress": ONLY when the request states temperatures or a heat input. Fields: "temperatures": [{"id","faces",\n'
+        '     "temperature_c"}] (at least one), optional "heat_inputs": [{"id","faces","power_w"}] (heat INTO the part, W),\n'
+        '     optional "reference_temperature_c" (stress-free temperature, default 20), "constraints" (required: the part must\n'
+        '     be held), optional mechanical "loads". Use ONLY temperatures and powers stated in the request - never invent\n'
+        f"     them. Criteria: \"min_safety_factor\" (judged against the strength at the hot spot's temperature), \"max_temperature_c\",\n"
+        f"     \"max_deflection_mm\". Materials with hot-strength data: {', '.join(sorted(HOT_YIELD))}.\n"
         'Loads: type "force" with either "vector_n":[fx,fy,fz] or "force_n" + "direction" (+x..-z),\n'
         '       or type "pressure" with "pressure_mpa" on planar faces (acts into the part).\n'
         f"Materials: {', '.join(sorted(materials))}.\n"
-        'Criteria (all optional): "min_safety_factor", "max_deflection_mm", "max_von_mises_mpa".\n'
+        'Criteria (all optional): "min_safety_factor", "max_deflection_mm", "max_von_mises_mpa", "min_buckling_factor", "max_temperature_c".\n'
         "Use SI-consistent mm / N / MPa. Example:\n" + json.dumps(EXAMPLE_PLAN, indent=1)
     )
 
@@ -498,6 +531,32 @@ _FORCE_RE = re.compile(r"(?<![\w.])(\d[\d,]*(?:\.\d+)?)\s*(kN|N)(?![\w/\u00b7*])
 _AXIS_RE = re.compile(r"(?:\(\s*([+-])\s*([XYZxyz])\s*\)|([+-])\s*([XYZxyz])\s*(?:direction|axis))")
 
 
+_TEMP_PATTERNS = (re.compile(r"(-?\d+(?:\.\d+)?)\s*[\u00b0\u00ba]\s*[Cc]"),
+                  re.compile(r"(-?\d+(?:\.\d+)?)\s*(?:degrees?|deg)\s*(?:C|celsius)", re.I),
+                  re.compile(r"(-?\d+(?:\.\d+)?)\s*celsius", re.I),
+                  re.compile(r"(-?\d+(?:\.\d+)?)\s*C(?![A-Za-z0-9])"))
+_KELVIN_RE = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*K(?![A-Za-z0-9])")
+_POWER_RE = re.compile(r"(?<![\w.])(\d[\d,]*(?:\.\d+)?)\s*(kW|W)(?![A-Za-z0-9/])")
+
+
+def _stated_temps(text):
+    out = []
+    for pat in _TEMP_PATTERNS:
+        out += [float(m) for m in pat.findall(text or "")]
+    out += [float(m) - 273.15 for m in _KELVIN_RE.findall(text or "")]
+    return out
+
+
+def _stated_powers(text):
+    out = []
+    for num, unit in _POWER_RE.findall(text or ""):
+        try:
+            out.append(float(num.replace(",", "")) * (1000.0 if unit == "kW" else 1.0))
+        except ValueError:
+            pass
+    return out
+
+
 def check_plan_against_request(plan, request_text):
     """The LLM plan must apply the force the request states, along the axis it states. Raises PlanError (fed back to
     the LLM) when it does not - a plan with a different load verifies a different part than the one asked for."""
@@ -532,6 +591,29 @@ def check_plan_against_request(plan, request_text):
                 mm = re.search(r"([+-])?\s*([xyz])", str(ld.get("direction", "")).lower())
                 if mm:
                     axes.add((mm.group(1) or "+") + mm.group(2))
+        if t.get("type") == "thermal_stress":              # every temperature / power must come from the request
+            st_t = _stated_temps(text)
+            for tp in (t.get("temperatures") or []):
+                try:
+                    v = float(tp.get("temperature_c"))
+                except (TypeError, ValueError):
+                    continue
+                if not st_t:
+                    raise PlanError(f"{tid}: the request states no temperatures, so a thermal_stress test would rest on "
+                                    "invented numbers. Remove the thermal test (or state the temperatures in the request).")
+                if not any(abs(v - x) <= 1.5 for x in st_t):
+                    raise PlanError(f"{tid}: temperature {v:g} C is not in the request (it states "
+                                    f"{', '.join(f'{x:g}' for x in sorted(set(st_t)))} C). Use only stated temperatures.")
+            st_p = _stated_powers(text)
+            for hp in (t.get("heat_inputs") or []):
+                try:
+                    v = abs(float(hp.get("power_w")))
+                except (TypeError, ValueError):
+                    continue
+                if not st_p or not any(abs(v - x) <= 0.05 * x for x in st_p):
+                    raise PlanError(f"{tid}: heat input {v:g} W is not stated in the request"
+                                    + (f" (it states {', '.join(f'{x:g}' for x in sorted(set(st_p)))} W)" if st_p else "")
+                                    + ". Use only stated powers, or remove the heat input.")
         if stated and mags:
             total = sum(mags)
             ok_vals = stated + ([sum(stated)] if len(stated) > 1 else [])
@@ -591,10 +673,26 @@ def build_load_case(test, descs, materials, default_material="aluminum_6061"):
     mat = test.get("material") or default_material
     if mat not in materials:
         raise PlanError(f"{tid}: unknown material {mat!r}; choose one of {sorted(materials)}.")
+    ttype = test.get("type")
     cons = test.get("constraints") or []
     loads = test.get("loads") or []
-    if not cons or not loads:
-        raise PlanError(f"{tid}: a static test needs at least one fixed constraint and one load.")
+    temps_in = test.get("temperatures") or []
+    heat_in = test.get("heat_inputs") or []
+    if ttype in ("static_stress", "buckling"):
+        if not cons or not loads:
+            raise PlanError(f"{tid}: a {ttype} test needs at least one fixed constraint and one load.")
+        if temps_in or heat_in:
+            raise PlanError(f"{tid}: temperatures/heat_inputs only belong in a thermal_stress test.")
+    else:                                                  # thermal_stress
+        if not cons:
+            raise PlanError(f"{tid}: a thermal_stress test needs at least one fixed constraint (the part must be held somewhere).")
+        if not temps_in:
+            raise PlanError(f"{tid}: a thermal_stress test needs at least one entry in \"temperatures\" (heat has to be able to leave).")
+        if mat not in HOT_YIELD:
+            raise PlanError(f"{tid}: no hot-strength data for material {mat!r}; thermal tests support {sorted(HOT_YIELD)}.")
+        mrec = materials[mat]
+        if not mrec.get("thermal_conductivity") or not mrec.get("thermal_expansion_per_c"):
+            raise PlanError(f"{tid}: material {mat!r} has no thermal conductivity / expansion data.")
 
     fixed_idx = []
     for c in cons:
@@ -630,12 +728,40 @@ def build_load_case(test, descs, materials, default_material="aluminum_6061"):
     if overlap:
         raise PlanError(f"{tid}: {len(overlap)} face(s) are both fixed and loaded - choose different faces.")
 
+    temp_list, flux_list = [], []
+    for t in temps_in:
+        lid = f"{tid}/temperature {t.get('id', '?')}"
+        try:
+            tc = float(t.get("temperature_c"))
+        except (TypeError, ValueError):
+            raise PlanError(f"{lid}: needs a numeric \"temperature_c\".")
+        if not -200.0 <= tc <= 1500.0:
+            raise PlanError(f"{lid}: temperature_c {tc:g} is outside -200..1500 C.")
+        temp_list.append({"id": t.get("id", "temp"), "face_idx": select_faces(descs, t.get("faces"), lid), "temperature_c": tc})
+    for h in heat_in:
+        lid = f"{tid}/heat input {h.get('id', '?')}"
+        try:
+            pw = float(h.get("power_w"))
+        except (TypeError, ValueError):
+            raise PlanError(f"{lid}: needs a numeric \"power_w\".")
+        if pw == 0 or abs(pw) > 1e6:
+            raise PlanError(f"{lid}: power_w must be non-zero and below 1 MW.")
+        flux_list.append({"id": h.get("id", "heat"), "face_idx": select_faces(descs, h.get("faces"), lid), "power_w": pw})
+    if {i for f in flux_list for i in f["face_idx"]} & {i for t in temp_list for i in t["face_idx"]}:
+        raise PlanError(f"{tid}: a face is both a heat input and a fixed-temperature face - choose different faces.")
+
     pts = lambda idxs: [p for i in idxs for p in descs[i]["samples"]]
     crit = test.get("criteria") or {}
-    return {"id": tid, "material": mat, "fixed_idx": fixed_idx, "loads": load_list,
+    try:
+        t_ref = float(test.get("reference_temperature_c", 20.0))
+    except (TypeError, ValueError):
+        raise PlanError(f"{tid}: reference_temperature_c must be a number.")
+    return {"id": tid, "type": ttype, "material": mat, "fixed_idx": fixed_idx, "loads": load_list,
+            "temps": temp_list, "fluxes": flux_list, "t_ref_c": t_ref,
             "fixed_pts_mm": pts(fixed_idx), "load_pts_mm": pts([i for l in load_list for i in l["face_idx"]]),
             "criteria": {k: float(v) for k, v in crit.items()
-                         if k in ("min_safety_factor", "max_deflection_mm", "max_von_mises_mpa")},
+                         if k in ("min_safety_factor", "max_deflection_mm", "max_von_mises_mpa",
+                                  "min_buckling_factor", "max_temperature_c")},
             "rationale": str(test.get("rationale", ""))[:300]}
 
 
@@ -644,10 +770,17 @@ def build_load_case(test, descs, materials, default_material="aluminum_6061"):
 # --------------------------------------------------------------------------------------------------
 def evaluate(case, fem, diag, default_min_sf=2.0):
     """Compact, LLM-readable verdict. status: PASS | FAIL | INVALID (numbers not trustworthy) | NOT_RUN."""
-    base = {"test_id": case["id"], "type": "static_stress", "material": case["material"],
-            "load_case": {"fixed_faces": len(case["fixed_idx"]),
-                          "loads": [{"id": l["id"], "faces": len(l["face_idx"]),
-                                     "force_n": [round(v, 2) for v in l["force_xyz"]]} for l in case["loads"]]}}
+    ttype = case.get("type", "static_stress")
+    lc = {"fixed_faces": len(case["fixed_idx"]),
+          "loads": [{"id": l["id"], "faces": len(l["face_idx"]),
+                     "force_n": [round(v, 2) for v in l["force_xyz"]]} for l in case["loads"]]}
+    if case.get("temps"):
+        lc["temperatures"] = [{"id": t["id"], "faces": len(t["face_idx"]), "temperature_c": t["temperature_c"]}
+                              for t in case["temps"]]
+        lc["heat_inputs"] = [{"id": f["id"], "faces": len(f["face_idx"]), "power_w": f["power_w"]}
+                             for f in case.get("fluxes", [])]
+        lc["reference_temperature_c"] = case.get("t_ref_c")
+    base = {"test_id": case["id"], "type": ttype, "material": case["material"], "load_case": lc}
     if fem is None:
         return {**base, "status": "NOT_RUN", "solver": (diag or {}).get("solver", "simscale"),
                 "reason": (diag or {}).get("reason"), "failed_stage": (diag or {}).get("failed_stage"),
@@ -663,9 +796,21 @@ def evaluate(case, fem, diag, default_min_sf=2.0):
         warnings.append("boundary-condition sanity check failed: " + str(bc.get("reason") or bc))
     if fem.get("numerically_suspect"):
         warnings.append("result flagged numerically suspect")
+    if fem.get("hot_data_warning"):
+        warnings.append(fem["hot_data_warning"])
     crit = dict(case["criteria"])
-    crit.setdefault("min_safety_factor", default_min_sf)
+    bf = fem.get("buckling_factor")
+    if ttype == "buckling":
+        crit.setdefault("min_buckling_factor", 3.0)        # stress under the reference load is not a pass/fail here
+        if bf is None:
+            warnings.append("no positive buckling factor: the reference load is tensile or stabilizing - check that the "
+                            "load pushes the slender member in compression")
+    else:
+        crit.setdefault("min_safety_factor", default_min_sf)
     rows = []
+    if ttype == "buckling" and bf is not None and "min_buckling_factor" in crit:
+        rows.append({"name": "buckling_factor", "required": f">= {crit['min_buckling_factor']}", "actual": bf,
+                     "pass": bf >= crit["min_buckling_factor"]})
     if "min_safety_factor" in crit and sf is not None:
         rows.append({"name": "safety_factor", "required": f">= {crit['min_safety_factor']}", "actual": sf,
                      "pass": sf >= crit["min_safety_factor"]})
@@ -675,13 +820,24 @@ def evaluate(case, fem, diag, default_min_sf=2.0):
     if "max_von_mises_mpa" in crit and vm is not None:
         rows.append({"name": "von_mises_mpa", "required": f"<= {crit['max_von_mises_mpa']}", "actual": vm,
                      "pass": vm <= crit["max_von_mises_mpa"]})
+    tmax = fem.get("t_max_c")
+    if "max_temperature_c" in crit and tmax is not None:
+        rows.append({"name": "max_temperature_c", "required": f"<= {crit['max_temperature_c']}", "actual": round(tmax, 1),
+                     "pass": tmax <= crit["max_temperature_c"]})
     status = "INVALID" if warnings else ("PASS" if rows and all(r["pass"] for r in rows) else "FAIL")
-    return {**base, "status": status, "solver": fem.get("solver", "simscale"),
-            "metrics": {"von_mises_mpa": vm, "safety_factor": sf, "max_deflection_mm": defl,
-                        "hotspot_mm": (fem.get("critical_section") or {}).get("hotspot_xyz_mm"),
-                        "hot_zone_mm": (fem.get("critical_section") or {}).get("hot_zone_mm")},
-            "criteria": rows, "warnings": warnings,
-            "mesh": {"nodes": (ss.get("mesh") or {}).get("nodes") or ((ss.get("field_diag") or {}).get("n_points") if isinstance(ss.get("field_diag"), dict) else None)}}
+    metrics = {"von_mises_mpa": vm, "safety_factor": sf, "max_deflection_mm": defl,
+               "hotspot_mm": (fem.get("critical_section") or {}).get("hotspot_xyz_mm"),
+               "hot_zone_mm": (fem.get("critical_section") or {}).get("hot_zone_mm")}
+    for k in ("buckling_factor", "buckling_factors", "buckling_mode1_peak_mm", "t_max_c", "t_min_c", "t_at_hotspot_c",
+              "yield_at_hotspot_mpa"):
+        if fem.get(k) is not None:
+            metrics[k] = fem[k]
+    out = {**base, "status": status, "solver": fem.get("solver", "simscale"), "metrics": metrics,
+           "criteria": rows, "warnings": warnings,
+           "mesh": {"nodes": (ss.get("mesh") or {}).get("nodes") or ((ss.get("field_diag") or {}).get("n_points") if isinstance(ss.get("field_diag"), dict) else None)}}
+    if fem.get("assumptions"):
+        out["assumptions"] = fem["assumptions"]
+    return out
 
 
 def overall(results):

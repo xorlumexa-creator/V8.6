@@ -6296,7 +6296,8 @@ def _verification_gate(use_test_plan, result, plan_diag, quality):
 def _plan_targets(r):
     """Numbers the LLM can design to: how much the failing metric must improve and what that means for thickness."""
     try:
-        need_stress, need_defl = 1.0, 1.0
+        need_stress, need_defl, need_buckle = 1.0, 1.0, 1.0
+        thermal = r.get("type") == "thermal_stress"
         for c in r.get("criteria", []):
             if c.get("pass"):
                 continue
@@ -6312,8 +6313,16 @@ def _plan_targets(r):
                 need_stress = max(need_stress, act / req)
             elif c.get("name") == "deflection_mm":
                 need_defl = max(need_defl, act / req)
+            elif c.get("name") == "buckling_factor":
+                need_buckle = max(need_buckle, req / act)
         out = []
-        if need_stress > 1.0:
+        if need_stress > 1.0 and thermal:
+            out.append(f"    TARGET: thermal stress must drop by x{need_stress:.2f}. It comes from temperature differences and "
+                       "restraint, NOT from load, so making the part thicker does not lower it. Lower it by (1) letting the "
+                       "hot region expand (slots, relief cuts, larger fillets, thinner flexible links), (2) reducing the "
+                       "temperature gradient (a shorter / wider / more conductive path between the hot and cold faces) or "
+                       "(3) releasing a constraint that blocks the expansion.")
+        elif need_stress > 1.0:
             t = need_stress ** 0.5
             out.append(f"    TARGET: peak stress must drop by at least {(1 - 1 / need_stress) * 100:.0f}% "
                        f"(x{need_stress:.2f}). If the hotspot is bending-dominated, stress ~ 1/thickness^2, so that section "
@@ -6322,6 +6331,12 @@ def _plan_targets(r):
         if need_defl > 1.0:
             out.append(f"    TARGET: deflection must drop by x{need_defl:.2f}; stiffness ~ thickness^3, so about "
                        f"x{need_defl ** (1 / 3):.2f} thickness (or add a rib).")
+        if need_buckle > 1.0:
+            out.append(f"    TARGET: the buckling factor must rise by x{need_buckle:.2f}. Critical load ~ bending stiffness (second "
+                       f"moment of area) / length^2: about x{need_buckle ** (1 / 3):.2f} on the thickness of a plate-like "
+                       f"member, or x{need_buckle ** 0.25:.2f} on the diameter of a solid round one; cutting the unsupported "
+                       f"length by x{need_buckle ** 0.5:.2f} (a rib, brace or support that stops the bending) is usually cheaper. "
+                       "Deepening the section away from its bending axis (ribs, flanges, a tube instead of a bar) beats adding mass.")
         return out
     except Exception:
         return []
@@ -6337,12 +6352,24 @@ def _plan_feedback_lines(result):
         st = r.get("status")
         out.append(f"- test '{r.get('test_id')}': {st}")
         lc = r.get("load_case") or {}
+        if r.get("type") and r.get("type") != "static_stress":
+            out.append(f"    ({r.get('type')} test)")
+        for t_ in lc.get("temperatures", []):
+            out.append(f"    temperature '{t_['id']}': {t_['temperature_c']} C on {t_['faces']} face(s)")
+        for h_ in lc.get("heat_inputs", []):
+            out.append(f"    heat input '{h_['id']}': {h_['power_w']} W on {h_['faces']} face(s)")
         for l in lc.get("loads", []):
             out.append(f"    load '{l['id']}': {l['force_n']} N on {l['faces']} face(s); {lc.get('fixed_faces')} fixed face(s)")
         m = r.get("metrics") or {}
         if m:
             out.append(f"    von Mises {m.get('von_mises_mpa')} MPa, safety factor {m.get('safety_factor')}, "
                        f"max deflection {m.get('max_deflection_mm')} mm, hotspot at {m.get('hotspot_mm')} mm")
+            if m.get("buckling_factor") is not None:
+                out.append(f"    buckling factor {m['buckling_factor']} (lowest modes {m.get('buckling_factors')}); "
+                           f"the first mode bends most at {m.get('buckling_mode1_peak_mm')} mm")
+            if m.get("t_max_c") is not None:
+                out.append(f"    temperature {m.get('t_min_c')}..{m['t_max_c']} C (at the stress hotspot {m.get('t_at_hotspot_c')} C), "
+                           f"yield strength there {m.get('yield_at_hotspot_mpa')} MPa")
         for c in r.get("criteria", []):
             out.append(f"    criterion {c['name']}: {c['actual']} (required {c['required']}) -> {'ok' if c['pass'] else 'FAILED'}")
         for w in r.get("warnings", []):
@@ -7810,6 +7837,19 @@ def run_ccx_service_fem(cad_obj, mat_key, load_case, descs, min_sf=2.0):
                 "faces": {"fixed": [fdesc(i) for i in load_case["fixed_idx"]],
                           "loads": [{"id": l["id"], "force_xyz": [float(v) for v in l["force_xyz"]],
                                      "faces": [fdesc(i) for i in l["face_idx"]]} for l in load_case["loads"]]}}
+        ttype = load_case.get("type", "static_stress")
+        analysis = {"static_stress": "static", "buckling": "buckling", "thermal_stress": "thermal"}.get(ttype, "static")
+        case["analysis"] = analysis
+        if analysis == "buckling":
+            case["buckle_modes"] = 3
+        if analysis == "thermal":
+            case["thermal"] = {"k_w_mk": float(mat["thermal_conductivity"]),
+                               "alpha_per_c": float(mat["thermal_expansion_per_c"]),
+                               "t_ref_c": float(load_case.get("t_ref_c", 20.0))}
+            case["faces"]["temps"] = [{"id": t["id"], "temperature_c": float(t["temperature_c"]),
+                                       "faces": [fdesc(i) for i in t["face_idx"]]} for t in load_case.get("temps", [])]
+            case["faces"]["fluxes"] = [{"id": f["id"], "power_w": float(f["power_w"]),
+                                        "faces": [fdesc(i) for i in f["face_idx"]]} for f in load_case.get("fluxes", [])]
         mark("solve")
         try:
             resp = _ccx_call("/solve", fields={"case": json.dumps(case)}, files={"step": ("part.step", step_bytes)},
@@ -7822,10 +7862,22 @@ def run_ccx_service_fem(cad_obj, mat_key, load_case, descs, min_sf=2.0):
                         failed_stage=resp.get("stage"), design_related=bool(resp.get("design_related")))
             return None, diag
         res = resp["result"]
+        if analysis != "static" and res.get("analysis") != analysis:
+            diag.update(reason=f"the solver service is an old version without {analysis} support: update analysis_service "
+                               "(git pull, restart uvicorn)", failed_stage="solve", design_related=False)
+            return None, diag
         mark("results", **{k: v for k, v in (resp.get("timings") or {}).items()})
         vm = float(res["vm_mpa"])
         Sy = float(mat["yield_strength_mpa"])
-        sfv = Sy / max(vm, 1e-6)
+        hot_warn, Sy_eff = None, Sy
+        if ttype == "thermal_stress":              # judge the stress against the strength at the hot spot's temperature
+            t_h = res.get("t_at_hotspot_c")
+            frac, inside = TP.yield_fraction(mat_key, t_h if t_h is not None else res.get("t_max_c"))
+            Sy_eff = Sy * frac
+            if not inside:
+                hot_warn = (f"the temperature at the stress hotspot ({t_h if t_h is not None else res.get('t_max_c')} C) is beyond "
+                            f"the strength data for {mat_key}; the safety factor cannot be trusted")
+        sfv = Sy_eff / max(vm, 1e-6)
         bb = cad_obj.bounding_box()
         exts = [bb.size.X, bb.size.Y, bb.size.Z]
         axis = int(np.argmax(exts))
@@ -7835,7 +7887,7 @@ def run_ccx_service_fem(cad_obj, mat_key, load_case, descs, min_sf=2.0):
                  "n_nodes": z["n_nodes"], "n_total": z["n_total"]} if z else None)
         bc = res.get("bc_check") or {}
         fem = {
-            "method": "calculix_static_fem", "solver": "calculix",
+            "method": f"calculix_{analysis}_fem", "solver": "calculix",
             "note": (f"CalculiX linear-static FEM (10-node tets). Load case from test plan '{load_case['id']}': "
                      f"{len(load_case['fixed_idx'])} fixed face(s), {len(load_case['loads'])} load(s). Peak stress at a "
                      "fixed/loaded face edge can include a local singularity -- judge by where the hotspot is, not "
@@ -7852,6 +7904,31 @@ def run_ccx_service_fem(cad_obj, mat_key, load_case, descs, min_sf=2.0):
                             "versions": res.get("versions")},
             "inputs": {"load_case": load_case["id"], "forces_n": [l["force_xyz"] for l in load_case["loads"]]},
         }
+        if analysis == "buckling":
+            bk = res.get("buckling") or {}
+            fem["buckling_factor"] = bk.get("factor")
+            fem["buckling_factors"] = bk.get("factors")
+            if bk.get("mode1_peak_xyz_mm"):
+                fem["buckling_mode1_peak_mm"] = [round(float(c), 1) for c in bk["mode1_peak_xyz_mm"]]
+            fem["note"] = (f"CalculiX linear buckling (eigenvalue) analysis. Buckling factor = critical load / the load given "
+                           f"in plan '{load_case['id']}'. It ignores imperfections, plasticity and large deflections, so real "
+                           "columns buckle EARLIER than this predicts: keep a margin (3+). The von Mises stress shown is "
+                           "at the reference load only.")
+        if analysis == "thermal":
+            fem["t_max_c"], fem["t_min_c"] = round(float(res.get("t_max_c")), 1), round(float(res.get("t_min_c")), 1)
+            if res.get("t_at_hotspot_c") is not None:
+                fem["t_at_hotspot_c"] = round(float(res["t_at_hotspot_c"]), 1)
+            fem["yield_at_hotspot_mpa"] = round(Sy_eff, 1)
+            if hot_warn:
+                fem["hot_data_warning"] = hot_warn
+            fem["assumptions"] = [
+                "steady-state conduction only: fixed-temperature faces and heat inputs from the request; no convection or radiation",
+                "stiffness, conductivity and expansion are room-temperature values (they change with temperature)",
+                "strength is derated with approximate handbook trends - verify with supplier data before relying on it",
+                f"the part is stress-free at {load_case.get('t_ref_c', 20.0)} C",
+            ]
+            fem["note"] = ("CalculiX steady-state heat conduction + thermal stress (10-node tets), plus any mechanical loads of "
+                           f"plan '{load_case['id']}'. Safety factor = yield at the hotspot's temperature / peak von Mises.")
         if bc and not bc.get("ok"):
             fem["note"] += " WARNING: sanity check FAILED (" + str(bc.get("reason")) + ") -- do not trust these numbers."
         mark("done")
@@ -7873,6 +7950,10 @@ def run_plan_fem(cad_obj, case, default_min_sf, descs):
         if fem is not None or diag.get("design_related") or FEA_SOLVER == "calculix":
             return fem, diag
         ccx_diag = diag
+    if case.get("type", "static_stress") != "static_stress":
+        return None, (ccx_diag or {"attempted": False, "solver": "none", "reason":
+                      f"{case.get('type')} analysis needs the CalculiX service (set CCX_SERVICE_URL); the SimScale path only "
+                      "supports static_stress"})
     if SIMSCALE_ENABLED and FEA_SOLVER in ("auto", "simscale"):
         fem, diag = run_simscale_fem(cad_obj, case["material"], 0, "z", min_sf, case)
         diag["solver"] = "simscale"
@@ -8053,12 +8134,17 @@ async def ccx_health():
 
 @app.get("/ccx-selftest")
 @_sanitize_response
-async def ccx_selftest():
-    """Cantilever solved by the CalculiX service and compared with beam theory (deflection ratio ~1, stress ~1-1.3)."""
+async def ccx_selftest(kind: str = "static"):
+    """Known-answer checks solved by the CalculiX service. kind=static: cantilever vs beam theory (deflection ratio ~1,
+    stress ~1-1.3); kind=buckling: clamped-free column vs Euler (ratio ~0.95-1.10); kind=thermal: bar with a temperature
+    drop, free-end growth vs alpha*dT*L (ratio ~0.97-1.05)."""
     if not CCX_SERVICE_URL:
         raise HTTPException(503, "CCX_SERVICE_URL not set")
+    path = {"static": "/selftest", "buckling": "/selftest-buckling", "thermal": "/selftest-thermal"}.get(kind)
+    if not path:
+        raise HTTPException(400, "kind must be static, buckling or thermal")
     try:
-        return await asyncio.to_thread(_ccx_call, "/selftest", None, None, CCX_TIMEOUT_S)
+        return await asyncio.to_thread(_ccx_call, path, None, None, CCX_TIMEOUT_S)
     except RuntimeError as e:
         raise HTTPException(502, str(e))
 
