@@ -43,7 +43,7 @@ def distribute_force(weights, force_xyz):
 
 # ---------------------------------------------------------------------------------------------- CalculiX input
 def write_inp(path, node_ids, coords, elem_ids, elem_conn_ccx, fixed_nodes, forces, E_mpa, nu,
-              analysis="static", buckle_modes=3, thermal=None):
+              analysis="static", buckle_modes=3, thermal=None, buckle_scale=1.0):
     """C3D10 model. analysis: 'static' (linear static) | 'buckling' (the same static step as the reference load, then
     *BUCKLE: the eigenvalues are the factors the load must be multiplied by to buckle the part) | 'thermal' (steady-state
     heat conduction + the thermal stress it causes, plus any mechanical forces).
@@ -99,7 +99,19 @@ def write_inp(path, node_ids, coords, elem_ids, elem_conn_ccx, fixed_nodes, forc
         lines += ["*NODE PRINT, NSET=NFIX, TOTALS=ONLY", "RF"]
     lines += ["*NODE FILE", "U, NT, RF" if analysis == "thermal" else "U, RF", "*EL FILE", "S", "*END STEP"]
     if analysis == "buckling":
-        lines += ["*STEP", "*BUCKLE", f"{int(buckle_modes)}", "*NODE FILE", "U", "*END STEP"]
+        # CalculiX removes every earlier load at the start of a buckling step and scales ONLY the load written inside it,
+        # so the reference load goes here (scaled to a small total, which also avoids CalculiX skipping the first mode
+        # when the load is far above the buckling load). Multiply the factors by buckle_scale to get them per actual load.
+        sc = float(buckle_scale)
+        bl = []
+        for n in sorted(forces):
+            if int(n) in used:
+                for dof, f in enumerate(forces[n], start=1):
+                    if abs(f) > 0.0:
+                        bl.append(f"{int(n)}, {dof}, {f * sc:.9g}")
+        if not bl:
+            raise ValueError("a buckling analysis needs a load")
+        lines += ["*STEP", "*BUCKLE", f"{int(buckle_modes)}", "*CLOAD"] + bl + ["*NODE FILE", "U", "*END STEP"]
     with open(path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
 

@@ -87,6 +87,8 @@ def solve_case(step_path, case, workdir, gmsh=None):
     if analysis not in ("static", "buckling", "thermal"):
         raise SolveError("setup", f"unknown analysis {analysis!r} (static | buckling | thermal)")
     th_in = case.get("thermal") or {}
+    if analysis == "buckling" and not (case.get("faces") or {}).get("loads"):
+        raise SolveError("setup", "a buckling case needs at least one load")
     if analysis == "thermal" and not all(k in th_in for k in ("k_w_mk", "alpha_per_c", "t_ref_c")):
         raise SolveError("setup", "a thermal case needs thermal.k_w_mk, thermal.alpha_per_c and thermal.t_ref_c")
     exp_lo, exp_hi = np.asarray(case["bbox_mm"]["min"], float), np.asarray(case["bbox_mm"]["max"], float)
@@ -223,10 +225,13 @@ def solve_case(step_path, case, workdir, gmsh=None):
         gmsh.finalize()
 
     # ---- CalculiX
+    # buckling: the reference load inside the *BUCKLE step is scaled to a ~1 N total; factors are scaled back below
+    fsum = sum(float(np.linalg.norm(l["force_xyz"])) for l in faces.get("loads", []))
+    bscale = 1.0 / fsum if (analysis == "buckling" and fsum > 0) else 1.0
     inp = os.path.join(workdir, "job.inp")
     FC.write_inp(inp, np.array(list(node_xyz)), np.array(list(node_xyz.values())), elem_ids,
                  FC.tet10_gmsh_to_ccx(conn), fixed_nodes, forces, float(mat["E_mpa"]), float(mat["nu"]),
-                 analysis=analysis, buckle_modes=int(case.get("buckle_modes") or 3),
+                 analysis=analysis, buckle_modes=int(case.get("buckle_modes") or 3), buckle_scale=bscale,
                  thermal=({"k_w_mk": th_in["k_w_mk"], "alpha_per_c": th_in["alpha_per_c"], "t_ref_c": th_in["t_ref_c"],
                            "temps": temp_bc, "cflux_mw": cflux} if analysis == "thermal" else None))
     env = dict(os.environ, OMP_NUM_THREADS=CCX_THREADS, CCX_NPROC_EQUATION_SOLVER=CCX_THREADS)
@@ -250,13 +255,13 @@ def solve_case(step_path, case, workdir, gmsh=None):
     except ValueError as e:
         raise SolveError("results", str(e))
     if analysis == "buckling":
-        facs = FC.parse_buckling_factors(dat_text)
+        facs = [f * bscale for f in FC.parse_buckling_factors(dat_text)]      # per ACTUAL load
         if not facs:
             tail = " | ".join((r.stdout + r.stderr).strip().splitlines()[-6:])
             raise SolveError("results", f"CalculiX produced no buckling factors ({tail[:300]})")
         pos = [f for f in facs if f > 0]
         bk = {"factors": [round(f, 4) for f in facs[:5]], "factor": round(min(pos), 4) if pos else None,
-              "n_modes": len(facs)}
+              "n_modes": len(facs), "solver_load_scale": bscale}
         blocks = res.get("DISP_BLOCKS") or []
         if len(blocks) > 1 and blocks[1]:
             mids = sorted(blocks[1])
