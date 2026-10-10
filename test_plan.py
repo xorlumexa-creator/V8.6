@@ -125,6 +125,18 @@ def _sample_points(face, n=40):
     return pts
 
 
+def _full_cyl_center(center, bmin, bmax, area, diameter):
+    """A closed cylindrical face (a bore, a pin) reports a centre on its surface in some kernels, which puts bore
+    selectors and hole-proximity checks off by one radius. When area ~ pi*d*length the face is a full cylinder and its
+    bbox centre is its true axis centre."""
+    if not diameter or area <= 0:
+        return center
+    ext = [bmax[k] - bmin[k] for k in range(3)]
+    if any(abs(area - math.pi * diameter * e) <= 0.05 * area for e in ext):
+        return [(bmin[k] + bmax[k]) / 2 for k in range(3)]
+    return center
+
+
 def describe_faces(shape):
     """[{idx, area, center, bbox_min, bbox_max, normal|None, geom, diameter|None, samples}] in B-rep order (mm)."""
     out = []
@@ -147,9 +159,11 @@ def describe_faces(shape):
             area = float(_call(f, "area"))
         except Exception:
             area = 0.0
+        _dia = _cyl_diameter(f, ext) if "CYLINDER" in geom else None
+        center = _full_cyl_center(center, bmin, bmax, area, _dia)
         out.append({"idx": i, "area": area, "center": center, "bbox_min": bmin, "bbox_max": bmax,
                     "normal": normal, "geom": "PLANE" if "PLANE" in geom else ("CYLINDER" if "CYLINDER" in geom else "OTHER"),
-                    "diameter": _cyl_diameter(f, ext) if "CYLINDER" in geom else None,
+                    "diameter": _dia,
                     "samples": _sample_points(f)})
     return out
 
@@ -478,6 +492,57 @@ def parse_plan(plan):
 
 _BOLT_WORDS = re.compile(r"\b(bolt\w*|screw\w*|fasten\w*|rivet\w*|mounting[- ]holes?|through[- ]holes?|dowel\w*)", re.I)
 _CLAMP_WORDS = re.compile(r"\b(clamp\w*|glu\w*|bond\w*|weld\w*|adhesive|fully fixed|rigid(ly)? (mounted|fixed))", re.I)
+
+
+_FORCE_RE = re.compile(r"(?<![\w.])(\d[\d,]*(?:\.\d+)?)\s*(kN|N)(?![\w/\u00b7*])")
+_AXIS_RE = re.compile(r"(?:\(\s*([+-])\s*([XYZxyz])\s*\)|([+-])\s*([XYZxyz])\s*(?:direction|axis))")
+
+
+def check_plan_against_request(plan, request_text):
+    """The LLM plan must apply the force the request states, along the axis it states. Raises PlanError (fed back to
+    the LLM) when it does not - a plan with a different load verifies a different part than the one asked for."""
+    text = request_text or ""
+    stated = []
+    for num, unit in _FORCE_RE.findall(text):
+        try:
+            v = float(num.replace(",", "")) * (1000.0 if unit == "kN" else 1.0)
+        except ValueError:
+            continue
+        if v > 0 and v not in stated:
+            stated.append(v)
+    dirs = {(m[0] or m[2]) + (m[1] or m[3]).lower() for m in _AXIS_RE.findall(text)}
+    if re.search(r"\bdownward\b", text, re.I) and not dirs:
+        dirs = {"-z"}
+    for t in (plan.get("tests") or []):
+        tid = t.get("id", "test")
+        mags, axes = [], set()
+        for ld in (t.get("loads") or []):
+            f = ld.get("force_n")
+            if isinstance(f, (list, tuple)) and len(f) == 3:
+                m = math.sqrt(sum(float(c) ** 2 for c in f))
+                if m > 0:
+                    k = max(range(3), key=lambda j: abs(float(f[j])))
+                    axes.add(("+" if float(f[k]) > 0 else "-") + "xyz"[k])
+                mags.append(m)
+            elif f is not None:
+                try:
+                    mags.append(abs(float(f)))
+                except (TypeError, ValueError):
+                    continue
+                mm = re.search(r"([+-])?\s*([xyz])", str(ld.get("direction", "")).lower())
+                if mm:
+                    axes.add((mm.group(1) or "+") + mm.group(2))
+        if stated and mags:
+            total = sum(mags)
+            ok_vals = stated + ([sum(stated)] if len(stated) > 1 else [])
+            if not any(abs(total - v) <= 0.05 * v for v in ok_vals):
+                raise PlanError(f"{tid}: the request states a force of {', '.join(f'{v:g}' for v in stated)} N but the plan "
+                                f"applies {total:g} N. Use exactly the stated force.")
+        if len(dirs) == 1 and axes:
+            want = next(iter(dirs))
+            if want not in axes:
+                raise PlanError(f"{tid}: the request says the load acts along {want} but the plan uses "
+                                f"{', '.join(sorted(axes))}. Use the stated direction ({want}).")
 
 
 def _check_bolt_intent(tid, test, descs, fixed_idx):

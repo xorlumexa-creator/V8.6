@@ -6020,6 +6020,57 @@ def step_from_cad(obj):
     with tempfile.NamedTemporaryFile(suffix=".step",delete=False) as t: p=t.name
     _b3d_write_step(obj,p); return p
 
+# Downloadable formats. B-rep formats keep exact geometry (editable in FreeCAD/Fusion/SolidWorks); mesh formats are
+# for viewers, 3D printing and game/web engines. Units are millimetres in every format.
+EXPORT_FORMATS = {
+    "step": {"ext": "step", "mime": "model/step",        "kind": "B-rep (exact, CAD-editable)"},
+    "brep": {"ext": "brep", "mime": "application/octet-stream", "kind": "B-rep (OpenCascade native)"},
+    "stl":  {"ext": "stl",  "mime": "model/stl",         "kind": "mesh (3D printing)"},
+    "glb":  {"ext": "glb",  "mime": "model/gltf-binary", "kind": "mesh (web / AR / Blender)"},
+    "obj":  {"ext": "obj",  "mime": "text/plain",        "kind": "mesh (Blender / most DCC tools)"},
+}
+
+def export_bytes(obj, fmt):
+    """Export a build123d solid as `fmt`. Returns (bytes, mime, filename). Raises ValueError (unknown format) or
+    RuntimeError (this format could not be produced - the caller reports it, other formats are unaffected)."""
+    fmt=(fmt or "").lower().lstrip(".")
+    if fmt=="stp": fmt="step"
+    if fmt not in EXPORT_FORMATS:
+        raise ValueError(f"unknown format {fmt!r}; available: {sorted(EXPORT_FORMATS)}")
+    meta=EXPORT_FORMATS[fmt]
+    paths=[]
+    try:
+        if fmt=="step":
+            pth=step_from_cad(obj); paths.append(pth)
+        elif fmt=="stl":
+            pth=stl_from_cad(obj); paths.append(pth)
+        elif fmt=="brep":
+            with tempfile.NamedTemporaryFile(suffix=".brep",delete=False) as t: pth=t.name
+            paths.append(pth)
+            try:
+                obj.export_brep(pth)
+            except Exception:
+                from OCP.BRepTools import BRepTools
+                if not BRepTools.Write_s(obj.wrapped,pth): raise RuntimeError("BREP write failed")
+        else:   # glb / obj: tessellate once, convert with trimesh
+            import trimesh
+            spth=stl_from_cad(obj); paths.append(spth)
+            m=trimesh.load(spth,file_type="stl",force="mesh")
+            data=m.export(file_type=fmt)
+            data=data.encode() if isinstance(data,str) else data
+            return data,meta["mime"],f"lumexa_part.{meta['ext']}"
+        if not os.path.exists(pth) or os.path.getsize(pth)==0:
+            raise RuntimeError(f"{fmt} export produced an empty file")
+        with open(pth,"rb") as f: data=f.read()
+        return data,meta["mime"],f"lumexa_part.{meta['ext']}"
+    except (ValueError,RuntimeError): raise
+    except Exception as e:
+        raise RuntimeError(f"{fmt} export failed: {type(e).__name__}: {str(e)[:200]}")
+    finally:
+        for q in paths:
+            try: os.unlink(q)
+            except Exception: pass
+
 # ═══════════════════════════════════════════════════════════════════
 # CORE ANALYSIS PIPELINE v8.0
 # ═══════════════════════════════════════════════════════════════════
@@ -6196,6 +6247,7 @@ async def generate_test_plan(prompt, cad_obj, material="auto", previous_plan=Non
             m = re.search(r"\{.*\}", text or "", re.S)
             try:
                 plan = TP.parse_plan(m.group(0) if m else (text or ""))
+                TP.check_plan_against_request(plan if isinstance(plan, dict) else {}, prompt)
                 chk = await run_plan_tests(cad_obj, plan, dry_run=True)
                 if chk.get("overall") == "RESOLVED":
                     diag["stage"] = "ok"
@@ -6924,6 +6976,61 @@ async def analyze_part_deep(
             "message":"Analysis started. Poll /job/{job_id} for results.",
             "estimated_time":"2-8 minutes with CalculiX, 30s without"}
 
+import gc as _gc
+import resource as _resource
+_JOB_ID = contextvars.ContextVar("lumexa_job_id", default=None)
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "1") or 1)   # 512 MB host: one design loop at a time
+
+
+def _rss_mb():
+    try:
+        with open("/proc/self/status") as f:
+            for ln in f:
+                if ln.startswith("VmRSS:"):
+                    return round(int(ln.split()[1]) / 1024)
+    except Exception:
+        pass
+    return None
+
+
+def _peak_mb():
+    try:
+        return round(_resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss / 1024)
+    except Exception:
+        return None
+
+
+def _job_progress(**kw):
+    """Record where the running job is (and how much memory it uses). No-op outside a background job."""
+    jid = _JOB_ID.get()
+    job = JOB_STORE.get(jid) if jid else None
+    if not job or job.get("status") != "running":
+        return
+    job.update(kw)
+    job["rss_mb"] = _rss_mb()
+    job["peak_mb"] = _peak_mb()
+
+
+def _job_cancelled():
+    jid = _JOB_ID.get()
+    return bool(jid and JOB_STORE.get(jid, {}).get("cancel"))
+
+
+@app.post("/job/{job_id}/cancel")
+@_sanitize_response
+def cancel_job(job_id: str):
+    """Stop a running design loop at the next safe point (end of the current step, not instantly)."""
+    job = JOB_STORE.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found (it finished, or the server restarted)")
+    if job.get("status") != "running":
+        return {"job_id": job_id, "status": job.get("status"), "message": "Job is not running."}
+    job["cancel"] = True
+    job["cancelling"] = True
+    return {"job_id": job_id, "status": "running", "cancelling": True,
+            "message": "Cancel requested; the loop stops after its current step."}
+
+
 @app.get("/job/{job_id}")
 @_sanitize_response
 def get_job(job_id:str):
@@ -6938,7 +7045,8 @@ def get_job(job_id:str):
     else:
         elapsed=time.time()-job["created"]
         return {"status":"running","elapsed_seconds":round(elapsed,1),
-                "message":"Analysis in progress..."}
+                "message":"Analysis in progress...",
+                **{k:job[k] for k in ("iteration","stage","analysed_rounds","last_passed","last_sf","rss_mb","peak_mb","cancelling") if k in job}}
 
 @app.post("/generate-part")
 @_sanitize_response
@@ -7167,6 +7275,11 @@ async def generate_validate_refine(
     for i in range(1, max_iterations+extra_attempts+1):
         if analysed_rounds>=max_iterations:
             break
+        if _job_cancelled():
+            stopped_reason="cancelled"
+            break
+        _gc.collect()                      # free the previous round's shapes/meshes before building the next
+        _job_progress(iteration=i, stage="generating")
         # 1) Generate or refine the script
         rate_limit_wait_remaining=RATE_LIMIT_MAX_TOTAL_WAIT
         gen_failed=False
@@ -7239,6 +7352,7 @@ async def generate_validate_refine(
                 continue
             review=None
             if gi["ok"] and i<max_iterations and review_refinements_used<1:
+                _job_progress(stage="reviewing")
                 review=await review_geometry_with_llm(prompt,gi)
                 if review and review["verdict"]=="fail" and review["issues"]:
                     review_refinements_used+=1
@@ -7254,6 +7368,7 @@ async def generate_validate_refine(
                     continue
 
         # 3) Analyze
+        _job_progress(stage="meshing_and_fem")
         try:
             mesh,stl_bytes=await mesh_from_cad_object(obj)
             plan=None
@@ -7295,6 +7410,8 @@ async def generate_validate_refine(
                "geometry_inspection":_gi_brief(gi),**({"review":review} if review else {})}
         iterations.append(entry)
         analysed_rounds+=1
+        _job_progress(stage="round_done", analysed_rounds=analysed_rounds, last_passed=quality["passed"],
+                      last_sf=(quality.get("metrics") or {}).get("safety_factor"))
 
         candidate={"result":result,"quality":quality,"script":script,
                    "stl_b64":stl_b64,"iteration":i,"fv":fv,"gi":gi,"review":review}
@@ -7323,6 +7440,8 @@ async def generate_validate_refine(
     if stopped_reason is None:
         stopped_reason="max_iterations_reached" if analysed_rounds>=max_iterations else "too_many_failed_attempts"
 
+    if best is None and stopped_reason=="cancelled":
+        raise HTTPException(499, "Cancelled by user before a design was produced.")
     if best is None:
         # Every iteration failed to even produce geometry — surface the last error.
         last=iterations[-1] if iterations else {}
@@ -7334,6 +7453,17 @@ async def generate_validate_refine(
     result=best["result"]
     result["generated_stl_base64"]=best["stl_b64"]
     result["generated_script"]=best["script"]
+    result["export_formats"]=sorted(EXPORT_FORMATS)
+    try:   # STEP is the one CAD users always want: ship it with the result, everything else via POST /export
+        _gc.collect()
+        _so,_se=execute_cad_script_safely(best["script"])
+        if _se or _so is None:
+            result["export_error"]=f"step: could not rebuild the design ({str(_se)[:160]})"
+        else:
+            _sb,_,_=export_bytes(_so,"step")
+            result["generated_step_base64"]=base64.b64encode(_sb).decode()
+    except Exception as _e:
+        result["export_error"]=f"step: {str(_e)[:200]}"
     result["feature_verification"]=best.get("fv")
     result["geometry_inspection"]=best.get("gi")
     result["geometry_review"]=best.get("review")
@@ -7436,10 +7566,15 @@ async def generate_validate_refine_async(
     will exceed the request timeout of most hosts (Render/Railway/proxies). Returns a
     job_id immediately; poll GET /job/{job_id} (returns the final result when done).
     """
+    _running=[j for j,v in JOB_STORE.items() if v.get("status")=="running" and time.time()-v.get("created",0)<5400]
+    if len(_running)>=MAX_CONCURRENT_JOBS:
+        raise HTTPException(409, f"{len(_running)} design job(s) already running (job {_running[0]}). This server has little "
+                                 f"memory, so jobs run one at a time. Wait for it, or POST /job/{_running[0]}/cancel.")
     job_id=str(uuid.uuid4())
     JOB_STORE[job_id]={"status":"running","created":time.time(),"filename":prompt[:80]}
 
     async def run_job():
+        _JOB_ID.set(job_id)
         try:
             result=await generate_validate_refine(
                 prompt=prompt,material=material,force_n=force_n,force_dir=force_dir,
@@ -8221,6 +8356,31 @@ async def edit_design_region(
                 "AI-generated. Re-run this endpoint again with a new box to edit another "
                 "region, or /refine-from-external-fea for whole-part corrections.",
     }
+
+
+@app.get("/export-formats")
+async def export_formats():
+    return {"formats": EXPORT_FORMATS, "units": "mm",
+            "usage": "POST /export with form fields script + format -> {format, filename, mime, base64}"}
+
+
+@app.post("/export")
+@_sanitize_response
+async def export_any(script: str = Form(...), format: str = Form("step")):
+    """Any supported format for the design a script represents (formats: GET /export-formats)."""
+    if not B3D:
+        raise HTTPException(503, "build123d not installed")
+    obj, err = execute_cad_script_safely(script)
+    if err:
+        raise HTTPException(400, f"Script failed to execute: {err}")
+    try:
+        data, mime, fname = await asyncio.to_thread(export_bytes, obj, format)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return {"format": format.lower(), "filename": fname, "mime": mime, "bytes": len(data),
+            "base64": base64.b64encode(data).decode()}
 
 
 @app.post("/export-step")
