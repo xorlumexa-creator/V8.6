@@ -42,10 +42,19 @@ def distribute_force(weights, force_xyz):
 
 
 # ---------------------------------------------------------------------------------------------- CalculiX input
-def write_inp(path, node_ids, coords, elem_ids, elem_conn_ccx, fixed_nodes, forces, E_mpa, nu):
-    """Linear static analysis with C3D10 elements. forces: {node: (fx, fy, fz)} (N)."""
+def write_inp(path, node_ids, coords, elem_ids, elem_conn_ccx, fixed_nodes, forces, E_mpa, nu,
+              analysis="static", buckle_modes=3, thermal=None):
+    """C3D10 model. analysis: 'static' (linear static) | 'buckling' (the same static step as the reference load, then
+    *BUCKLE: the eigenvalues are the factors the load must be multiplied by to buckle the part) | 'thermal' (steady-state
+    heat conduction + the thermal stress it causes, plus any mechanical forces).
+    forces: {node: (fx, fy, fz)} N.  thermal: {"k_w_mk", "alpha_per_c", "t_ref_c", "temps": {node: degC},
+    "cflux_mw": {node: mW}}  (mm-N-s-tonne units: 1 W/(m K) == 1 mW/(mm K), power in mW)."""
+    if analysis not in ("static", "buckling", "thermal"):
+        raise ValueError(f"unknown analysis {analysis!r}")
+    if analysis == "thermal" and not thermal:
+        raise ValueError("a thermal analysis needs the thermal data")
     used = set(int(v) for v in np.asarray(elem_conn_ccx).ravel())
-    lines = ["*HEADING", "lumexa static", "*NODE"]
+    lines = ["*HEADING", f"lumexa {analysis}", "*NODE, NSET=NALL" if analysis == "thermal" else "*NODE"]
     for nid, xyz in zip(node_ids, coords):
         if int(nid) in used:
             lines.append(f"{int(nid)}, {xyz[0]:.9g}, {xyz[1]:.9g}, {xyz[2]:.9g}")
@@ -57,37 +66,74 @@ def write_inp(path, node_ids, coords, elem_ids, elem_conn_ccx, fixed_nodes, forc
         lines.append("*NSET, NSET=NFIX")
         for i in range(0, len(fx_nodes), 10):
             lines.append(", ".join(str(n) for n in fx_nodes[i:i + 10]))
-    lines += ["*MATERIAL, NAME=MAT", "*ELASTIC", f"{E_mpa:.9g}, {nu:.6g}",
-              "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT", "*BOUNDARY"]
+    lines += ["*MATERIAL, NAME=MAT", "*ELASTIC", f"{E_mpa:.9g}, {nu:.6g}"]
+    if analysis == "thermal":
+        lines += [f"*EXPANSION, ZERO={float(thermal['t_ref_c']):.9g}", f"{float(thermal['alpha_per_c']):.9g}",
+                  "*CONDUCTIVITY", f"{float(thermal['k_w_mk']):.9g}"]
+    lines += ["*SOLID SECTION, ELSET=EALL, MATERIAL=MAT"]
+    if analysis == "thermal":
+        lines += ["*INITIAL CONDITIONS, TYPE=TEMPERATURE", f"NALL, {float(thermal['t_ref_c']):.9g}"]
+    lines += ["*BOUNDARY"]
     for n in fx_nodes:
         lines.append(f"{n}, 1, 3")
-    lines += ["*STEP", "*STATIC", "*CLOAD"]
+    force_lines = []
     for n in sorted(forces):
         if int(n) in used:
             for dof, f in enumerate(forces[n], start=1):
                 if abs(f) > 0.0:
-                    lines.append(f"{int(n)}, {dof}, {f:.9g}")
+                    force_lines.append(f"{int(n)}, {dof}, {f:.9g}")
+    if analysis == "thermal":
+        lines += ["*STEP", "*UNCOUPLED TEMPERATURE-DISPLACEMENT, STEADY STATE", "*BOUNDARY"]
+        for n, t in sorted((thermal.get("temps") or {}).items()):
+            if int(n) in used:
+                lines.append(f"{int(n)}, 11, 11, {float(t):.9g}")
+        cf = [(int(n), float(w)) for n, w in sorted((thermal.get("cflux_mw") or {}).items()) if int(n) in used and w]
+        if cf:
+            lines.append("*CFLUX")
+            lines += [f"{n}, 11, {w:.9g}" for n, w in cf]
+        if force_lines:
+            lines += ["*CLOAD"] + force_lines
+    else:
+        lines += ["*STEP", "*STATIC", "*CLOAD"] + force_lines
     if fx_nodes:                                           # total reaction of the fixed set -> equilibrium check (.dat)
         lines += ["*NODE PRINT, NSET=NFIX, TOTALS=ONLY", "RF"]
-    lines += ["*NODE FILE", "U, RF", "*EL FILE", "S", "*END STEP"]
+    lines += ["*NODE FILE", "U, NT, RF" if analysis == "thermal" else "U, RF", "*EL FILE", "S", "*END STEP"]
+    if analysis == "buckling":
+        lines += ["*STEP", "*BUCKLE", f"{int(buckle_modes)}", "*NODE FILE", "U", "*END STEP"]
     with open(path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
 
 
-def parse_frd(text):
-    """Read the nodal DISP and STRESS blocks of a CalculiX .frd (ASCII). Later increments overwrite earlier ones.
-    Data lines are ' -1' + I10 node id + n x E12.5."""
-    res = {"DISP": {}, "STRESS": {}, "FORC": {}}
-    block, ncomp = None, 0
+def parse_frd(text, first_only=False):
+    """Read the nodal DISP, STRESS, FORC (reaction) and NDTEMP (temperature) blocks of a CalculiX .frd (ASCII).
+    Default: later increments overwrite earlier ones. first_only=True keeps the FIRST block of each kind (the static
+    step of a buckling run) and collects every DISP block, in order, in res['DISP_BLOCKS'] (block 0 = static, block 1 =
+    buckling mode 1, ...). Data lines are ' -1' + I10 node id + n x E12.5."""
+    comps = {"DISP": 3, "STRESS": 6, "FORC": 3, "NDTEMP": 1}
+    res = {"DISP": {}, "STRESS": {}, "FORC": {}, "NDTEMP": {}, "DISP_BLOCKS": []}
+    seen = set()
+    block, ncomp, tgt = None, 0, None
     for line in text.splitlines():
         if line.startswith(" -4"):
             parts = line.split()
             name = parts[1] if len(parts) > 1 else ""
-            if name in res:
-                block, ncomp = name, (6 if name == "STRESS" else 3)
-                res[name] = {}
-            else:
+            if name not in comps:
                 block = None
+                continue
+            dup = name in seen
+            seen.add(name)
+            block, ncomp = name, comps[name]
+            if dup and first_only:
+                if name != "DISP":
+                    block = None                           # later duplicates (mode stresses, ...) are ignored
+                    continue
+                tgt = {}                                   # a buckling-mode shape: kept in DISP_BLOCKS only
+                res["DISP_BLOCKS"].append(tgt)
+            else:
+                tgt = {}
+                res[name] = tgt
+                if name == "DISP":
+                    res["DISP_BLOCKS"].append(tgt)
             continue
         if line.startswith(" -3"):
             block = None
@@ -99,12 +145,32 @@ def parse_frd(text):
                 vals = tuple(float(body[13 + 12 * k:25 + 12 * k]) for k in range(ncomp))
             except ValueError:
                 continue
-            res[block][nid] = vals
+            tgt[nid] = vals
     return res
 
 
+def parse_buckling_factors(text):
+    """Buckling factors from CalculiX's .dat ('B U C K L I N G   F A C T O R   O U T P U T' table). Returns a list of
+    floats in mode order (may include negatives: the load would have to be reversed). First table wins."""
+    import re
+    lines = text.splitlines()
+    row = re.compile(r"^\s*(\d+)\s+([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*$")
+    for i, ln in enumerate(lines):
+        if "bucklingfactoroutput" in re.sub(r"\s+", "", ln.lower()):
+            out = []
+            for nxt in lines[i + 1:i + 40]:
+                m = row.match(nxt)
+                if m:
+                    out.append(float(m.group(2)))
+                elif out:
+                    break
+            if out:
+                return out
+    return []
+
+
 # ---------------------------------------------------------------------------------------------- results
-def analyse(node_xyz, disp, stress, zone_frac=0.85):
+def analyse(node_xyz, disp, stress, zone_frac=0.85, temps=None):
     """Peak von Mises (+ where, + the zone within 15 % of it) and peak displacement magnitude."""
     if not stress:
         raise ValueError("no STRESS block in the result file")
@@ -124,6 +190,33 @@ def analyse(node_xyz, disp, stress, zone_frac=0.85):
         out["disp_xyz_mm"] = [float(c) for c in np.array([node_xyz[dids[j]]], float)[0]]
     else:
         out["disp_mm"] = 0.0
+    if temps:
+        tv = np.array([temps[i][0] for i in sorted(temps)], float)
+        out["t_max_c"], out["t_min_c"] = float(tv.max()), float(tv.min())
+        h = temps.get(ids[k])
+        out["t_at_hotspot_c"] = float(h[0]) if h else None
+    return out
+
+
+def thermal_sanity(temps, target_by_node, has_flux, t_ref_c=None, tol_frac=0.005, tol_abs=0.5):
+    """Physical checks on a steady-state thermal solution: every node with a prescribed temperature reached it, and
+    (without heat input) no node is hotter or colder than the prescribed extremes (maximum principle)."""
+    if not temps:
+        return {"ok": False, "reason": "no temperature result"}
+    span = max(max(target_by_node.values()) - min(target_by_node.values()), 1.0) if target_by_node else 1.0
+    tol = max(tol_abs, tol_frac * span)
+    errs = [abs(temps[n][0] - t) for n, t in target_by_node.items() if n in temps]
+    out = {"ok": True, "bc_max_err_c": round(max(errs), 4) if errs else None}
+    tv = [v[0] for v in temps.values()]
+    out["t_range_c"] = [round(min(tv), 3), round(max(tv), 3)]
+    if errs and max(errs) > tol:
+        out["ok"] = False
+        out["reason"] = "prescribed temperatures were not reached: a temperature boundary condition was not applied"
+    elif target_by_node and not has_flux:
+        lo, hi = min(target_by_node.values()), max(target_by_node.values())
+        if min(tv) < lo - tol or max(tv) > hi + tol:
+            out["ok"] = False
+            out["reason"] = "temperatures outside the prescribed extremes with no heat input: the thermal solve is not trustworthy"
     return out
 
 
@@ -150,7 +243,7 @@ def bc_sanity(disp, fixed_nodes, load_nodes_by_load, force_by_load, tol_fixed=0.
     return out
 
 
-def parse_dat_totals(text):
+def parse_dat_totals(text, first=False):
     """Total reaction force (fx, fy, fz) of the fixed node set from CalculiX's .dat file (*NODE PRINT, TOTALS=ONLY).
     The value sits on the first numeric line after 'total force (fx,fy,fz) ...'. The last one in the file wins."""
     lines = text.splitlines()
@@ -165,6 +258,8 @@ def parse_dat_totals(text):
                         break
                     except ValueError:
                         continue
+            if first and found is not None:       # buckling runs print the totals again for the mode shapes
+                break
     return found
 
 

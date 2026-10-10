@@ -4,6 +4,7 @@ Pipeline: gmsh (STEP import, tet10 mesh) -> match faces by position/area/bbox ->
 Run:  uvicorn app:app --host 0.0.0.0 --port 8000      Env: CCX_API_KEY (optional shared secret), CCX_BIN (default ccx),
 CCX_THREADS (default 2), CCX_TIMEOUT_S (default 600), MAX_NODES (default 12000)."""
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -82,6 +83,12 @@ def solve_case(step_path, case, workdir, gmsh=None):
     t0 = time.time()
     tm = {}
     mat = case["material"]
+    analysis = case.get("analysis", "static")
+    if analysis not in ("static", "buckling", "thermal"):
+        raise SolveError("setup", f"unknown analysis {analysis!r} (static | buckling | thermal)")
+    th_in = case.get("thermal") or {}
+    if analysis == "thermal" and not all(k in th_in for k in ("k_w_mk", "alpha_per_c", "t_ref_c")):
+        raise SolveError("setup", "a thermal case needs thermal.k_w_mk, thermal.alpha_per_c and thermal.t_ref_c")
     exp_lo, exp_hi = np.asarray(case["bbox_mm"]["min"], float), np.asarray(case["bbox_mm"]["max"], float)
     exp_ext = float(np.linalg.norm(exp_hi - exp_lo))
     _gmsh_init(gmsh)
@@ -113,22 +120,35 @@ def solve_case(step_path, case, workdir, gmsh=None):
         faces = case["faces"]
         try:
             fixed_m = FC.match_faces(faces["fixed"], surfaces, exp_ext)
-            load_m = [FC.match_faces(l["faces"], surfaces, exp_ext) for l in faces["loads"]]
+            load_m = [FC.match_faces(l["faces"], surfaces, exp_ext) for l in faces.get("loads", [])]
+            temp_m = [FC.match_faces(t["faces"], surfaces, exp_ext) for t in faces.get("temps", [])]
+            flux_m = [FC.match_faces(f["faces"], surfaces, exp_ext) for f in faces.get("fluxes", [])]
         except ValueError as e:
             raise SolveError("face_match", str(e))
-        fixed_tags = sorted({t for m in fixed_m for t in m["tags"]})
-        load_tags = [sorted({t for m in lm for t in m["tags"]}) for lm in load_m]
+        _tags = lambda ms: sorted({t for m in ms for t in m["tags"]})
+        fixed_tags = _tags(fixed_m)
+        load_tags = [_tags(lm) for lm in load_m]
+        temp_tags = [_tags(tm) for tm in temp_m]
+        flux_tags = [_tags(fm) for fm in flux_m]
+        if not fixed_tags:
+            raise SolveError("setup", "no fixed face: the part must be held somewhere or the stiffness matrix is singular")
         if set(fixed_tags) & {t for ts in load_tags for t in ts}:
             raise SolveError("face_match", "a fixed face and a loaded face resolved to the same gmsh surface")
+        if {t for ts in flux_tags for t in ts} & {t for ts in temp_tags for t in ts}:
+            raise SolveError("face_match", "a heat-input face and a temperature face resolved to the same gmsh surface")
 
         # ---- mesh (tet10), coarsened if it would exceed the node budget
         lc = FC.choose_lc(exp_ext, case.get("min_thickness_mm"))
         max_nodes = int(case.get("max_nodes") or MAX_NODES)
         gmsh.option.setNumber("Mesh.ElementOrder", 2)
-        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 12)
+        # a mesh a little over the budget is fine (the estimate is rough and RAM is not the limit at this size);
+        # beyond that, coarsen the element size AND the curvature refinement that small fillets/holes trigger
+        hard_max = int(max_nodes * 1.3)
+        curv = 12
         n_nodes = 0
-        for attempt in range(4):
+        for attempt in range(6):
             gmsh.model.mesh.clear()
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", curv)
             gmsh.option.setNumber("Mesh.MeshSizeMax", lc)
             gmsh.option.setNumber("Mesh.MeshSizeMin", lc * 0.2)
             try:
@@ -136,12 +156,14 @@ def solve_case(step_path, case, workdir, gmsh=None):
             except Exception as e:
                 raise SolveError("mesh", f"gmsh meshing failed: {e}", design_related=True)
             n_nodes = len(gmsh.model.mesh.getNodes(-1, -1, True, False)[0])
-            if n_nodes <= max_nodes:
+            if n_nodes <= hard_max:
                 break
             lc *= min(1.6, (n_nodes / max_nodes) ** (1 / 3) * 1.1)
-        if n_nodes > max_nodes:
-            raise SolveError("mesh", f"mesh still has {n_nodes} nodes (> {max_nodes}) at element size {lc:.2f} mm: "
-                                     "part too large/complex for this machine", design_related=False)
+            curv = max(4, curv - 2)
+        if n_nodes > hard_max:
+            raise SolveError("mesh", f"mesh still has {n_nodes} nodes (limit {max_nodes}) at element size {lc:.2f} mm "
+                                     "after coarsening: the geometry has many tiny features (small fillets, holes or "
+                                     "ribs) - simplify them or raise MAX_NODES", design_related=True)
         tm["mesh_s"] = round(time.time() - t0, 2)
 
         ntags, ncoords, _ = gmsh.model.mesh.getNodes(-1, -1, True, False)
@@ -168,7 +190,7 @@ def solve_case(step_path, case, workdir, gmsh=None):
 
         fixed_nodes = set().union(*[surf_nodes(t) for t in fixed_tags])
         forces, load_nodes, force_by_load, total = {}, {}, {}, {}
-        for l, tags in zip(faces["loads"], load_tags):
+        for l, tags in zip(faces.get("loads", []), load_tags):
             w = {}
             for tg in tags:
                 for n, v in FC.tri_node_weights(surf_tris(tg), node_xyz).items():
@@ -178,6 +200,24 @@ def solve_case(step_path, case, workdir, gmsh=None):
                 forces[n] = tuple(a + b for a, b in zip(forces.get(n, (0, 0, 0)), f))
             load_nodes[l["id"]], force_by_load[l["id"]] = list(w), l["force_xyz"]
             total[l["id"]] = [round(sum(forces[n][i] for n in w), 4) for i in range(3)]
+        temp_bc, cflux, temp_conflicts = {}, {}, 0
+        if analysis == "thermal":
+            by_node = {}
+            for t, tags in zip(faces.get("temps", []), temp_tags):
+                for tg in tags:
+                    for n in surf_nodes(tg):
+                        by_node.setdefault(n, []).append(float(t["temperature_c"]))
+            temp_conflicts = sum(1 for v in by_node.values() if max(v) - min(v) > 1e-6)
+            temp_bc = {n: sum(v) / len(v) for n, v in by_node.items()}      # an edge node shared by two faces: mean
+            if not temp_bc:
+                raise SolveError("setup", "a thermal case needs at least one temperature face")
+            for f, tags in zip(faces.get("fluxes", []), flux_tags):
+                w = {}
+                for tg in tags:
+                    for n, v in FC.tri_node_weights(surf_tris(tg), node_xyz).items():
+                        w[n] = w.get(n, 0.0) + v
+                for n, fx in FC.distribute_force(w, [float(f["power_w"]) * 1000.0, 0.0, 0.0]).items():   # W -> mW
+                    cflux[n] = cflux.get(n, 0.0) + fx[0]
         tm["setup_s"] = round(time.time() - t0, 2)
     finally:
         gmsh.finalize()
@@ -185,7 +225,10 @@ def solve_case(step_path, case, workdir, gmsh=None):
     # ---- CalculiX
     inp = os.path.join(workdir, "job.inp")
     FC.write_inp(inp, np.array(list(node_xyz)), np.array(list(node_xyz.values())), elem_ids,
-                 FC.tet10_gmsh_to_ccx(conn), fixed_nodes, forces, float(mat["E_mpa"]), float(mat["nu"]))
+                 FC.tet10_gmsh_to_ccx(conn), fixed_nodes, forces, float(mat["E_mpa"]), float(mat["nu"]),
+                 analysis=analysis, buckle_modes=int(case.get("buckle_modes") or 3),
+                 thermal=({"k_w_mk": th_in["k_w_mk"], "alpha_per_c": th_in["alpha_per_c"], "t_ref_c": th_in["t_ref_c"],
+                           "temps": temp_bc, "cflux_mw": cflux} if analysis == "thermal" else None))
     env = dict(os.environ, OMP_NUM_THREADS=CCX_THREADS, CCX_NPROC_EQUATION_SOLVER=CCX_THREADS)
     try:
         r = subprocess.run([CCX_BIN, "job"], cwd=workdir, capture_output=True, text=True, env=env, timeout=CCX_TIMEOUT_S)
@@ -199,18 +242,38 @@ def solve_case(step_path, case, workdir, gmsh=None):
         raise SolveError("solve", f"CalculiX failed (exit {r.returncode}): {tail[:600]}")
     tm["solve_s"] = round(time.time() - t0, 2)
 
-    res = FC.parse_frd(open(frd, errors="ignore").read())
+    res = FC.parse_frd(open(frd, errors="ignore").read(), first_only=(analysis == "buckling"))
+    dat_path = os.path.join(workdir, "job.dat")
+    dat_text = open(dat_path, errors="ignore").read() if os.path.exists(dat_path) else ""
     try:
-        out = FC.analyse(node_xyz, res["DISP"], res["STRESS"])
+        out = FC.analyse(node_xyz, res["DISP"], res["STRESS"], temps=(res["NDTEMP"] if analysis == "thermal" else None))
     except ValueError as e:
         raise SolveError("results", str(e))
+    if analysis == "buckling":
+        facs = FC.parse_buckling_factors(dat_text)
+        if not facs:
+            tail = " | ".join((r.stdout + r.stderr).strip().splitlines()[-6:])
+            raise SolveError("results", f"CalculiX produced no buckling factors ({tail[:300]})")
+        pos = [f for f in facs if f > 0]
+        bk = {"factors": [round(f, 4) for f in facs[:5]], "factor": round(min(pos), 4) if pos else None,
+              "n_modes": len(facs)}
+        blocks = res.get("DISP_BLOCKS") or []
+        if len(blocks) > 1 and blocks[1]:
+            mids = sorted(blocks[1])
+            mag = np.linalg.norm(np.array([blocks[1][i] for i in mids], float), axis=1)
+            bk["mode1_peak_xyz_mm"] = [float(c) for c in node_xyz[mids[int(np.argmax(mag))]]]
+        out["buckling"] = bk
     bc = FC.bc_sanity(res["DISP"], fixed_nodes, load_nodes, force_by_load)
+    if analysis == "thermal":
+        ts = FC.thermal_sanity(res["NDTEMP"], temp_bc, bool(cflux))
+        ts["bc_conflicting_nodes"] = temp_conflicts
+        bc["thermal"] = ts
+        if not ts["ok"]:
+            bc["ok"] = False
+            bc["reason"] = ts["reason"]
     bc["face_matching"] = {"fixed": fixed_m, "loads": load_m}
     bc["applied_force_n"] = total
-    dat_total = None
-    dat_path = os.path.join(workdir, "job.dat")
-    if os.path.exists(dat_path):
-        dat_total = FC.parse_dat_totals(open(dat_path, errors="ignore").read())
+    dat_total = FC.parse_dat_totals(dat_text, first=(analysis == "buckling")) if dat_text else None
     eq = FC.equilibrium(res.get("FORC"), force_by_load, total=dat_total)
     if eq is not None:
         eq["source"] = "dat_totals" if dat_total is not None else "frd_forc"
@@ -224,7 +287,7 @@ def solve_case(step_path, case, workdir, gmsh=None):
             bc["ok"] = False
             bc["reason"] = (f"reaction forces do not balance the applied loads (error {eq['error_pct']}%): "
                             "a load or a constraint was not applied as intended")
-    out.update({"bc_check": bc, "mesh": {"nodes": n_nodes, "elements": int(len(elem_ids)), "element_size_mm": round(lc, 3),
+    out.update({"analysis": analysis, "bc_check": bc, "mesh": {"nodes": n_nodes, "elements": int(len(elem_ids)), "element_size_mm": round(lc, 3),
                                          "unit_scale_applied": k},
                 "versions": {"ccx": _ccx_version()}})
     tm["total_s"] = round(time.time() - t0, 2)
@@ -307,6 +370,87 @@ def selftest(x_api_key: str = Header(default="")):
                        "hotspot_mm": [round(v, 1) for v in out["hotspot_xyz_mm"]]},
                 "ratio": {"deflection": round(out["disp_mm"] / th_defl, 3), "stress": round(out["vm_mpa"] / th_sig, 3)},
                 "expect": "deflection ratio ~0.95-1.03; stress ratio ~1.0-1.3 (peak sits at the fixed edge)",
+                "bc_check": out["bc_check"], "mesh": out["mesh"], "timings": tm}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _box_step(gmsh, work, dx, dy, dz):
+    _gmsh_init(gmsh)
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.model.add("box")
+        gmsh.model.occ.addBox(0, 0, 0, dx, dy, dz)
+        gmsh.model.occ.synchronize()
+        step = os.path.join(work, "box.step")
+        gmsh.write(step)
+        return step
+    finally:
+        gmsh.finalize()
+
+
+def _x_face(x, b, h):
+    return {"center": [x, b / 2, h / 2], "area": b * h, "bbox_min": [x, 0, 0], "bbox_max": [x, b, h]}
+
+
+@app.get("/selftest-buckling")
+def selftest_buckling(x_api_key: str = Header(default="")):
+    """Clamped-free square column 10 x 10 x 200 mm, 100 N compression, against Euler: Pcr = pi^2 E I / (2 L)^2."""
+    _auth(x_api_key)
+    gmsh = _gmsh()
+    work = tempfile.mkdtemp(prefix="ccx_selfb_")
+    try:
+        E, nu, F, L, b, h = 70000.0, 0.33, 100.0, 200.0, 10.0, 10.0
+        step = _box_step(gmsh, work, L, b, h)
+        case = {"analysis": "buckling", "buckle_modes": 3, "material": {"E_mpa": E, "nu": nu},
+                "bbox_mm": {"min": [0, 0, 0], "max": [L, b, h]},
+                "faces": {"fixed": [_x_face(0, b, h)],
+                          "loads": [{"id": "axial", "force_xyz": [-F, 0, 0], "faces": [_x_face(L, b, h)]}]},
+                "min_thickness_mm": 6.0}
+        with _lock:
+            try:
+                out, tm = solve_case(step, case, work)
+            except SolveError as e:
+                return {"ok": False, "stage": e.stage, "reason": str(e)}
+        I = b * h ** 3 / 12.0
+        theory = math.pi ** 2 * E * I / (2.0 * L) ** 2 / F
+        fe = (out.get("buckling") or {}).get("factor")
+        return {"ok": fe is not None, "theory_buckling_factor": round(theory, 3), "fe": out.get("buckling"),
+                "ratio_fe_over_theory": round(fe / theory, 3) if fe else None,
+                "expect": "ratio ~0.95-1.10 (the two lowest modes are a degenerate pair)",
+                "bc_check": out["bc_check"], "mesh": out["mesh"], "timings": tm}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.get("/selftest-thermal")
+def selftest_thermal(x_api_key: str = Header(default="")):
+    """Aluminium bar 100 x 10 x 10 mm, one end held at 100 C and clamped, the other end at 0 C. Linear temperature
+    profile, so the free end grows by alpha * (T_mean - T_ref) * L = 23.6e-6 * (50 - 20) * 100 = 0.0708 mm."""
+    _auth(x_api_key)
+    gmsh = _gmsh()
+    work = tempfile.mkdtemp(prefix="ccx_selft_")
+    try:
+        E, nu, L, b, h, alpha, tref = 70000.0, 0.33, 100.0, 10.0, 10.0, 23.6e-6, 20.0
+        step = _box_step(gmsh, work, L, b, h)
+        case = {"analysis": "thermal", "material": {"E_mpa": E, "nu": nu},
+                "thermal": {"k_w_mk": 167.0, "alpha_per_c": alpha, "t_ref_c": tref},
+                "bbox_mm": {"min": [0, 0, 0], "max": [L, b, h]},
+                "faces": {"fixed": [_x_face(0, b, h)], "loads": [],
+                          "temps": [{"id": "hot", "temperature_c": 100.0, "faces": [_x_face(0, b, h)]},
+                                    {"id": "cold", "temperature_c": 0.0, "faces": [_x_face(L, b, h)]}]},
+                "min_thickness_mm": 6.0}
+        with _lock:
+            try:
+                out, tm = solve_case(step, case, work)
+            except SolveError as e:
+                return {"ok": False, "stage": e.stage, "reason": str(e)}
+        theory = alpha * (50.0 - tref) * L
+        return {"ok": True, "theory_end_growth_mm": round(theory, 4),
+                "fe": {"disp_mm": round(out["disp_mm"], 4), "t_max_c": out.get("t_max_c"), "t_min_c": out.get("t_min_c"),
+                       "von_mises_mpa": round(out["vm_mpa"], 3)},
+                "ratio_disp": round(out["disp_mm"] / theory, 3),
+                "expect": "ratio ~0.97-1.05, t_max 100, t_min 0, bc_check.ok true",
                 "bc_check": out["bc_check"], "mesh": out["mesh"], "timings": tm}
     finally:
         shutil.rmtree(work, ignore_errors=True)
