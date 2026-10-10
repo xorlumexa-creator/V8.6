@@ -189,6 +189,11 @@ def equilibrium(reactions, force_by_load, total=None):
 # ---------------------------------------------------------------------------------------------- face matching
 def _cost(d, s, extent):
     dc = float(np.linalg.norm(np.asarray(d["center"], float) - np.asarray(s["center"], float))) / extent
+    # A full cylinder's reported centre can sit on its surface instead of its axis (seen on 47 mm bores). Its bbox
+    # centre is always right, so take the better of the two; the bbox and area terms below still have to agree.
+    bc_d = (np.asarray(d["bbox_min"], float) + np.asarray(d["bbox_max"], float)) / 2.0
+    bc_s = (np.asarray(s["bbox_min"], float) + np.asarray(s["bbox_max"], float)) / 2.0
+    dc = min(dc, float(np.linalg.norm(bc_d - bc_s)) / extent)
     da = abs(float(s["area"]) / max(float(d["area"]), 1e-12) - 1.0)
     db = (float(np.linalg.norm(np.asarray(d["bbox_min"], float) - np.asarray(s["bbox_min"], float))) +
           float(np.linalg.norm(np.asarray(d["bbox_max"], float) - np.asarray(s["bbox_max"], float)))) / extent
