@@ -511,9 +511,10 @@ def selftest_buckling(x_api_key: str = Header(default="")):
 def selftest_thermal(x_api_key: str = Header(default="")):
     """Two closed-form checks on an aluminium bar 100 x 10 x 10 mm.
     (1) conduction: 100 C at one end, 0 C at the other -> T = 50 C at mid-length (linear profile).
-    (2) thermal stress: both ends clamped, uniform 120 C, stress-free at 20 C -> the mid-length axial stress is
-        -E * alpha * dT = -165.2 MPa (the side faces are free, so the mid-length state is uniaxial; the clamped
-        ends only disturb the outer ~10 mm)."""
+    (2) thermal stress: both ends clamped, uniform 120 C, stress-free at 20 C. With Poisson's ratio 0 the axes decouple
+        and the axial stress is exactly -E * alpha * dT = -165.2 MPa everywhere (tight check). With nu = 0.33 the clamps'
+        lateral restraint stretches the end zones, the total length cannot change, and the middle compresses a little
+        more (about +3%), so that case only has to land within 6%."""
     _auth(x_api_key)
     gmsh = _gmsh()
     work = tempfile.mkdtemp(prefix="ccx_selft_")
@@ -531,6 +532,7 @@ def selftest_thermal(x_api_key: str = Header(default="")):
             "restrained_expansion": {**base, "faces": {"fixed": [_x_face(0, b, h), _x_face(L, b, h)], "loads": [], "temps": [
                 {"id": "a", "temperature_c": 120.0, "faces": [_x_face(0, b, h)]},
                 {"id": "b", "temperature_c": 120.0, "faces": [_x_face(L, b, h)]}]}}}
+        cases["restrained_expansion_nu0"] = {**cases["restrained_expansion"], "material": {"E_mpa": E, "nu": 0.0}}
         res, last = {}, {}
         for name, c in cases.items():
             with _lock:
@@ -540,14 +542,19 @@ def selftest_thermal(x_api_key: str = Header(default="")):
                     return {"ok": False, "case": name, "stage": e.stage, "reason": str(e)}
             last = {"mesh": res[name]["mesh"], "timings": tm}
         p1, p2 = res["conduction"]["probes"][0], res["restrained_expansion"]["probes"][0]
+        p0 = res["restrained_expansion_nu0"]["probes"][0]
         theory = -E * alpha * 100.0
         sxx = p2["stress_mpa"][0] if p2.get("stress_mpa") else None
+        sxx0 = p0["stress_mpa"][0] if p0.get("stress_mpa") else None
         checks = {
             "conduction_T_at_mid_c": {"fe": p1["t_c"], "theory": 50.0,
                                       "pass": p1["t_c"] is not None and abs(p1["t_c"] - 50.0) < 0.6},
-            "restrained_axial_stress_at_mid_mpa": {"fe": sxx, "theory": round(theory, 2),
-                                                   "ratio": round(sxx / theory, 3) if sxx else None,
-                                                   "pass": bool(sxx and abs(sxx / theory - 1.0) < 0.03)},
+            "restrained_axial_stress_at_mid_nu0_mpa": {"fe": sxx0, "theory": round(theory, 2),
+                                                       "ratio": round(sxx0 / theory, 4) if sxx0 else None,
+                                                       "pass": bool(sxx0 and abs(sxx0 / theory - 1.0) < 0.015)},
+            "restrained_axial_stress_at_mid_nu033_mpa": {"fe": sxx, "theory_ignoring_end_effect": round(theory, 2),
+                                                         "ratio": round(sxx / theory, 3) if sxx else None,
+                                                         "pass": bool(sxx and abs(sxx / theory - 1.0) < 0.06)},
             "restrained_lateral_stress_at_mid_mpa": {"fe": (p2["stress_mpa"][1:3] if p2.get("stress_mpa") else None),
                                                      "theory": [0.0, 0.0],
                                                      "pass": bool(p2.get("stress_mpa") and max(abs(v) for v in p2["stress_mpa"][1:3]) < 8.0)},
@@ -556,6 +563,7 @@ def selftest_thermal(x_api_key: str = Header(default="")):
                                                     "pass": all(abs((res["restrained_expansion"].get(k) or 0) - 120.0) < 0.6
                                                                 for k in ("t_min_c", "t_max_c"))},
             "boundary_checks_ok": {"pass": all(r["bc_check"].get("ok") for r in res.values())}}
+        checks["conduction_T_at_mid_c"]["pass"] = bool(p1["t_c"] is not None and abs(p1["t_c"] - 50.0) < 0.6)
         return {"ok": all(c["pass"] for c in checks.values()), "checks": checks,
                 "note": "Closed-form answers; the 3 mm mesh and nodal stress averaging allow a few percent.", **last}
     finally:
