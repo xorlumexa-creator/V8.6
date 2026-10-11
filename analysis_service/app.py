@@ -77,19 +77,24 @@ def _ccx_version():
 
 
 # ---------------------------------------------------------------------------------------------- the solve
-def _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale, modes, accuracy, unscaled, env):
+def _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, sc, modes, accuracy, threads, env, tag="a"):
     """Linear buckling in its own CalculiX run: a deck with ONE *BUCKLE step whose load is the reference load (scaled to a
-    ~1 N total, which keeps CalculiX from skipping modes). Factors are scaled back to the ACTUAL load."""
-    sc = 1.0 if unscaled else bscale
-    FC.write_inp(os.path.join(workdir, "buck.inp"), np.array(list(node_xyz)), np.array(list(node_xyz.values())), elem_ids,
+    ~1 N total, which keeps CalculiX from skipping modes). Factors are scaled back to the ACTUAL load. CalculiX's eigenvalue
+    solver is known to return random values with SPOOLES on more than 1-2 threads, so every thread setting is forced to
+    `threads` (default 1)."""
+    t = str(int(threads))
+    env = dict(env, OMP_NUM_THREADS=t, CCX_NPROC_EQUATION_SOLVER=t, CCX_NPROC_RESULTS=t, NUMBER_OF_CPUS=t,
+               OPENBLAS_NUM_THREADS=t, MKL_NUM_THREADS=t)
+    job = f"buck{tag}"
+    FC.write_inp(os.path.join(workdir, job + ".inp"), np.array(list(node_xyz)), np.array(list(node_xyz.values())), elem_ids,
                  FC.tet10_gmsh_to_ccx(conn), set(fixed_nodes), forces, float(mat["E_mpa"]), float(mat["nu"]),
                  analysis="buckling", buckle_modes=modes, buckle_scale=sc, buckle_accuracy=accuracy)
     try:
-        r = subprocess.run([CCX_BIN, "buck"], cwd=workdir, capture_output=True, text=True, env=env, timeout=CCX_TIMEOUT_S)
+        r = subprocess.run([CCX_BIN, job], cwd=workdir, capture_output=True, text=True, env=env, timeout=CCX_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         raise SolveError("solve", f"CalculiX buckling run exceeded {CCX_TIMEOUT_S:.0f}s")
     tail = (r.stdout + r.stderr).strip().splitlines()[-8:]
-    dat_p, frd_p = os.path.join(workdir, "buck.dat"), os.path.join(workdir, "buck.frd")
+    dat_p, frd_p = os.path.join(workdir, job + ".dat"), os.path.join(workdir, job + ".frd")
     dat = open(dat_p, errors="ignore").read() if os.path.exists(dat_p) else ""
     raw = FC.parse_buckling_factors(dat)
     if r.returncode != 0 or not raw:
@@ -114,6 +119,22 @@ def _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, b
             bk["mode1_peak_xyz_mm"] = [float(c) for c in node_xyz[ids[int(np.argmax(mg))]]]
     bk["debug"] = {"mode_blocks": stats, "ccx_stdout_tail": tail}
     return bk
+
+
+def _buckling_checked(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale, modes, accuracy, threads, env):
+    """Two buckling runs at load scales 10x apart. A correct linear buckling factor (per actual load) does not depend on the
+    size of the reference load; the CalculiX failure modes (random values, a skipped first mode) do. A mismatch marks the
+    result as suspect so it can never be passed off as a verdict."""
+    a = _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale, modes, accuracy, threads, env, "a")
+    b = _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale * 0.1, modes, accuracy, threads, env, "b")
+    fa, fb = a.get("factor"), b.get("factor")
+    agree = bool(fa and fb and abs(fa - fb) <= 0.03 * max(fa, fb))
+    a["check"] = {"factor_load_1N": fa, "factor_load_0.1N": fb, "agree_within_3pct": agree}
+    if not agree:
+        a["suspect"] = True
+        a["suspect_reason"] = (f"CalculiX buckling is not repeatable (factor {fa} with a 1 N reference load vs {fb} with 0.1 N); "
+                               "a real buckling factor does not depend on the reference load")
+    return a
 
 
 def solve_case(step_path, case, workdir, gmsh=None):
@@ -294,9 +315,9 @@ def solve_case(step_path, case, workdir, gmsh=None):
     except ValueError as e:
         raise SolveError("results", str(e))
     if analysis == "buckling":
-        out["buckling"] = _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale,
-                                        int(case.get("buckle_modes") or 3), case.get("buckle_accuracy"),
-                                        bool(case.get("buckle_unscaled")), env)
+        out["buckling"] = _buckling_checked(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale,
+                                            int(case.get("buckle_modes") or 3), case.get("buckle_accuracy"),
+                                            int(case.get("buckle_threads") or 1), env)
     bc = FC.bc_sanity(res["DISP"], fixed_nodes, load_nodes, force_by_load)
     if analysis == "thermal":
         ts = FC.thermal_sanity(res["NDTEMP"], temp_bc, bool(cflux))
@@ -444,8 +465,9 @@ def selftest_buckling(x_api_key: str = Header(default="")):
         I = b * h ** 3 / 12.0
         theory = math.pi ** 2 * E * I / (2.0 * L) ** 2 / F
         variants, last = [], {}
-        for name, extra in (("default", {}), ("accuracy_1e-5", {"buckle_accuracy": 1e-5}),
-                            ("unscaled_100N", {"buckle_unscaled": True})):
+        for name, extra in (("1thread", {"buckle_threads": 1}),
+                            ("1thread_acc1e-4", {"buckle_threads": 1, "buckle_accuracy": 1e-4}),
+                            ("2threads_acc1e-4", {"buckle_threads": 2, "buckle_accuracy": 1e-4})):
             with _lock:
                 try:
                     out, tm = solve_case(step, {**case, **extra}, work)
@@ -457,8 +479,10 @@ def selftest_buckling(x_api_key: str = Header(default="")):
             last = {"bc_check": out["bc_check"], "mesh": out["mesh"], "timings": tm}
             variants.append({"variant": name, "factors": bk.get("factors"), "raw_factors": bk.get("raw_factors"),
                              "ratio_fe_over_theory": round(fe / theory, 3) if fe else None,
-                             "mode1_peak_xyz_mm": bk.get("mode1_peak_xyz_mm"), "debug": bk.get("debug")})
-        good = [v for v in variants if v.get("ratio_fe_over_theory") and 0.9 <= v["ratio_fe_over_theory"] <= 1.15]
+                             "mode1_peak_xyz_mm": bk.get("mode1_peak_xyz_mm"), "check": bk.get("check"),
+                             "suspect": bk.get("suspect", False), "debug": bk.get("debug")})
+        good = [v for v in variants if v.get("ratio_fe_over_theory") and 0.9 <= v["ratio_fe_over_theory"] <= 1.15
+                and not v.get("suspect")]
         return {"ok": bool(good), "theory_buckling_factor": round(theory, 3),
                 "best_variant": good[0]["variant"] if good else None, "variants": variants,
                 "expect": "ratio ~0.95-1.10, first two factors nearly equal (a degenerate pair), mode-1 peak at the free end x~200",
