@@ -756,8 +756,10 @@ def build_load_case(test, descs, materials, default_material="aluminum_6061"):
         t_ref = float(test.get("reference_temperature_c", 20.0))
     except (TypeError, ValueError):
         raise PlanError(f"{tid}: reference_temperature_c must be a number.")
+    probes = [list(map(float, p)) for p in (test.get("probe_mm") or [])
+              if isinstance(p, (list, tuple)) and len(p) == 3][:5]      # internal: nodal results at given points
     return {"id": tid, "type": ttype, "material": mat, "fixed_idx": fixed_idx, "loads": load_list,
-            "temps": temp_list, "fluxes": flux_list, "t_ref_c": t_ref,
+            "temps": temp_list, "fluxes": flux_list, "t_ref_c": t_ref, "probe_mm": probes,
             "fixed_pts_mm": pts(fixed_idx), "load_pts_mm": pts([i for l in load_list for i in l["face_idx"]]),
             "criteria": {k: float(v) for k, v in crit.items()
                          if k in ("min_safety_factor", "max_deflection_mm", "max_von_mises_mpa",
@@ -829,7 +831,7 @@ def evaluate(case, fem, diag, default_min_sf=2.0):
                "hotspot_mm": (fem.get("critical_section") or {}).get("hotspot_xyz_mm"),
                "hot_zone_mm": (fem.get("critical_section") or {}).get("hot_zone_mm")}
     for k in ("buckling_factor", "buckling_factors", "buckling_mode1_peak_mm", "t_max_c", "t_min_c", "t_at_hotspot_c",
-              "yield_at_hotspot_mpa"):
+              "yield_at_hotspot_mpa", "probes"):
         if fem.get(k) is not None:
             metrics[k] = fem[k]
     out = {**base, "status": status, "solver": fem.get("solver", "simscale"), "metrics": metrics,

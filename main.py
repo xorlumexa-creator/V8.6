@@ -7842,6 +7842,8 @@ def run_ccx_service_fem(cad_obj, mat_key, load_case, descs, min_sf=2.0):
         case["analysis"] = analysis
         if analysis == "buckling":
             case["buckle_modes"] = 3
+        if load_case.get("probe_mm"):
+            case["probe_mm"] = load_case["probe_mm"]
         if analysis == "thermal":
             case["thermal"] = {"k_w_mk": float(mat["thermal_conductivity"]),
                                "alpha_per_c": float(mat["thermal_expansion_per_c"]),
@@ -7904,6 +7906,8 @@ def run_ccx_service_fem(cad_obj, mat_key, load_case, descs, min_sf=2.0):
                             "versions": res.get("versions")},
             "inputs": {"load_case": load_case["id"], "forces_n": [l["force_xyz"] for l in load_case["loads"]]},
         }
+        if res.get("probes"):
+            fem["probes"] = res["probes"]
         if analysis == "buckling":
             bk = res.get("buckling") or {}
             if bk.get("suspect"):
@@ -8087,19 +8091,22 @@ async def _plan_selftest_new_types(kind, mat_key, force_n, dry_run):
     alpha = mat["thermal_expansion_per_c"]
     bar = b3d.Pos(L / 2, 0, 0) * b3d.Box(L, b, h)
     plan = {"version": 1, "tests": [{
-        "id": "gradient", "type": "thermal_stress", "material": mat_key, "reference_temperature_c": 100.0,
-        "constraints": [{"id": "clamp", "type": "fixed", "faces": {"at": "min_x", "normal": "-x"}}],
-        "temperatures": [{"id": "hot", "faces": {"at": "min_x", "normal": "-x"}, "temperature_c": 100.0},
-                         {"id": "cold", "faces": {"at": "max_x", "normal": "+x"}, "temperature_c": 0.0}],
-        "criteria": {"min_safety_factor": 2.0}}]}
+        "id": "restrained_heating", "type": "thermal_stress", "material": mat_key, "reference_temperature_c": 20.0,
+        "constraints": [{"id": "clamp_a", "type": "fixed", "faces": {"at": "min_x", "normal": "-x"}},
+                        {"id": "clamp_b", "type": "fixed", "faces": {"at": "max_x", "normal": "+x"}}],
+        "temperatures": [{"id": "end_a", "faces": {"at": "min_x", "normal": "-x"}, "temperature_c": 120.0},
+                         {"id": "end_b", "faces": {"at": "max_x", "normal": "+x"}, "temperature_c": 120.0}],
+        "probe_mm": [[L / 2, 0.0, 0.0]]}]}
     out = await run_plan_tests(bar, plan, dry_run=dry_run)
-    theory = alpha * math.sqrt((L * L / 2) ** 2 + (L * b) ** 2 + (L * h) ** 2)
-    out["expected"] = {"max_displacement_mm": round(theory, 4), "von_mises_mpa": "~0 (exactly stress-free)",
-                       "t_range_c": [0.0, 100.0], "expect": "displacement ratio 0.97-1.03, von Mises < 3, status PASS"}
+    theory = -E * alpha * 100.0
+    out["expected"] = {"mid_length_axial_stress_mpa": round(theory, 2), "temperature_c": 120.0,
+                       "expect": "mid-length sigma_xx ratio 0.97-1.03; the verdict itself may be FAIL (restrained heating is severe) - "
+                                 "the check is the stress at the middle, not the status"}
     m = (out.get("results") or [{}])[0].get("metrics") or {}
-    if m.get("max_deflection_mm") is not None:
-        out["ratio_fem_over_theory"] = {"displacement": round(m["max_deflection_mm"] / theory, 3),
-                                        "von_mises_mpa": m.get("von_mises_mpa")}
+    pr = (m.get("probes") or [{}])[0]
+    if pr.get("stress_mpa"):
+        out["ratio_fem_over_theory"] = {"mid_axial_stress": round(pr["stress_mpa"][0] / theory, 3),
+                                        "mid_temperature_c": pr.get("t_c"), "peak_von_mises_mpa": m.get("von_mises_mpa")}
     return out
 
 
