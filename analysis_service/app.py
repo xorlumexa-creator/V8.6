@@ -2,7 +2,7 @@
 
 Pipeline: gmsh (STEP import, tet10 mesh) -> match faces by position/area/bbox -> .inp -> ccx -> .frd -> metrics.
 Run:  uvicorn app:app --host 0.0.0.0 --port 8000      Env: CCX_API_KEY (optional shared secret), CCX_BIN (default ccx),
-CCX_THREADS (default 2), CCX_TIMEOUT_S (default 600), MAX_NODES (default 12000)."""
+CCX_THREADS (forced to 1 unless CCX_ALLOW_MULTITHREAD is set), CCX_TIMEOUT_S (default 600), MAX_NODES (default 12000)."""
 import json
 import math
 import os
@@ -31,7 +31,9 @@ async def _crash_handler(request, exc):
         "ok": False, "stage": "crash", "reason": f"{type(exc).__name__}: {str(exc)[:300]}",
         "trace_tail": "".join(tail)[-1800:]})
 CCX_BIN = os.environ.get("CCX_BIN", "ccx")
-CCX_THREADS = os.environ.get("CCX_THREADS", "2")
+# CalculiX's SPOOLES solver gives random results on several threads (seen: buckling factors off by 100x, a 6% equilibrium
+# error in a plain static solve). These solves take seconds, so run on ONE thread unless multi-thread is explicitly allowed.
+CCX_THREADS = os.environ.get("CCX_THREADS", "1") if os.environ.get("CCX_ALLOW_MULTITHREAD") else "1"
 CCX_TIMEOUT_S = float(os.environ.get("CCX_TIMEOUT_S", "600"))
 MAX_NODES = int(os.environ.get("MAX_NODES", "12000"))
 API_KEY = os.environ.get("CCX_API_KEY", "").strip()
@@ -493,13 +495,14 @@ def selftest_buckling(x_api_key: str = Header(default="")):
 
 @app.get("/selftest-thermal")
 def selftest_thermal(x_api_key: str = Header(default="")):
-    """Aluminium bar 100 x 10 x 10 mm, one end held at 100 C and clamped, the other end at 0 C. Linear temperature
-    profile, so the free end grows by alpha * (T_mean - T_ref) * L = 23.6e-6 * (50 - 20) * 100 = 0.0708 mm."""
+    """Aluminium bar 100 x 10 x 10 mm, T = 100 C at the clamped end, 0 C at the free end (linear profile). The stress-free
+    temperature is set to 100 C, so the clamped face has zero thermal strain and the exact solution is stress-free:
+    u = -alpha*(x^2/2, x*y, x*z). Checks the temperature field, the expansion law and the reference temperature."""
     _auth(x_api_key)
     gmsh = _gmsh()
     work = tempfile.mkdtemp(prefix="ccx_selft_")
     try:
-        E, nu, L, b, h, alpha, tref = 70000.0, 0.33, 100.0, 10.0, 10.0, 23.6e-6, 20.0
+        E, nu, L, b, h, alpha, tref = 70000.0, 0.33, 100.0, 10.0, 10.0, 23.6e-6, 100.0
         step = _box_step(gmsh, work, L, b, h)
         case = {"analysis": "thermal", "material": {"E_mpa": E, "nu": nu},
                 "thermal": {"k_w_mk": 167.0, "alpha_per_c": alpha, "t_ref_c": tref},
@@ -513,12 +516,14 @@ def selftest_thermal(x_api_key: str = Header(default="")):
                 out, tm = solve_case(step, case, work)
             except SolveError as e:
                 return {"ok": False, "stage": e.stage, "reason": str(e)}
-        theory = alpha * (50.0 - tref) * L
-        return {"ok": True, "theory_end_growth_mm": round(theory, 4),
+        theory = alpha * math.sqrt((L * L / 2) ** 2 + (L * b) ** 2 + (L * h) ** 2)     # |u| at the free corner
+        vm = out["vm_mpa"]
+        return {"ok": bool(abs(out["disp_mm"] / theory - 1.0) < 0.03 and vm < 3.0 and out["bc_check"].get("ok")),
+                "theory_max_disp_mm": round(theory, 4), "stress_free_exact_solution": True,
                 "fe": {"disp_mm": round(out["disp_mm"], 4), "t_max_c": out.get("t_max_c"), "t_min_c": out.get("t_min_c"),
                        "von_mises_mpa": round(out["vm_mpa"], 3)},
                 "ratio_disp": round(out["disp_mm"] / theory, 3),
-                "expect": "ratio ~0.97-1.05, t_max 100, t_min 0, bc_check.ok true",
+                "expect": "ratio_disp 0.97-1.03, von_mises ~0 (< 3 MPa), t_max 100, t_min 0, bc_check.ok true",
                 "bc_check": out["bc_check"], "mesh": out["mesh"], "timings": tm}
     finally:
         shutil.rmtree(work, ignore_errors=True)
