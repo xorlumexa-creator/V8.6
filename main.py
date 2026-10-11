@@ -8028,7 +8028,7 @@ async def run_test_plan(file: UploadFile = File(...), plan: str = Form(...), dry
 
 @app.get("/test-plan-selftest")
 @_sanitize_response
-async def test_plan_selftest(force_n: float = 100.0, material: str = "", dry_run: bool = True):
+async def test_plan_selftest(force_n: float = 100.0, material: str = "", dry_run: bool = True, kind: str = "static"):
     """Cantilever driven ONLY by a test plan (no force/face arguments). dry_run=true (default) is instant and
     shows which faces the selectors picked; dry_run=false runs SimScale (several minutes) and compares with
     beam theory."""
@@ -8037,6 +8037,8 @@ async def test_plan_selftest(force_n: float = 100.0, material: str = "", dry_run
     mat_key = material or SIMSCALE_TEMPLATE_MATERIAL
     if mat_key not in MATERIALS:
         mat_key = "aluminum_6061"
+    if kind in ("buckling", "thermal"):
+        return await _plan_selftest_new_types(kind, mat_key, force_n if kind == "buckling" else None, dry_run)
     L, h, b = 100.0, 20.0, 10.0
     beam = b3d.Pos(L / 2, 0, 0) * b3d.Box(L, h, b)
     plan = {"version": 1, "tests": [{
@@ -8056,6 +8058,48 @@ async def test_plan_selftest(force_n: float = 100.0, material: str = "", dry_run
         out["ratio_fem_over_theory"] = {
             "stress": round(m["von_mises_mpa"] / max(exp["beam_theory_max_stress_mpa"], 1e-9), 3),
             "deflection": round((m.get("max_deflection_mm") or 0) / max(exp["beam_theory_tip_deflection_mm"], 1e-9), 3)}
+    return out
+
+
+async def _plan_selftest_new_types(kind, mat_key, force_n, dry_run):
+    """The whole chain for the new test types with NO LLM: test plan -> face selectors -> adapter -> CalculiX service,
+    compared with closed-form answers. buckling: clamped-free 10x10x200 column vs Euler. thermal: 100x10x10 bar,
+    100 C at the clamped end, 0 C at the free end, stress-free temperature 100 C -> exactly stress-free."""
+    mat = MATERIALS[mat_key]
+    E = mat["youngs_modulus_gpa"] * 1e3
+    if kind == "buckling":
+        L, b, h, F = 200.0, 10.0, 10.0, float(force_n or 100.0)
+        bar = b3d.Pos(L / 2, 0, 0) * b3d.Box(L, b, h)
+        plan = {"version": 1, "tests": [{
+            "id": "column", "type": "buckling", "material": mat_key,
+            "constraints": [{"id": "base", "type": "fixed", "faces": {"at": "min_x", "normal": "-x"}}],
+            "loads": [{"id": "axial", "type": "force", "faces": {"at": "max_x", "normal": "+x"},
+                       "force_n": F, "direction": "-x"}],
+            "criteria": {"min_buckling_factor": 3.0}}]}
+        out = await run_plan_tests(bar, plan, dry_run=dry_run)
+        euler = math.pi ** 2 * E * (b * h ** 3 / 12.0) / (2.0 * L) ** 2 / F
+        out["expected"] = {"euler_buckling_factor": round(euler, 3), "expect": "ratio 0.95-1.05, status PASS"}
+        bf = ((out.get("results") or [{}])[0].get("metrics") or {}).get("buckling_factor")
+        if bf:
+            out["ratio_fem_over_euler"] = round(bf / euler, 3)
+        return out
+    L, b, h = 100.0, 10.0, 10.0
+    alpha = mat["thermal_expansion_per_c"]
+    bar = b3d.Pos(L / 2, 0, 0) * b3d.Box(L, b, h)
+    plan = {"version": 1, "tests": [{
+        "id": "gradient", "type": "thermal_stress", "material": mat_key, "reference_temperature_c": 100.0,
+        "constraints": [{"id": "clamp", "type": "fixed", "faces": {"at": "min_x", "normal": "-x"}}],
+        "temperatures": [{"id": "hot", "faces": {"at": "min_x", "normal": "-x"}, "temperature_c": 100.0},
+                         {"id": "cold", "faces": {"at": "max_x", "normal": "+x"}, "temperature_c": 0.0}],
+        "criteria": {"min_safety_factor": 2.0}}]}
+    out = await run_plan_tests(bar, plan, dry_run=dry_run)
+    theory = alpha * math.sqrt((L * L / 2) ** 2 + (L * b) ** 2 + (L * h) ** 2)
+    out["expected"] = {"max_displacement_mm": round(theory, 4), "von_mises_mpa": "~0 (exactly stress-free)",
+                       "t_range_c": [0.0, 100.0], "expect": "displacement ratio 0.97-1.03, von Mises < 3, status PASS"}
+    m = (out.get("results") or [{}])[0].get("metrics") or {}
+    if m.get("max_deflection_mm") is not None:
+        out["ratio_fem_over_theory"] = {"displacement": round(m["max_deflection_mm"] / theory, 3),
+                                        "von_mises_mpa": m.get("von_mises_mpa")}
     return out
 
 
