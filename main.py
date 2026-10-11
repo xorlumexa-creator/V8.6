@@ -7906,6 +7906,9 @@ def run_ccx_service_fem(cad_obj, mat_key, load_case, descs, min_sf=2.0):
         }
         if analysis == "buckling":
             bk = res.get("buckling") or {}
+            if bk.get("suspect"):
+                fem["numerically_suspect"] = True
+                fem["suspect_reason"] = bk.get("suspect_reason")
             fem["buckling_factor"] = bk.get("factor")
             fem["buckling_factors"] = bk.get("factors")
             if bk.get("mode1_peak_xyz_mm"):
