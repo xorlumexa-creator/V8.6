@@ -344,6 +344,20 @@ def solve_case(step_path, case, workdir, gmsh=None):
             bc["ok"] = False
             bc["reason"] = (f"reaction forces do not balance the applied loads (error {eq['error_pct']}%): "
                             "a load or a constraint was not applied as intended")
+    if case.get("probe_mm"):                       # stress / temperature / displacement at the nodes nearest to given points
+        ids_arr = np.array(list(node_xyz))
+        pts_arr = np.array(list(node_xyz.values()), float)
+        probes = []
+        for p_ in case["probe_mm"]:
+            k_ = int(np.argmin(np.linalg.norm(pts_arr - np.asarray(p_, float), axis=1)))
+            nid = int(ids_arr[k_])
+            s6, tt, d3 = res["STRESS"].get(nid), (res.get("NDTEMP") or {}).get(nid), res["DISP"].get(nid)
+            probes.append({"at_mm": [float(c) for c in p_], "node_mm": [round(float(c), 3) for c in pts_arr[k_]],
+                           "stress_mpa": [round(float(v), 3) for v in s6] if s6 else None,
+                           "von_mises_mpa": round(float(FC.vm_from_tensor(s6)[0]), 3) if s6 else None,
+                           "t_c": round(float(tt[0]), 3) if tt else None,
+                           "disp_mm": [round(float(v), 5) for v in d3] if d3 else None})
+        out["probes"] = probes
     out.update({"analysis": analysis, "bc_check": bc, "mesh": {"nodes": n_nodes, "elements": int(len(elem_ids)), "element_size_mm": round(lc, 3),
                                          "unit_scale_applied": k},
                 "versions": {"ccx": _ccx_version()}})
@@ -495,35 +509,54 @@ def selftest_buckling(x_api_key: str = Header(default="")):
 
 @app.get("/selftest-thermal")
 def selftest_thermal(x_api_key: str = Header(default="")):
-    """Aluminium bar 100 x 10 x 10 mm, T = 100 C at the clamped end, 0 C at the free end (linear profile). The stress-free
-    temperature is set to 100 C, so the clamped face has zero thermal strain and the exact solution is stress-free:
-    u = -alpha*(x^2/2, x*y, x*z). Checks the temperature field, the expansion law and the reference temperature."""
+    """Two closed-form checks on an aluminium bar 100 x 10 x 10 mm.
+    (1) conduction: 100 C at one end, 0 C at the other -> T = 50 C at mid-length (linear profile).
+    (2) thermal stress: both ends clamped, uniform 120 C, stress-free at 20 C -> the mid-length axial stress is
+        -E * alpha * dT = -165.2 MPa (the side faces are free, so the mid-length state is uniaxial; the clamped
+        ends only disturb the outer ~10 mm)."""
     _auth(x_api_key)
     gmsh = _gmsh()
     work = tempfile.mkdtemp(prefix="ccx_selft_")
     try:
-        E, nu, L, b, h, alpha, tref = 70000.0, 0.33, 100.0, 10.0, 10.0, 23.6e-6, 100.0
+        E, nu, L, b, h, alpha = 70000.0, 0.33, 100.0, 10.0, 10.0, 23.6e-6
         step = _box_step(gmsh, work, L, b, h)
-        case = {"analysis": "thermal", "material": {"E_mpa": E, "nu": nu},
-                "thermal": {"k_w_mk": 167.0, "alpha_per_c": alpha, "t_ref_c": tref},
-                "bbox_mm": {"min": [0, 0, 0], "max": [L, b, h]},
-                "faces": {"fixed": [_x_face(0, b, h)], "loads": [],
-                          "temps": [{"id": "hot", "temperature_c": 100.0, "faces": [_x_face(0, b, h)]},
-                                    {"id": "cold", "temperature_c": 0.0, "faces": [_x_face(L, b, h)]}]},
-                "min_thickness_mm": 6.0}
-        with _lock:
-            try:
-                out, tm = solve_case(step, case, work)
-            except SolveError as e:
-                return {"ok": False, "stage": e.stage, "reason": str(e)}
-        theory = alpha * math.sqrt((L * L / 2) ** 2 + (L * b) ** 2 + (L * h) ** 2)     # |u| at the free corner
-        vm = out["vm_mpa"]
-        return {"ok": bool(abs(out["disp_mm"] / theory - 1.0) < 0.03 and vm < 3.0 and out["bc_check"].get("ok")),
-                "theory_max_disp_mm": round(theory, 4), "stress_free_exact_solution": True,
-                "fe": {"disp_mm": round(out["disp_mm"], 4), "t_max_c": out.get("t_max_c"), "t_min_c": out.get("t_min_c"),
-                       "von_mises_mpa": round(out["vm_mpa"], 3)},
-                "ratio_disp": round(out["disp_mm"] / theory, 3),
-                "expect": "ratio_disp 0.97-1.03, von_mises ~0 (< 3 MPa), t_max 100, t_min 0, bc_check.ok true",
-                "bc_check": out["bc_check"], "mesh": out["mesh"], "timings": tm}
+        base = {"analysis": "thermal", "material": {"E_mpa": E, "nu": nu},
+                "thermal": {"k_w_mk": 167.0, "alpha_per_c": alpha, "t_ref_c": 20.0},
+                "bbox_mm": {"min": [0, 0, 0], "max": [L, b, h]}, "min_thickness_mm": 6.0,
+                "probe_mm": [[L / 2, b / 2, h / 2]]}
+        cases = {
+            "conduction": {**base, "faces": {"fixed": [_x_face(0, b, h)], "loads": [], "temps": [
+                {"id": "hot", "temperature_c": 100.0, "faces": [_x_face(0, b, h)]},
+                {"id": "cold", "temperature_c": 0.0, "faces": [_x_face(L, b, h)]}]}},
+            "restrained_expansion": {**base, "faces": {"fixed": [_x_face(0, b, h), _x_face(L, b, h)], "loads": [], "temps": [
+                {"id": "a", "temperature_c": 120.0, "faces": [_x_face(0, b, h)]},
+                {"id": "b", "temperature_c": 120.0, "faces": [_x_face(L, b, h)]}]}}}
+        res, last = {}, {}
+        for name, c in cases.items():
+            with _lock:
+                try:
+                    res[name], tm = solve_case(step, c, work)
+                except SolveError as e:
+                    return {"ok": False, "case": name, "stage": e.stage, "reason": str(e)}
+            last = {"mesh": res[name]["mesh"], "timings": tm}
+        p1, p2 = res["conduction"]["probes"][0], res["restrained_expansion"]["probes"][0]
+        theory = -E * alpha * 100.0
+        sxx = p2["stress_mpa"][0] if p2.get("stress_mpa") else None
+        checks = {
+            "conduction_T_at_mid_c": {"fe": p1["t_c"], "theory": 50.0,
+                                      "pass": p1["t_c"] is not None and abs(p1["t_c"] - 50.0) < 0.6},
+            "restrained_axial_stress_at_mid_mpa": {"fe": sxx, "theory": round(theory, 2),
+                                                   "ratio": round(sxx / theory, 3) if sxx else None,
+                                                   "pass": bool(sxx and abs(sxx / theory - 1.0) < 0.03)},
+            "restrained_lateral_stress_at_mid_mpa": {"fe": (p2["stress_mpa"][1:3] if p2.get("stress_mpa") else None),
+                                                     "theory": [0.0, 0.0],
+                                                     "pass": bool(p2.get("stress_mpa") and max(abs(v) for v in p2["stress_mpa"][1:3]) < 8.0)},
+            "restrained_temperature_uniform_120c": {"t_range_c": [res["restrained_expansion"].get("t_min_c"),
+                                                                  res["restrained_expansion"].get("t_max_c")],
+                                                    "pass": all(abs((res["restrained_expansion"].get(k) or 0) - 120.0) < 0.6
+                                                                for k in ("t_min_c", "t_max_c"))},
+            "boundary_checks_ok": {"pass": all(r["bc_check"].get("ok") for r in res.values())}}
+        return {"ok": all(c["pass"] for c in checks.values()), "checks": checks,
+                "note": "Closed-form answers; the 3 mm mesh and nodal stress averaging allow a few percent.", **last}
     finally:
         shutil.rmtree(work, ignore_errors=True)
