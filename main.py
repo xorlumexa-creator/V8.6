@@ -7998,7 +7998,14 @@ async def run_plan_tests(cad_obj, plan, default_min_sf=2.0, dry_run=False):
         r = TP.evaluate(case, fem, diag, default_min_sf)
         r["elapsed_s"] = diag.get("elapsed_s")
         _m = r.get("metrics") or {}
-        if _m.get("hotspot_mm"):
+        if case.get("type") == "buckling":          # the stress under the reference load is not where it fails: say where it bends
+            pk = _m.get("buckling_mode1_peak_mm")
+            if pk:
+                r["localization"] = {"text": (f"WHERE: the lowest buckling mode bends most at ({pk[0]}, {pk[1]}, {pk[2]}) mm, the "
+                                              "least-supported region of the slender member. Add bending stiffness or bracing "
+                                              "there: ribs or flanges, a deeper cross-section, or a support that shortens the "
+                                              "unsupported length.")}
+        elif _m.get("hotspot_mm"):
             r["localization"] = TP.localize(descs, case, _m.get("hotspot_mm"), _m.get("hot_zone_mm"), _m)
         results.append(r)
     return {"plan_version": TP.PLAN_VERSION, "overall": TP.overall(results), "results": results,
