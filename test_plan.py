@@ -795,7 +795,7 @@ def evaluate(case, fem, diag, default_min_sf=2.0):
     if bc is not None and not bc.get("ok"):
         warnings.append("boundary-condition sanity check failed: " + str(bc.get("reason") or bc))
     if fem.get("numerically_suspect"):
-        warnings.append("result flagged numerically suspect")
+        warnings.append("result flagged numerically suspect" + (": " + str(fem["suspect_reason"]) if fem.get("suspect_reason") else ""))
     if fem.get("hot_data_warning"):
         warnings.append(fem["hot_data_warning"])
     crit = dict(case["criteria"])
