@@ -77,6 +77,45 @@ def _ccx_version():
 
 
 # ---------------------------------------------------------------------------------------------- the solve
+def _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale, modes, accuracy, unscaled, env):
+    """Linear buckling in its own CalculiX run: a deck with ONE *BUCKLE step whose load is the reference load (scaled to a
+    ~1 N total, which keeps CalculiX from skipping modes). Factors are scaled back to the ACTUAL load."""
+    sc = 1.0 if unscaled else bscale
+    FC.write_inp(os.path.join(workdir, "buck.inp"), np.array(list(node_xyz)), np.array(list(node_xyz.values())), elem_ids,
+                 FC.tet10_gmsh_to_ccx(conn), set(fixed_nodes), forces, float(mat["E_mpa"]), float(mat["nu"]),
+                 analysis="buckling", buckle_modes=modes, buckle_scale=sc, buckle_accuracy=accuracy)
+    try:
+        r = subprocess.run([CCX_BIN, "buck"], cwd=workdir, capture_output=True, text=True, env=env, timeout=CCX_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise SolveError("solve", f"CalculiX buckling run exceeded {CCX_TIMEOUT_S:.0f}s")
+    tail = (r.stdout + r.stderr).strip().splitlines()[-8:]
+    dat_p, frd_p = os.path.join(workdir, "buck.dat"), os.path.join(workdir, "buck.frd")
+    dat = open(dat_p, errors="ignore").read() if os.path.exists(dat_p) else ""
+    raw = FC.parse_buckling_factors(dat)
+    if r.returncode != 0 or not raw:
+        raise SolveError("results", f"CalculiX buckling run gave no buckling factors (exit {r.returncode}): "
+                                    f"{' | '.join(tail)[:500]}")
+    facs = [f * sc for f in raw]
+    pos = [f for f in facs if f > 0]
+    bk = {"factors": [round(f, 4) for f in facs[:5]], "factor": round(min(pos), 4) if pos else None,
+          "n_modes": len(facs), "solver_load_scale": sc, "raw_factors": [round(f, 5) for f in raw[:5]]}
+    blocks = []
+    if os.path.exists(frd_p):
+        blocks = FC.parse_frd(open(frd_p, errors="ignore").read()).get("DISP_BLOCKS") or []
+    stats = []
+    for b in blocks[:4]:
+        if b:
+            mg = np.linalg.norm(np.array(list(b.values()), float), axis=1)
+            stats.append({"nodes": len(b), "max_disp": float(mg.max())})
+    if blocks and blocks[0]:
+        ids = sorted(blocks[0])
+        mg = np.linalg.norm(np.array([blocks[0][i] for i in ids], float), axis=1)
+        if mg.max() > 0:
+            bk["mode1_peak_xyz_mm"] = [float(c) for c in node_xyz[ids[int(np.argmax(mg))]]]
+    bk["debug"] = {"mode_blocks": stats, "ccx_stdout_tail": tail}
+    return bk
+
+
 def solve_case(step_path, case, workdir, gmsh=None):
     """Returns (result_dict, timings). Raises SolveError(stage, msg, design_related)."""
     gmsh = gmsh or _gmsh()
@@ -231,7 +270,7 @@ def solve_case(step_path, case, workdir, gmsh=None):
     inp = os.path.join(workdir, "job.inp")
     FC.write_inp(inp, np.array(list(node_xyz)), np.array(list(node_xyz.values())), elem_ids,
                  FC.tet10_gmsh_to_ccx(conn), fixed_nodes, forces, float(mat["E_mpa"]), float(mat["nu"]),
-                 analysis=analysis, buckle_modes=int(case.get("buckle_modes") or 3), buckle_scale=bscale,
+                 analysis=("static" if analysis == "buckling" else analysis),
                  thermal=({"k_w_mk": th_in["k_w_mk"], "alpha_per_c": th_in["alpha_per_c"], "t_ref_c": th_in["t_ref_c"],
                            "temps": temp_bc, "cflux_mw": cflux} if analysis == "thermal" else None))
     env = dict(os.environ, OMP_NUM_THREADS=CCX_THREADS, CCX_NPROC_EQUATION_SOLVER=CCX_THREADS)
@@ -247,7 +286,7 @@ def solve_case(step_path, case, workdir, gmsh=None):
         raise SolveError("solve", f"CalculiX failed (exit {r.returncode}): {tail[:600]}")
     tm["solve_s"] = round(time.time() - t0, 2)
 
-    res = FC.parse_frd(open(frd, errors="ignore").read(), first_only=(analysis == "buckling"))
+    res = FC.parse_frd(open(frd, errors="ignore").read())
     dat_path = os.path.join(workdir, "job.dat")
     dat_text = open(dat_path, errors="ignore").read() if os.path.exists(dat_path) else ""
     try:
@@ -255,19 +294,9 @@ def solve_case(step_path, case, workdir, gmsh=None):
     except ValueError as e:
         raise SolveError("results", str(e))
     if analysis == "buckling":
-        facs = [f * bscale for f in FC.parse_buckling_factors(dat_text)]      # per ACTUAL load
-        if not facs:
-            tail = " | ".join((r.stdout + r.stderr).strip().splitlines()[-6:])
-            raise SolveError("results", f"CalculiX produced no buckling factors ({tail[:300]})")
-        pos = [f for f in facs if f > 0]
-        bk = {"factors": [round(f, 4) for f in facs[:5]], "factor": round(min(pos), 4) if pos else None,
-              "n_modes": len(facs), "solver_load_scale": bscale}
-        blocks = res.get("DISP_BLOCKS") or []
-        if len(blocks) > 1 and blocks[1]:
-            mids = sorted(blocks[1])
-            mag = np.linalg.norm(np.array([blocks[1][i] for i in mids], float), axis=1)
-            bk["mode1_peak_xyz_mm"] = [float(c) for c in node_xyz[mids[int(np.argmax(mag))]]]
-        out["buckling"] = bk
+        out["buckling"] = _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale,
+                                        int(case.get("buckle_modes") or 3), case.get("buckle_accuracy"),
+                                        bool(case.get("buckle_unscaled")), env)
     bc = FC.bc_sanity(res["DISP"], fixed_nodes, load_nodes, force_by_load)
     if analysis == "thermal":
         ts = FC.thermal_sanity(res["NDTEMP"], temp_bc, bool(cflux))
@@ -278,7 +307,7 @@ def solve_case(step_path, case, workdir, gmsh=None):
             bc["reason"] = ts["reason"]
     bc["face_matching"] = {"fixed": fixed_m, "loads": load_m}
     bc["applied_force_n"] = total
-    dat_total = FC.parse_dat_totals(dat_text, first=(analysis == "buckling")) if dat_text else None
+    dat_total = FC.parse_dat_totals(dat_text) if dat_text else None
     eq = FC.equilibrium(res.get("FORC"), force_by_load, total=dat_total)
     if eq is not None:
         eq["source"] = "dat_totals" if dat_total is not None else "frd_forc"
@@ -412,18 +441,28 @@ def selftest_buckling(x_api_key: str = Header(default="")):
                 "faces": {"fixed": [_x_face(0, b, h)],
                           "loads": [{"id": "axial", "force_xyz": [-F, 0, 0], "faces": [_x_face(L, b, h)]}]},
                 "min_thickness_mm": 6.0}
-        with _lock:
-            try:
-                out, tm = solve_case(step, case, work)
-            except SolveError as e:
-                return {"ok": False, "stage": e.stage, "reason": str(e)}
         I = b * h ** 3 / 12.0
         theory = math.pi ** 2 * E * I / (2.0 * L) ** 2 / F
-        fe = (out.get("buckling") or {}).get("factor")
-        return {"ok": fe is not None, "theory_buckling_factor": round(theory, 3), "fe": out.get("buckling"),
-                "ratio_fe_over_theory": round(fe / theory, 3) if fe else None,
-                "expect": "ratio ~0.95-1.10 (the two lowest modes are a degenerate pair)",
-                "bc_check": out["bc_check"], "mesh": out["mesh"], "timings": tm}
+        variants, last = [], {}
+        for name, extra in (("default", {}), ("accuracy_1e-5", {"buckle_accuracy": 1e-5}),
+                            ("unscaled_100N", {"buckle_unscaled": True})):
+            with _lock:
+                try:
+                    out, tm = solve_case(step, {**case, **extra}, work)
+                except SolveError as e:
+                    variants.append({"variant": name, "ok": False, "stage": e.stage, "reason": str(e)[:400]})
+                    continue
+            bk = out.get("buckling") or {}
+            fe = bk.get("factor")
+            last = {"bc_check": out["bc_check"], "mesh": out["mesh"], "timings": tm}
+            variants.append({"variant": name, "factors": bk.get("factors"), "raw_factors": bk.get("raw_factors"),
+                             "ratio_fe_over_theory": round(fe / theory, 3) if fe else None,
+                             "mode1_peak_xyz_mm": bk.get("mode1_peak_xyz_mm"), "debug": bk.get("debug")})
+        good = [v for v in variants if v.get("ratio_fe_over_theory") and 0.9 <= v["ratio_fe_over_theory"] <= 1.15]
+        return {"ok": bool(good), "theory_buckling_factor": round(theory, 3),
+                "best_variant": good[0]["variant"] if good else None, "variants": variants,
+                "expect": "ratio ~0.95-1.10, first two factors nearly equal (a degenerate pair), mode-1 peak at the free end x~200",
+                **last}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

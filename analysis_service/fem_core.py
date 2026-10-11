@@ -43,9 +43,9 @@ def distribute_force(weights, force_xyz):
 
 # ---------------------------------------------------------------------------------------------- CalculiX input
 def write_inp(path, node_ids, coords, elem_ids, elem_conn_ccx, fixed_nodes, forces, E_mpa, nu,
-              analysis="static", buckle_modes=3, thermal=None, buckle_scale=1.0):
-    """C3D10 model. analysis: 'static' (linear static) | 'buckling' (the same static step as the reference load, then
-    *BUCKLE: the eigenvalues are the factors the load must be multiplied by to buckle the part) | 'thermal' (steady-state
+              analysis="static", buckle_modes=3, thermal=None, buckle_scale=1.0, buckle_accuracy=None):
+    """C3D10 model. analysis: 'static' (linear static) | 'buckling' (a deck with ONE *BUCKLE step carrying the reference
+    load: the eigenvalues are the factors the load must be multiplied by to buckle the part) | 'thermal' (steady-state
     heat conduction + the thermal stress it causes, plus any mechanical forces).
     forces: {node: (fx, fy, fz)} N.  thermal: {"k_w_mk", "alpha_per_c", "t_ref_c", "temps": {node: degC},
     "cflux_mw": {node: mW}}  (mm-N-s-tonne units: 1 W/(m K) == 1 mW/(mm K), power in mW)."""
@@ -82,7 +82,9 @@ def write_inp(path, node_ids, coords, elem_ids, elem_conn_ccx, fixed_nodes, forc
             for dof, f in enumerate(forces[n], start=1):
                 if abs(f) > 0.0:
                     force_lines.append(f"{int(n)}, {dof}, {f:.9g}")
-    if analysis == "thermal":
+    if analysis == "buckling":
+        pass                                               # single-step deck: see the *BUCKLE step below
+    elif analysis == "thermal":
         lines += ["*STEP", "*UNCOUPLED TEMPERATURE-DISPLACEMENT, STEADY STATE", "*BOUNDARY"]
         for n, t in sorted((thermal.get("temps") or {}).items()):
             if int(n) in used:
@@ -95,9 +97,10 @@ def write_inp(path, node_ids, coords, elem_ids, elem_conn_ccx, fixed_nodes, forc
             lines += ["*CLOAD"] + force_lines
     else:
         lines += ["*STEP", "*STATIC", "*CLOAD"] + force_lines
-    if fx_nodes:                                           # total reaction of the fixed set -> equilibrium check (.dat)
-        lines += ["*NODE PRINT, NSET=NFIX, TOTALS=ONLY", "RF"]
-    lines += ["*NODE FILE", "U, NT, RF" if analysis == "thermal" else "U, RF", "*EL FILE", "S", "*END STEP"]
+    if analysis != "buckling":
+        if fx_nodes:                                       # total reaction of the fixed set -> equilibrium check (.dat)
+            lines += ["*NODE PRINT, NSET=NFIX, TOTALS=ONLY", "RF"]
+        lines += ["*NODE FILE", "U, NT, RF" if analysis == "thermal" else "U, RF", "*EL FILE", "S", "*END STEP"]
     if analysis == "buckling":
         # CalculiX removes every earlier load at the start of a buckling step and scales ONLY the load written inside it,
         # so the reference load goes here (scaled to a small total, which also avoids CalculiX skipping the first mode
@@ -111,7 +114,8 @@ def write_inp(path, node_ids, coords, elem_ids, elem_conn_ccx, fixed_nodes, forc
                         bl.append(f"{int(n)}, {dof}, {f * sc:.9g}")
         if not bl:
             raise ValueError("a buckling analysis needs a load")
-        lines += ["*STEP", "*BUCKLE", f"{int(buckle_modes)}", "*CLOAD"] + bl + ["*NODE FILE", "U", "*END STEP"]
+        card = f"{int(buckle_modes)}" + (f", {float(buckle_accuracy):.6g}" if buckle_accuracy else "")
+        lines += ["*STEP", "*BUCKLE", card, "*CLOAD"] + bl + ["*NODE FILE", "U", "*END STEP"]
     with open(path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
 
