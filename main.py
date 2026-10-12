@@ -7933,6 +7933,9 @@ def run_ccx_service_fem(cad_obj, mat_key, load_case, descs, min_sf=2.0):
                 "stiffness, conductivity and expansion are room-temperature values (they change with temperature)",
                 "strength is derated with approximate handbook trends - verify with supplier data before relying on it",
                 f"the part is stress-free at {load_case.get('t_ref_c', 20.0)} C",
+                "fixed faces are perfectly rigid: a peak stress right at the edge of a fully clamped face is a constraint "
+                "artifact that grows with mesh refinement, so a restrained-heating FAIL there is conservative (a real "
+                "bolted or compliant mount would carry less)",
             ]
             fem["note"] = ("CalculiX steady-state heat conduction + thermal stress (10-node tets), plus any mechanical loads of "
                            f"plan '{load_case['id']}'. Safety factor = yield at the hotspot's temperature / peak von Mises.")
