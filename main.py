@@ -6557,8 +6557,9 @@ def evaluate_design_quality(result: dict, min_health_score: float = 75.0,
     hs = result.get("health_score", {}) or {}
     score = hs.get("score", 0)
     re_ = result.get("rule_engine", {}) or {}
-    n_crit = re_.get("total_violations", 0) and len(re_.get("critical", []))
-    n_high = len(re_.get("high", []))
+    crit_l, high_l, med_l = (list(re_.get(k) or []) for k in ("critical", "high", "medium"))
+    n_crit = re_.get("total_violations", 0) and len(crit_l)
+    n_high = len(high_l)
     fea = result.get("analytical_fea", {}) or {}
     sfv = fea.get("safety_factor", 0)
     fea_status = fea.get("status", "UNKNOWN")
@@ -6568,6 +6569,24 @@ def evaluate_design_quality(result: dict, min_health_score: float = 75.0,
     reasons = []
     tp = result.get("test_plan_results") or {}
     plan_authoritative = tp.get("overall") in ("PASS", "FAIL")      # valid FEM verdict -> it replaces the generic SF check
+    aspect_replaced = False
+    if plan_authoritative and any(r.get("type") == "buckling" and r.get("status") in ("PASS", "FAIL")
+                                  for r in tp.get("results", [])):
+        # A real buckling analysis has run, so the crude aspect-ratio heuristic (R02) must neither fail the design nor
+        # lower its score: left in, it pushed the model to widen a deliberately slender column just to move the ratio.
+        refund, asp_v = 0, 0.0
+        for lst, pen in ((crit_l, 15), (high_l, 8), (med_l, 3)):
+            for e in [e for e in lst if e.get("rule_id") == "R02"]:
+                lst.remove(e)
+                refund += pen
+                m_ = re.search(r"Aspect\s+([\d.]+)", str(e.get("message", "")))
+                asp_v = max(asp_v, float(m_.group(1)) if m_ else 0.0)
+        if refund:
+            refund += 10 if asp_v > 15 else (5 if asp_v > 8 else 0)      # the same rule's extra score penalty
+            score = min(100, score + refund)
+            n_crit = len(crit_l) if re_.get("total_violations", 0) else 0
+            n_high = len(high_l)
+            aspect_replaced = True
     for r in tp.get("results", []):
         if r.get("status") == "FAIL":
             bad = [c for c in r.get("criteria", []) if not c.get("pass")]
@@ -6628,6 +6647,7 @@ def evaluate_design_quality(result: dict, min_health_score: float = 75.0,
             "is_watertight": is_wt,
             "fea_method": fea.get("method"),
             "test_plan": tp.get("overall"),
+            **({"aspect_rule_replaced_by_buckling": True} if aspect_replaced else {}),
         }
     }
 
@@ -7038,6 +7058,17 @@ def _job_progress(**kw):
     job["peak_mb"] = _peak_mb()
 
 
+def _trim_memory():
+    """Collect garbage AND hand freed heap back to the OS (glibc keeps it otherwise, which is what pushes a 512 MB host over
+    its limit between iterations)."""
+    _gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 def _job_cancelled():
     jid = _JOB_ID.get()
     return bool(jid and JOB_STORE.get(jid, {}).get("cancel"))
@@ -7305,7 +7336,7 @@ async def generate_validate_refine(
         if _job_cancelled():
             stopped_reason="cancelled"
             break
-        _gc.collect()                      # free the previous round's shapes/meshes before building the next
+        _trim_memory()                     # free the previous round's shapes/meshes before building the next
         _job_progress(iteration=i, stage="generating")
         # 1) Generate or refine the script
         rate_limit_wait_remaining=RATE_LIMIT_MAX_TOTAL_WAIT
@@ -7437,6 +7468,7 @@ async def generate_validate_refine(
                "geometry_inspection":_gi_brief(gi),**({"review":review} if review else {})}
         iterations.append(entry)
         analysed_rounds+=1
+        _trim_memory()
         _job_progress(stage="round_done", analysed_rounds=analysed_rounds, last_passed=quality["passed"],
                       last_sf=(quality.get("metrics") or {}).get("safety_factor"))
 
@@ -10644,6 +10676,7 @@ def render_mesh_snapshot_png(mesh, view="iso", size_px=800):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.05)
     plt.close(fig)
+    plt.close("all")
     buf.seek(0)
     return buf.read()
 
