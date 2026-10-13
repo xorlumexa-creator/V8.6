@@ -2754,7 +2754,8 @@ def _nvidia_extra_body(model, thinking=None):
     Other models get nothing extra, so unknown fields can never break them. thinking: True/False/None(=env)."""
     if "nemotron-3-ultra" not in (model or "").lower():
         return {}
-    th = thinking if thinking is not None else {"on": True, "off": False}.get(NVIDIA_THINKING)
+    _ov = _NV_THINKING_OVERRIDE.get()
+    th = thinking if thinking is not None else (_ov if _ov is not None else {"on": True, "off": False}.get(NVIDIA_THINKING))
     ex = {}
     if th is False:
         ex["chat_template_kwargs"] = {"enable_thinking": False, "force_nonempty_content": True}
@@ -5595,7 +5596,10 @@ def _find_watertight_defect_locations(mesh, max_regions=3):
 
 def rule_engine_v8(mesh,wt_,ctx,mat_key,holes,sharp,fea,part_desc=""):
     mat=MATERIALS.get(mat_key,MATERIALS["aluminum_6061"]);V=[]
-    exts=[sf(e) for e in mesh.extents];se=sorted(exts);asp=se[2]/se[0] if se[0]>0 else 0
+    exts=[sf(e) for e in mesh.extents];se=sorted(exts)
+    # slenderness = longest extent / MIDDLE extent: a rod or beam is slender, a flat plate or a block is not (the old
+    # longest/shortest ratio called a 100 x 50 x 6 mm plate "buckling risk 16.7:1")
+    asp=se[2]/se[1] if se[1]>0 else 0
     vm=fea["stress"]["von_mises_mpa"];sfv=fea["safety_factor"]
     min_sf_=ctx.get("min_sf",2.0);min_wall=mat.get("min_wall_mm",1.0)
     def add(rid,sev,msg,fix,std="Best practice",pos=None):
@@ -6402,7 +6406,7 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
                            topo_volfrac=0.5, cad_obj=None, test_plan=None):
     mesh, was_auto_repaired = _repair_watertight_mesh(mesh)
     vol=sf(mesh.volume);exts=[sf(e) for e in mesh.extents]
-    se=sorted(exts);asp=se[2]/se[0] if se[0]>0 else 0;is_wt=bool(mesh.is_watertight)
+    se=sorted(exts);asp=se[2]/se[0] if se[0]>0 else 0;slend=se[2]/se[1] if se[1]>0 else 0;is_wt=bool(mesh.is_watertight)
     if mat_key=="auto": mat_key=detect_material(mesh)
     if mat_key not in MATERIALS: mat_key="aluminum_6061"
     mat=MATERIALS[mat_key];ctx=classify_context(part_name,proj)
@@ -6470,7 +6474,7 @@ async def run_analysis_v8(mesh, filename, part_name, mat_key,
     except:
         cog_pct=0;cog_d={"x":0,"y":0,"z":0};bnds=mesh.bounds
 
-    hs=health_score_v8(is_wt,rules,wt_,asp,cog_pct,fea)
+    hs=health_score_v8(is_wt,rules,wt_,slend,cog_pct,fea)
     fn_=mesh.face_normals;inw=fn_[:,1]<-0.3
     inw_c=int(inw.sum());inw_p=float(inw_c/len(fn_)*100) if len(fn_)>0 else 0
 
@@ -7025,6 +7029,7 @@ async def analyze_part_deep(
 
 import gc as _gc
 import resource as _resource
+_NV_THINKING_OVERRIDE = contextvars.ContextVar("lumexa_nv_thinking", default=None)   # set to False after a stalled call
 _JOB_ID = contextvars.ContextVar("lumexa_job_id", default=None)
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "1") or 1)   # 512 MB host: one design loop at a time
 
@@ -7330,6 +7335,7 @@ async def generate_validate_refine(
     # LOOP_EXTRA_ATTEMPTS additional attempts are allowed on top of max_iterations analysed rounds.
     extra_attempts=int(os.environ.get("LOOP_EXTRA_ATTEMPTS","3") or 0)
     analysed_rounds=0
+    no_think_retry_used=False
     for i in range(1, max_iterations+extra_attempts+1):
         if analysed_rounds>=max_iterations:
             break
@@ -7348,6 +7354,12 @@ async def generate_validate_refine(
                 break
             except HTTPException as e:
                 is_rate_limited=(e.status_code==429)
+                if e.status_code in (502, 503, 504) and not no_think_retry_used and "NVIDIA" in str(e.detail):
+                    # the model spent the whole budget thinking (or the service stalled): ask again with thinking off,
+                    # which is how the plan calls already run (11-13 s instead of minutes)
+                    no_think_retry_used=True
+                    _NV_THINKING_OVERRIDE.set(False)
+                    continue
                 if is_rate_limited and rate_limit_wait_remaining>0:
                     wait_s=min(_parse_groq_retry_after(str(e.detail)), rate_limit_wait_remaining)
                     rate_limit_wait_remaining-=wait_s
