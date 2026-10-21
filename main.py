@@ -40,8 +40,13 @@
 # via NVIDIA NIM, AI_PROVIDER=nvidia) as structured refinement feedback. CalculiX service and the
 # analytical model remain as automatic fallbacks.
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks, Request
 import test_plan as TP
+try:                                           # assembly.py is a separate file; if it is missing the endpoints say so
+    import assembly as ASM
+    _ASM_ERR = ""
+except Exception as _asm_e:                    # pragma: no cover
+    ASM, _ASM_ERR = None, f"{type(_asm_e).__name__}: {_asm_e}"
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 import trimesh
@@ -5103,9 +5108,15 @@ def wall_thickness_v8(mesh, n_base=8000, n_targeted=4000):
                 if t<1.0: crit.append({"thickness_mm":round(t,3),"position":pos,"severity":"CRITICAL"})
                 elif t<2.0: thin.append({"thickness_mm":round(t,3),"position":pos,"severity":"WARNING"})
         if not all_t:
-            fb=float(min(mesh.bounding_box.extents))*0.12
-            return {"min_mm":round(fb,3),"mean_mm":round(fb*2,3),"thin_2mm_pct":0.0,
-                    "thin_zones":[],"critical_zones":[],"method":"fallback","samples_used":0}
+            # No opposite-wall pairs within reach: the part is solid or its walls are thicker than the search radius, i.e. there
+            # is NO thin wall to report. (The old fallback invented 12% of the smallest extent, which turned a plain 6 mm
+            # plate into a 0.72 mm "wall" and a CRITICAL violation on every run.) Report the search radius, floored at 2 mm
+            # and capped by the smallest extent, so it can never trip the thin-wall rules.
+            ext_min=float(min(mesh.bounding_box.extents))
+            r40=float(np.median(all_dists[:, -1])) if getattr(all_dists, "ndim", 1) == 2 else ext_min
+            est=min(ext_min, max(r40, 2.0))
+            return {"min_mm":round(est,3),"mean_mm":round(est*2,3),"thin_2mm_pct":0.0,
+                    "thin_zones":[],"critical_zones":[],"method":"no_thin_wall_detected","samples_used":0}
         arr=np.array(all_t)
         def dedup(zones,d=1.5):
             out=[]
@@ -8163,6 +8174,278 @@ async def _plan_selftest_new_types(kind, mat_key, force_n, dry_run):
                                         "mid_temperature_c": pr.get("t_c"), "peak_von_mises_mpa": m.get("von_mises_mpa")}
     return out
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# ASSEMBLY: place generated parts with real mates, measure the internal space of each part, plan hardware, check fit
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+_ASM_LOCK = threading.Lock()
+
+
+def _need_asm():
+    if ASM is None:
+        raise HTTPException(503, f"assembly.py is not deployed on this server ({_ASM_ERR}). Add it to the Dockerfile COPY line.")
+    if not B3D:
+        raise HTTPException(503, "build123d not installed")
+
+
+def _part_info(pid, name, script, want_internal=True, pitch=None):
+    """Run a part's script and gather what the assembly needs: solid, features, mesh (base64 STL), measured cavities."""
+    obj, err = execute_cad_script_safely(script)
+    if err or obj is None:
+        raise HTTPException(400, f"part {pid!r}: its CAD script failed: {str(err)[:300]}")
+    try:
+        feats = ASM.features_from_shape(obj, TP)
+    except Exception as e:
+        raise HTTPException(500, f"part {pid!r}: could not read its faces ({type(e).__name__}: {str(e)[:200]})")
+    stl_path = stl_from_cad(obj)
+    internal, warn = None, None
+    try:
+        with open(stl_path, "rb") as fh:
+            raw = fh.read()
+        if want_internal:
+            import trimesh
+            mesh = trimesh.load(stl_path, file_type="stl", force="mesh")
+            tris = np.asarray(mesh.triangles, float)
+            if len(tris) > 60000:
+                warn = f"{len(tris)} triangles: too detailed to measure internal space quickly; skipped"
+            elif len(tris):
+                internal = ASM.analyze_internal_space(tris, pitch)
+    finally:
+        try:
+            os.unlink(stl_path)
+        except Exception:
+            pass
+    return {"id": pid, "name": name or pid, "shape": obj, "features": feats, "stl_base64": base64.b64encode(raw).decode(),
+            "internal_space": internal, "internal_space_warning": warn}
+
+
+def _items_from_json(raw):
+    """[{name, dims | dims_text, qty}] -> [{name, dims, qty}] (dims parsed from datasheet text when needed)."""
+    out = []
+    for it in (raw or []):
+        dims = it.get("dims")
+        if not dims and it.get("dims_text"):
+            dims = ASM.parse_dims_mm(it["dims_text"])
+        if not dims and it.get("name"):
+            dims = ASM.parse_dims_mm(it["name"])
+        out.append({"name": it.get("name", "component"), "dims": tuple(dims) if dims else None, "qty": int(it.get("qty", 1) or 1),
+                    "dims_known": bool(dims)})
+    return out
+
+
+def _assemble_from_infos(infos, mates, ground, components, options):
+    clearance = float(options.get("clearance_mm", 1.0))
+    margin = float(options.get("margin_mm", 1.0))
+    comps = {pid: _items_from_json(items) for pid, items in (components or {}).items()}
+    unknown = {pid: [i["name"] for i in items if not i["dims_known"]] for pid, items in comps.items()}
+    res = ASM.build_result(infos, mates, ground, ASM.OccOps, {pid: [i for i in items if i["dims"]] for pid, items in comps.items()},
+                           clearance, margin)
+    for pid, names in unknown.items():
+        if names:
+            res["warnings"].append(f"part {pid}: no dimensions known for {names}; they were not checked for fit")
+    for i in infos:
+        if i.get("internal_space_warning"):
+            res["warnings"].append(f"part {i['id']}: {i['internal_space_warning']}")
+    if options.get("step", True):
+        try:
+            placed = {p["id"]: np.array(p["matrix"], float).reshape(4, 4) for p in res["parts"]}
+            from build123d import Compound
+            kids = []
+            for i in infos:
+                w = ASM.OccOps.apply(i["shape"], placed[i["id"]])
+                w.label = i["name"]
+                kids.append(w)
+            comp = Compound(children=kids, label="Assembly")
+            sp = step_from_cad(comp)
+            with open(sp, "rb") as fh:
+                res["step_base64"] = base64.b64encode(fh.read()).decode()
+            os.unlink(sp)
+        except Exception as e:
+            res["step_error"] = f"{type(e).__name__}: {str(e)[:200]} (hardware is not included in the STEP in any case)"
+    return res
+
+
+def _assemble_sync(body, mates=None, ground=None, infos=None):
+    parts = body.get("parts") or []
+    if not 1 <= len(parts) <= 12:
+        raise HTTPException(400, "send between 1 and 12 parts, each {id, name, script}")
+    if infos is None:
+        infos = [_part_info(str(p["id"]), p.get("name"), p.get("script", ""), bool(body.get("internal_space", True)),
+                            body.get("pitch_mm")) for p in parts]
+    try:
+        mates = mates if mates is not None else body.get("mates") or []
+        ground = ground or body.get("ground") or infos[0]["id"]
+        if len(infos) > 1 and not mates:
+            raise ASM.AssemblyError("send a mates list (or use /assembly-plan to have one proposed)")
+        return _assemble_from_infos(infos, mates, ground, body.get("components"), body.get("options") or {})
+    except ASM.AssemblyError as e:
+        raise HTTPException(422, f"assembly: {e}")
+
+
+@app.post("/part-features")
+@_sanitize_response
+async def part_features(script: str = Form(...), name: str = Form("part")):
+    """What an assembly can attach to on this part: flat faces, holes and pins, as the solver sees them."""
+    _need_asm()
+    info = await asyncio.to_thread(_part_info, "part", name, script, False)
+    return {"features": info["features"], "summary": ASM.feature_summary(info["features"], name)}
+
+
+@app.post("/part-internal-space")
+@_sanitize_response
+async def part_internal_space(script: str = Form(...), pitch_mm: float = Form(0.0), components: str = Form(""),
+                              clearance_mm: float = Form(1.0), margin_mm: float = Form(1.0)):
+    """The real cavities of a part (enclosed voids, pockets, channels, troughs) with the largest usable box in each, and,
+    if components are given as JSON [{name, dims_text|dims, qty}], whether and where they fit."""
+    _need_asm()
+    info = await asyncio.to_thread(_part_info, "part", "part", script, True, pitch_mm or None)
+    out = {"internal_space": info["internal_space"], "warning": info.get("internal_space_warning")}
+    if components.strip():
+        try:
+            items = [i for i in _items_from_json(json.loads(components)) if i["dims"]]
+        except Exception as e:
+            raise HTTPException(400, f"components must be a JSON list of {{name, dims_text|dims, qty}}: {e}")
+        cavs = (info["internal_space"] or {}).get("cavities") or []
+        out["fit"] = ASM.check_requirement(cavs, items, clearance_mm, margin_mm) if cavs else \
+            {"fits": False, "message": "no internal space found in this part"}
+        out["required"] = ASM.required_cavity(items, clearance_mm, margin_mm)
+    return out
+
+
+@app.post("/required-cavity")
+@_sanitize_response
+async def required_cavity(request: Request):
+    """From components' datasheet dimensions to the internal space a part must provide (the number the CAD prompt needs)."""
+    _need_asm()
+    body = await request.json()
+    items = _items_from_json(body.get("components"))
+    known = [i for i in items if i["dims"]]
+    return {"required": ASM.required_cavity(known, float(body.get("clearance_mm", 1.0)), float(body.get("margin_mm", 1.0)),
+                                           float(body.get("wire_allowance_mm", 0.0))),
+            "unknown_dimensions": [i["name"] for i in items if not i["dims"]]}
+
+
+@app.post("/assemble")
+@_sanitize_response
+async def assemble(request: Request):
+    """Body: {parts:[{id,name,script}], mates:[...], ground, components:{partId:[{name,dims_text,qty}]}, options}."""
+    _need_asm()
+    body = await request.json()
+    if not _ASM_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "another assembly is being built; this server has little memory, try again in a minute")
+    try:
+        return await asyncio.to_thread(_assemble_sync, body)
+    finally:
+        _ASM_LOCK.release()
+        _trim_memory()
+
+
+async def _assembly_plan_impl(body):
+    """Parts -> model proposes mates -> solver validates (errors go back to the model) -> assembly is built."""
+    if not _ASM_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "another assembly is being built; this server has little memory, try again in a minute")
+    try:
+        parts = body.get("parts") or []
+        if not 2 <= len(parts) <= 12:
+            raise HTTPException(400, "send between 2 and 12 parts, each {id, name, script}")
+        _job_progress(stage="building parts")
+        infos = []
+        for p in parts:                                  # one at a time: each part holds a CAD solid in memory
+            infos.append(await asyncio.to_thread(_part_info, str(p["id"]), p.get("name"), p.get("script", ""),
+                                                 bool(body.get("internal_space", True)), body.get("pitch_mm")))
+            _trim_memory()
+
+        async def llm(system, turns):
+            return await _llm_text(system, turns, max_tokens=2500, temperature=0.1)
+
+        _job_progress(stage="planning mates")
+        try:
+            mates, ground, log = await ASM.propose_mates({i["id"]: i["features"] for i in infos},
+                                                         {i["id"]: i["name"] for i in infos}, body.get("hints") or {}, llm)
+        except ASM.AssemblyError as e:
+            raise HTTPException(422, f"assembly plan: {e}")
+        _job_progress(stage="solving and checking")
+        res = await asyncio.to_thread(_assemble_sync, body, mates, ground, infos)
+        res["plan"] = {"mates": mates, "ground": ground, "attempts": log}
+        return res
+    finally:
+        _ASM_LOCK.release()
+        _trim_memory()
+
+
+@app.post("/assembly-plan")
+@_sanitize_response
+async def assembly_plan(request: Request):
+    """Same body as /assemble without mates (plus optional hints {partId: text}). Blocking; /assembly-plan-async is the
+    submit-and-poll version the frontend uses."""
+    _need_asm()
+    return await _assembly_plan_impl(await request.json())
+
+
+@app.post("/assembly-plan-async")
+@_sanitize_response
+async def assembly_plan_async(request: Request, background_tasks: BackgroundTasks):
+    _need_asm()
+    body = await request.json()
+    running = [j for j, v in JOB_STORE.items() if v.get("status") == "running" and time.time() - v.get("created", 0) < 5400]
+    if len(running) >= MAX_CONCURRENT_JOBS:
+        raise HTTPException(409, f"{len(running)} job(s) already running (job {running[0]}); this server has little memory, so "
+                                 f"jobs run one at a time.")
+    job_id = str(uuid.uuid4())
+    JOB_STORE[job_id] = {"status": "running", "created": time.time(), "filename": "assembly"}
+
+    async def run_job():
+        _JOB_ID.set(job_id)
+        try:
+            res = await _assembly_plan_impl(body)
+            JOB_STORE[job_id] = {"status": "complete", "result": res, "created": time.time()}
+        except HTTPException as e:
+            JOB_STORE[job_id] = {"status": "error", "error": f"{e.status_code}: {e.detail}", "created": time.time()}
+        except Exception as e:
+            JOB_STORE[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}", "created": time.time()}
+
+    background_tasks.add_task(run_job)
+    return {"job_id": job_id, "status": "running", "message": "Assembly started. Poll GET /job/{job_id}."}
+
+
+_ASM_SELFTEST_BASE = ("from build123d import *\nresult = Box(60, 40, 5, align=(Align.MIN, Align.MIN, Align.MIN))\n"
+                      "for x, y in [(5, 5), (55, 5), (5, 35), (55, 35)]:\n    result = result - Pos(x, y, 2.5) * Cylinder(1.7, 6)\n")
+_ASM_SELFTEST_COVER = ("from build123d import *\nresult = Box(60, 40, 3, align=(Align.MIN, Align.MIN, Align.MIN))\n"
+                       "for x, y in [(5, 5), (55, 5), (5, 35), (55, 35)]:\n    result = result - Pos(x, y, 1.5) * Cylinder(1.6, 5)\n")
+
+
+@app.get("/assembly-selftest")
+@_sanitize_response
+async def assembly_selftest():
+    """A 60x40x5 base and a 60x40x3 cover, 4 holes each, joined by M3 bolts and nuts. Closed-form answers: the cover sits at
+    z = 5, the 4 holes coincide, the bolts are M3x12, nothing interferes, and no cavities are invented."""
+    _need_asm()
+    body = {"parts": [{"id": "base", "name": "Base", "script": _ASM_SELFTEST_BASE},
+                      {"id": "cover", "name": "Cover", "script": _ASM_SELFTEST_COVER}],
+            "mates": [{"id": "m1", "type": "plane_mate", "a": {"part": "base", "feature": {"kind": "plane", "normal": "+z"}},
+                       "b": {"part": "cover", "feature": {"kind": "plane", "normal": "-z"}}, "register": "holes",
+                       "fasteners": {"size": "M3", "nut": True, "head_on": "b"}}],
+            "ground": "base", "options": {"step": False}}
+    if not _ASM_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "another assembly is being built")
+    try:
+        r = await asyncio.to_thread(_assemble_sync, body)
+    finally:
+        _ASM_LOCK.release()
+        _trim_memory()
+    cover = next(p for p in r["parts"] if p["id"] == "cover")
+    z = cover["matrix"][11]
+    checks = {"cover_z_mm": {"fe": z, "expect": 5.0, "pass": abs(z - 5.0) < 0.01},
+              "holes_registered": {"fe": len(r["mates"][0].get("pairs", [])), "expect": 4,
+                                   "pass": len(r["mates"][0].get("pairs", [])) == 4},
+              "bolts": {"fe": [(h["size"], h["length_mm"]) for h in r["hardware"]], "expect": "4 x M3 x 12",
+                        "pass": len(r["hardware"]) == 4 and all(h["length_mm"] == 12.0 for h in r["hardware"])},
+              "no_interference": {"fe": len(r["interference"]), "pass": not r["interference"]},
+              "residual_mm": {"fe": r["mates"][0].get("registration_residual_mm"),
+                              "pass": (r["mates"][0].get("registration_residual_mm") or 99) < 0.05}}
+    return {"ok": all(c["pass"] for c in checks.values()), "checks": checks, "warnings": r["warnings"],
+            "internal_space_base": ((r["parts"][0].get("internal_space") or {}).get("cavities") or [])[:3]}
 
 @app.get("/deepseek-selftest")
 @_sanitize_response
