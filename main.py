@@ -7567,6 +7567,15 @@ async def generate_validate_refine(
         "history":iterations,
         "kb":kb_log,
     }
+    try:   # downloadable report (static / buckling / thermal results + the script) for hand-off to Claude
+        result["analysis_report_md"]=build_analysis_report_md(
+            result,best["quality"],best["script"],
+            {"method":"Lumexa AI (LLM-written build123d, self-correcting loop)","prompt":prompt,"material":material,
+             "force_n":force_n,"force_dir":force_dir,"operating_temp_c":operating_temp_c,
+             "thresholds":result["refinement"]["quality_thresholds"]},
+            gi=best.get("gi"),fv=best.get("fv"))
+    except Exception:
+        pass
     return result
 
 
@@ -7675,6 +7684,411 @@ async def generate_validate_refine_async(
     return {"job_id":job_id,"status":"running",
             "message":"Design loop started. Poll GET /job/{job_id} for the result.",
             "estimated_time":"1-5 minutes per iteration with SimScale, seconds without"}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SCRIPT MODE + DOWNLOADABLE ANALYSIS REPORT
+#
+# POST /generate-from-script-async runs a build123d script the USER supplies (no LLM call at all)
+# through the same sandbox -> geometry checks -> mesh -> FEM -> quality gate as the AI loop, once.
+# Both that endpoint and the AI loop attach `analysis_report_md` to their result: a Markdown file
+# with the static / buckling / thermal results, why the design failed, and the script itself, so
+# it can be handed to Claude (or anyone) who rewrites the script. Poll GET /job/{id} as usual.
+# ═══════════════════════════════════════════════════════════════════
+
+def _rp_json(obj, limit=4000):
+    """Compact JSON for the report, hard-capped so one huge solver blob cannot bloat the file."""
+    try:
+        s = json.dumps(_json_safe(obj), indent=1, default=str)
+    except Exception:
+        s = str(obj)
+    return s if len(s) <= limit else s[:limit] + "\n... (truncated)"
+
+
+def _rp_num(v, nd=4):
+    try:
+        return f"{float(v):.{nd}g}"
+    except Exception:
+        return str(v)
+
+
+def _rp_plan_test_lines(r):
+    """Lines describing ONE test-plan result (static_stress / buckling / thermal_stress)."""
+    out = [f"### Test `{r.get('test_id')}`: {r.get('type', 'static_stress')}, **{r.get('status')}**"]
+    lc = r.get("load_case") or {}
+    for t_ in lc.get("temperatures", []) or []:
+        out.append(f"- temperature `{t_.get('id')}`: {t_.get('temperature_c')} C on {t_.get('faces')} face(s)")
+    for h_ in lc.get("heat_inputs", []) or []:
+        out.append(f"- heat input `{h_.get('id')}`: {h_.get('power_w')} W on {h_.get('faces')} face(s)")
+    for l_ in lc.get("loads", []) or []:
+        out.append(f"- load `{l_.get('id')}`: {l_.get('force_n')} N on {l_.get('faces')} face(s); "
+                   f"{lc.get('fixed_faces')} fixed face(s)")
+    m = r.get("metrics") or {}
+    if m.get("von_mises_mpa") is not None:
+        out.append(f"- peak von Mises: {_rp_num(m.get('von_mises_mpa'))} MPa, safety factor "
+                   f"**{_rp_num(m.get('safety_factor'))}**, max deflection {_rp_num(m.get('max_deflection_mm'))} mm, "
+                   f"hotspot at {m.get('hotspot_mm')} mm")
+    if m.get("buckling_factor") is not None:
+        out.append(f"- buckling factor **{_rp_num(m.get('buckling_factor'))}** (lowest modes {m.get('buckling_factors')}); "
+                   f"first mode bends most at {m.get('buckling_mode1_peak_mm')} mm")
+    if m.get("t_max_c") is not None:
+        out.append(f"- temperature range {m.get('t_min_c')} .. {m.get('t_max_c')} C (at hotspot {m.get('t_at_hotspot_c')} C), "
+                   f"yield strength there {m.get('yield_at_hotspot_mpa')} MPa")
+    for c in r.get("criteria", []) or []:
+        out.append(f"- criterion `{c.get('name')}`: actual {c.get('actual')} (required {c.get('required')}) -> "
+                   f"{'ok' if c.get('pass') else '**FAILED**'}")
+    for w in r.get("warnings", []) or []:
+        out.append(f"- WARNING: {w}")
+    loc = r.get("localization")
+    if isinstance(loc, dict) and loc.get("text"):
+        out.append("- where it fails:")
+        out.extend("    " + ln for ln in str(loc["text"]).split("\n"))
+    if r.get("status") in ("NOT_RUN", "INVALID", "PLAN_ERROR"):
+        out.append(f"- reason: {r.get('reason') or r.get('error')}")
+    return out
+
+
+def build_analysis_report_md(result, quality, script, meta=None, gi=None, fv=None, error=None, lint=None):
+    """Markdown report of one generation: verdict, static / buckling / thermal results, geometry, solver
+    diagnostics, history and the build123d script. Never raises (a broken section is replaced by a note)."""
+    meta = meta or {}
+    result = result or {}
+    L = []
+
+    def sec(title, fn):
+        try:
+            lines = fn()
+        except Exception as e:
+            lines = [f"(could not build this section: {type(e).__name__}: {e})"]
+        if lines:
+            L.append("")
+            L.append(f"## {title}")
+            L.extend(lines)
+
+    quality = quality or {}
+    passed = bool(quality.get("passed")) and not error
+    name = meta.get("part_name") or (str(meta.get("prompt") or "part").strip().split("\n")[0][:80])
+    verdict = "PASSED" if passed else "NOT PASSED"
+    L.append(f"# Lumexa analysis report: {name}")
+    L.append("")
+    L.append(f"- Verdict: **{verdict}**" + (f" (health score {quality.get('score')})" if quality.get("score") is not None else ""))
+    L.append(f"- Generated by: {meta.get('method', 'unknown')}")
+    L.append(f"- Created: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}")
+    L.append(f"- Material: `{meta.get('material')}`; fallback load case: {meta.get('force_n')} N along {meta.get('force_dir')}; "
+             f"operating temperature {meta.get('operating_temp_c')} C")
+    if meta.get("thresholds"):
+        L.append(f"- Quality thresholds: {json.dumps(meta['thresholds'])}")
+
+    def _how():
+        return [
+            "Send this whole file to Claude and say: *Fix the build123d script so it passes. Keep the stated dimensions, "
+            "bolt holes and the faces the test plan loads/fixes.* Then upload the new script with "
+            "**Generate STL -> Use my build123d file**.",
+            "",
+            "Script rules enforced by the server sandbox: only `from build123d import *`, `math` and `numpy` may be imported; "
+            "the final solid must be assigned to `result`; no file I/O, `open`, `eval`, `getattr` or dunder access; units are mm, Z is up.",
+        ]
+    sec("How to use this file", _how)
+
+    def _why():
+        out = []
+        if error:
+            out.append(f"**The script did not run.** {error}")
+            if lint:
+                out.append("")
+                out.append("Static API check against the installed build123d:")
+                out.extend(f"- {x}" for x in lint[:25])
+            return out
+        for r in quality.get("reasons") or []:
+            out.append(f"- {r}")
+        return out or ["Nothing failed."]
+    sec("Why it did not pass" if not passed else "Quality-gate notes", _why)
+
+    fea = result.get("analytical_fea") or {}
+    tp = result.get("test_plan_results") or {}
+    plan_results = tp.get("results") or []
+
+    def _static():
+        out = []
+        if fea:
+            stress = fea.get("stress") or {}
+            out += [f"- Solver: `{fea.get('method')}`",
+                    f"- Safety factor: **{_rp_num(fea.get('safety_factor'))}** (required {_rp_num(fea.get('required_sf'))}) -> {fea.get('status')}",
+                    f"- Peak von Mises stress: {_rp_num(stress.get('von_mises_mpa'))} MPa",
+                    f"- Max deflection: {_rp_num(fea.get('deflection_mm'))} mm"]
+            crit = fea.get("critical_section") or {}
+            if crit.get("position_mm") is not None:
+                out.append(f"- Weakest section: along the {crit.get('axis')}-axis at {crit.get('position_mm')} mm "
+                           f"(min area {fea.get('min_section_area_mm2')} mm2), hotspot x,y,z = {crit.get('hotspot_xyz_mm')} mm")
+            if fea.get("note"):
+                out.append(f"- Load case: {fea.get('note')}")
+        for r in plan_results:
+            if r.get("type", "static_stress") == "static_stress":
+                out.append("")
+                out.extend(_rp_plan_test_lines(r))
+        return out or ["Static analysis did not run."]
+    sec("Static stress (FEA)", _static)
+
+    def _buckling():
+        out = []
+        for r in plan_results:
+            if r.get("type") == "buckling":
+                out.extend(_rp_plan_test_lines(r))
+        if not out:
+            b = fea.get("buckling") or {}
+            if b and float(b.get("safety_factor", 0) or 0) >= 999:
+                out.append("Not computed: the solver reported no buckling result (this is the default placeholder). "
+                           "Provide a test plan with a `buckling` test to get a real buckling factor.")
+            elif b:
+                out.append(f"- Buckling safety factor: **{_rp_num(b.get('safety_factor'))}** -> {b.get('status')}; "
+                           f"critical load {_rp_num(b.get('critical_load_n'))} N")
+        return out or ["Buckling did not run (provide a test plan with a `buckling` test)."]
+    sec("Buckling", _buckling)
+
+    def _thermal():
+        out = []
+        for r in plan_results:
+            if r.get("type") == "thermal_stress":
+                out.extend(_rp_plan_test_lines(r))
+        if not out:
+            out.append("No thermal FEM test was run (it needs a test plan with a `thermal_stress` test and stated temperatures). "
+                       "Analytical thermal screening for the operating temperature:")
+            out.append("```json")
+            out.append(_rp_json(result.get("thermal_analysis") or {}, 1500))
+            out.append("```")
+        return out
+    sec("Thermal", _thermal)
+
+    def _feedback():
+        if not quality or "score" not in quality or "reasons" not in quality:
+            return []
+        txt = summarize_analysis_for_refinement(result, quality)
+        if gi:
+            txt += "\n\n" + geometry_report_text(gi)
+        return ["This is the exact feedback text the AI refinement loop is given:", "```text", txt, "```"]
+    sec("Full engineering feedback", _feedback)
+
+    def _checks():
+        out = []
+        if fv is not None:
+            out += ["Declared features:", "```json", _rp_json(_fv_brief(fv), 1500), "```"]
+        if gi is not None:
+            out += ["Geometry inspection:", "```json", _rp_json(_gi_brief(gi), 2000), "```"]
+        return out
+    sec("Geometry and feature checks", _checks)
+
+    def _diag():
+        out = []
+        for key in ("simscale_diagnostic", "test_plan_diag"):
+            if result.get(key):
+                out += [f"{key}:", "```json", _rp_json(result.get(key), 1500), "```"]
+        cd = (fea or {}).get("calculix_diagnostic")
+        if cd:
+            out += ["calculix_diagnostic:", "```json", _rp_json(cd, 1500), "```"]
+        return out
+    sec("Solver diagnostics", _diag)
+
+    def _hist():
+        h = (result.get("refinement") or {}).get("history") or []
+        if len(h) <= 1:
+            return []
+        out = []
+        for e in h:
+            line = f"- iteration {e.get('iteration')}: {e.get('stage')}"
+            if e.get("passed") is not None:
+                line += f", passed={e.get('passed')}, health {e.get('health_score')}"
+            rs = e.get("reasons") or ([e.get("error")] if e.get("error") else [])
+            if rs:
+                line += " | " + "; ".join(str(x)[:160] for x in rs[:3])
+            out.append(line)
+        return out
+    sec("Iteration history", _hist)
+
+    def _script():
+        return ["```python", (script or "").rstrip(), "```"]
+    sec("The build123d script that produced this result", _script)
+
+    def _appendix():
+        keep = {k: result.get(k) for k in ("health_score", "geometry", "wall_thickness", "fatigue_analysis",
+                                            "hole_analysis", "sharp_corner_analysis", "material") if result.get(k) is not None}
+        rules = (result.get("rule_engine") or {}).get("all_violations")
+        if rules:
+            keep["rule_violations"] = rules[:15]
+        return ["```json", _rp_json(keep, 9000), "```"] if keep else []
+    sec("Appendix: raw analysis blocks", _appendix)
+
+    return "\n".join(L) + "\n"
+
+
+@app.post("/generate-from-script-async")
+@_sanitize_response
+async def generate_from_script_async(
+    background_tasks: BackgroundTasks,
+    script: str = Form(...),
+    prompt: str = Form("User-supplied build123d script"),
+    part_name: Optional[str] = Form(None),
+    material: str = Form("auto"),
+    force_n: float = Form(1000.0),
+    force_dir: str = Form("z"),
+    operating_temp_c: float = Form(25.0),
+    surface_finish: str = Form("machined"),
+    reliability: float = Form(0.99),
+    project_description: Optional[str] = Form(None),
+    min_health_score: float = Form(75.0),
+    max_critical_violations: int = Form(0),
+    max_high_violations: int = Form(2),
+    min_safety_factor: float = Form(1.0),
+    run_topology: bool = Form(False),
+    test_plan_json: Optional[str] = Form(None),
+):
+    """
+    Run a user-supplied build123d script (NO LLM involved) through sandbox -> geometry checks -> mesh -> FEM
+    -> quality gate, exactly once. Same job/poll contract and result shape as /generate-validate-refine-async,
+    plus `analysis_report_md`. `test_plan_json` (optional) is a test plan in the test_plan.py format; with it the
+    static / buckling / thermal tests run as real FEM on the faces the plan selects.
+    """
+    _running = [j for j, v in JOB_STORE.items() if v.get("status") == "running" and time.time() - v.get("created", 0) < 5400]
+    if len(_running) >= MAX_CONCURRENT_JOBS:
+        raise HTTPException(409, f"{len(_running)} design job(s) already running (job {_running[0]}). This server has little "
+                                 f"memory, so jobs run one at a time. Wait for it, or POST /job/{_running[0]}/cancel.")
+    job_id = str(uuid.uuid4())
+    JOB_STORE[job_id] = {"status": "running", "created": time.time(), "filename": (part_name or prompt)[:80]}
+
+    async def run_job():
+        _JOB_ID.set(job_id)
+        try:
+            result = await run_user_script_analysis(
+                script=script, prompt=prompt, part_name=part_name, material=material, force_n=force_n,
+                force_dir=force_dir, operating_temp_c=operating_temp_c, surface_finish=surface_finish,
+                reliability=reliability, project_description=project_description, min_health_score=min_health_score,
+                max_critical_violations=max_critical_violations, max_high_violations=max_high_violations,
+                min_safety_factor=min_safety_factor, run_topology=run_topology, test_plan_json=test_plan_json)
+            JOB_STORE[job_id] = {"status": "complete", "result": result, "created": time.time()}
+        except HTTPException as e:
+            JOB_STORE[job_id] = {"status": "error", "error": f"{e.status_code}: {e.detail}", "created": time.time()}
+        except Exception as e:
+            JOB_STORE[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}", "created": time.time()}
+
+    background_tasks.add_task(run_job)
+    return {"job_id": job_id, "status": "running",
+            "message": "Script analysis started. Poll GET /job/{job_id} for the result.",
+            "estimated_time": "seconds to a few minutes depending on the FEM solver"}
+
+
+async def run_user_script_analysis(script, prompt, part_name, material, force_n, force_dir, operating_temp_c,
+                                   surface_finish, reliability, project_description, min_health_score,
+                                   max_critical_violations, max_high_violations, min_safety_factor,
+                                   run_topology, test_plan_json):
+    if not B3D:
+        raise HTTPException(503, "build123d not installed")
+    script = (script or "").replace("\r\n", "\n").lstrip("\ufeff")
+    if not script.strip():
+        raise HTTPException(422, "The build123d file is empty.")
+    if len(script) > 200_000:
+        raise HTTPException(413, "The build123d file is larger than 200 KB.")
+    thresholds = {"min_health_score": min_health_score, "max_critical_violations": max_critical_violations,
+                  "max_high_violations": max_high_violations, "min_safety_factor": min_safety_factor}
+    meta = {"method": "User-supplied build123d script (no LLM)", "part_name": part_name, "prompt": prompt,
+            "material": material, "force_n": force_n, "force_dir": force_dir,
+            "operating_temp_c": operating_temp_c, "thresholds": thresholds}
+
+    def _base_refinement(passed, reason, reasons, history, analysed):
+        return {"iterations_used": 1, "analysed_rounds": analysed, "max_iterations": 1, "best_iteration": 1,
+                "passed_quality_gate": passed, "stopped_reason": reason, "final_reasons": reasons,
+                "quality_thresholds": thresholds, "history": history, "kb": []}
+
+    # 1) execute in the same sandbox the AI scripts use
+    _job_progress(iteration=1, stage="executing_script")
+    obj, err = execute_cad_script_safely(script)
+    if err or obj is None:
+        err = err or "The script produced no solid."
+        lint = []
+        try:
+            lint = await asyncio.to_thread(lint_b3d_script, script, 25)
+        except Exception:
+            pass
+        res = {"generation_method": "user_script_v8", "execution_error": err, "generated_script": script,
+               "lint_issues": lint,
+               "refinement": _base_refinement(False, "execution_failed", [err],
+                                              [{"iteration": 1, "stage": "execution_failed", "error": err}], 0)}
+        res["analysis_report_md"] = build_analysis_report_md(res, None, script, meta, error=err, lint=lint)
+        return res
+
+    # 2) deterministic checks (recorded, not looped on: there is no LLM to feed them back to)
+    fv = verify_declared_features(script, obj)
+    gi = inspect_b3d_geometry(obj)
+
+    # 3) mesh + optional user test plan
+    _job_progress(stage="meshing_and_fem")
+    mesh, stl_bytes = await mesh_from_cad_object(obj)
+    plan, plan_diag = None, {}
+    if test_plan_json and test_plan_json.strip():
+        plan_diag["provided"] = True
+        try:
+            plan = TP.parse_plan(test_plan_json)
+            chk = await run_plan_tests(obj, plan, dry_run=True)
+            if chk.get("overall") != "RESOLVED":
+                msg = chk.get("error") or next((r.get("error") for r in chk.get("results", []) if r.get("error")),
+                                               "its face selectors do not resolve on this geometry")
+                plan_diag["error"] = f"test plan rejected: {msg}"
+                plan = None
+        except TP.PlanError as e:
+            plan_diag["error"] = f"test plan invalid: {e}"
+            plan = None
+        except Exception as e:
+            plan_diag["error"] = f"test plan could not be read: {type(e).__name__}: {str(e)[:200]}"
+            plan = None
+
+    # 4) analysis
+    try:
+        result = await run_analysis_v8(mesh, prompt, prompt, material, force_n, force_dir, operating_temp_c,
+                                       project_description, surface_finish, reliability, run_topology,
+                                       cad_obj=obj, test_plan=plan)
+    except Exception as e:
+        msg = f"{type(e).__name__}: {str(e)[:300]}"
+        res = {"generation_method": "user_script_v8", "analysis_error": msg, "generated_script": script,
+               "generated_stl_base64": base64.b64encode(stl_bytes).decode(), "feature_verification": fv,
+               "geometry_inspection": gi, "test_plan_diag": plan_diag or None,
+               "refinement": _base_refinement(False, "analysis_failed", [f"analysis pipeline raised: {msg}"],
+                                              [{"iteration": 1, "stage": "analysis_failed", "error": msg}], 0)}
+        res["analysis_report_md"] = build_analysis_report_md(res, None, script, meta, gi=gi, fv=fv,
+                                                              error=f"The solid was built but analysis failed: {msg}")
+        return res
+    if plan_diag:
+        result["test_plan_diag"] = plan_diag
+
+    # 5) quality gate (same rules as the AI loop)
+    quality = evaluate_design_quality(result, min_health_score, max_critical_violations, max_high_violations,
+                                      min_safety_factor)
+    if not fv["ok"]:
+        quality["passed"] = False
+        quality["reasons"].insert(0, "Declared feature(s) missing from the solid: " + feature_failure_summary(fv))
+    if not gi["ok"]:
+        quality["passed"] = False
+        quality["reasons"].insert(0, "Geometry inspection failed: " + "; ".join(gi["issues"]))
+    _verification_gate(bool(plan_diag.get("provided")), result, plan_diag, quality)
+
+    entry = {"iteration": 1, "stage": "analyzed", "passed": quality["passed"], "health_score": quality["score"],
+             "reasons": quality["reasons"], "metrics": quality["metrics"],
+             "feature_verification": _fv_brief(fv), "geometry_inspection": _gi_brief(gi)}
+    result["generated_stl_base64"] = base64.b64encode(stl_bytes).decode()
+    result["generated_script"] = script
+    result["export_formats"] = sorted(EXPORT_FORMATS)
+    try:
+        _sb, _, _ = export_bytes(obj, "step")
+        result["generated_step_base64"] = base64.b64encode(_sb).decode()
+    except Exception as _e:
+        result["export_error"] = f"step: {str(_e)[:200]}"
+    result["feature_verification"] = fv
+    result["geometry_inspection"] = gi
+    result["geometry_review"] = None
+    result["generation_method"] = "user_script_v8"
+    result["refinement"] = _base_refinement(
+        quality["passed"], "quality_gate_passed" if quality["passed"] else "single_pass_user_script",
+        quality["reasons"], [entry], 1)
+    result["analysis_report_md"] = build_analysis_report_md(result, quality, script, meta, gi=gi, fv=fv)
+    _trim_memory()
+    return result
 
 
 def _b3d_stats(shape):
