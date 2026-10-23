@@ -6227,7 +6227,7 @@ _PLAN_SYSTEM = ("You are a mechanical test engineer. You are shown a part reques
                 "Output ONLY the JSON object - no prose, no markdown.\n\n")
 
 
-async def generate_test_plan(prompt, cad_obj, material="auto", previous_plan=None, diag=None):
+async def generate_test_plan(prompt, cad_obj, material="auto", previous_plan=None, diag=None, required=None):
     """The LLM writes the test plan for a built part. The plan is dry-run against the real faces first (instant)
     and sent back for correction if a selector is unusable. Returns a plan dict or None (caller then falls back
     to the legacy fixed load case). `diag` (dict, filled in place) records WHY a plan was not produced."""
@@ -6247,6 +6247,7 @@ async def generate_test_plan(prompt, cad_obj, material="auto", previous_plan=Non
         hint = f"\nPreferred material: {material}." if material and material != "auto" else ""
         user = (f"PART REQUEST:\n{prompt[:2500]}{hint}\n\nMEASURED GEOMETRY (mm):\n{json.dumps(summary)}\n"
                 + (f"\nThe previous test plan no longer fits this geometry: {err}\n" if err else "")
+                + (f"\nREQUIRED TEST TYPES for this part: {', '.join(required)}. Include at least one test of each of these types and no test of any other type.\n" if required else "")
                 + "\nOutput ONLY the JSON test plan.")
         turns = [{"role": "user", "content": user}]
         system = _PLAN_SYSTEM + TP.schema_prompt(MATERIALS)
@@ -6263,6 +6264,12 @@ async def generate_test_plan(prompt, cad_obj, material="auto", previous_plan=Non
             try:
                 plan = TP.parse_plan(m.group(0) if m else (text or ""))
                 TP.check_plan_against_request(plan if isinstance(plan, dict) else {}, prompt)
+                if required and isinstance(plan, dict):
+                    present = {(t.get("type") or "static_stress") for t in plan.get("tests", []) if isinstance(t, dict)}
+                    miss = [r for r in required if r not in present]
+                    if miss:
+                        raise TP.PlanError("the plan must include at least one test of type " + ", ".join(miss) + " (required for this part)")
+                    plan, _skipped, _missing = restrict_plan_to_required(plan, required)
                 chk = await run_plan_tests(cad_obj, plan, dry_run=True)
                 if chk.get("overall") == "RESOLVED":
                     diag["stage"] = "ok"
@@ -7295,6 +7302,7 @@ async def generate_validate_refine(
     min_safety_factor:float=Form(1.0),
     run_topology:bool=Form(False),
     use_test_plan:bool=Form(False),
+    required_tests:Optional[str]=Form(None),
 ):
     """
     ★ THE CORE VIBE-ENGINEERING LOOP ★
@@ -7319,7 +7327,8 @@ async def generate_validate_refine(
       - min_safety_factor: minimum FEA safety factor (default 1.0)
     """
     if not B3D: raise HTTPException(503,"build123d not installed")
-    use_test_plan=(use_test_plan is True)     # direct calls may leave a Form() default object here
+    required=parse_required_tests(required_tests)     # direct calls may leave a Form() default object here (ignored)
+    use_test_plan=(use_test_plan is True) or bool(required)     # required tests need a test plan
     plan_cache=None
     if max_iterations<1: max_iterations=1
     if max_iterations>6: max_iterations=6  # hard cap: cost + latency safety
@@ -7455,7 +7464,7 @@ async def generate_validate_refine(
             plan=None
             plan_diag={}
             if use_test_plan and obj is not None:
-                plan=await generate_test_plan(prompt,obj,material,previous_plan=plan_cache,diag=plan_diag)
+                plan=await generate_test_plan(prompt,obj,material,previous_plan=plan_cache,diag=plan_diag,required=required)
                 plan_cache=plan or plan_cache
             result=await run_analysis_v8(mesh,prompt,prompt,material,force_n,force_dir,
                                           operating_temp_c,project_description,
@@ -7484,6 +7493,11 @@ async def generate_validate_refine(
             quality["passed"]=False
             quality["reasons"].insert(0,"Geometry inspection failed: "+"; ".join(gi["issues"]))
         verified,unverifiable=_verification_gate(use_test_plan,result,plan_diag,quality)
+        if required:
+            _req_status=required_tests_status(required,result)
+            result["required_tests"]=required
+            result["required_tests_status"]=_req_status
+            apply_required_tests_gate(quality,_req_status,"The AI test plan did not include it.")
         stl_b64=base64.b64encode(stl_bytes).decode()
         entry={"iteration":i,"stage":"analyzed","passed":quality["passed"],
                "health_score":quality["score"],"reasons":quality["reasons"],
@@ -7570,7 +7584,7 @@ async def generate_validate_refine(
     try:   # downloadable report (static / buckling / thermal results + the script) for hand-off to Claude
         result["analysis_report_md"]=build_analysis_report_md(
             result,best["quality"],best["script"],
-            {"method":"Lumexa AI (LLM-written build123d, self-correcting loop)","prompt":prompt,"material":material,
+            {"method":"Lumexa AI (LLM-written build123d, self-correcting loop)","prompt":prompt,"material":material,"required_tests":required,
              "force_n":force_n,"force_dir":force_dir,"operating_temp_c":operating_temp_c,
              "thresholds":result["refinement"]["quality_thresholds"]},
             gi=best.get("gi"),fv=best.get("fv"))
@@ -7650,6 +7664,7 @@ async def generate_validate_refine_async(
     min_safety_factor:float=Form(1.0),
     run_topology:bool=Form(False),
     use_test_plan:bool=Form(False),
+    required_tests:Optional[str]=Form(None),
 ):
     """
     Same self-correcting loop as /generate-validate-refine, but as a background job.
@@ -7673,7 +7688,7 @@ async def generate_validate_refine_async(
                 project_description=project_description,max_iterations=max_iterations,
                 min_health_score=min_health_score,max_critical_violations=max_critical_violations,
                 max_high_violations=max_high_violations,min_safety_factor=min_safety_factor,
-                run_topology=run_topology,use_test_plan=use_test_plan)
+                run_topology=run_topology,use_test_plan=use_test_plan,required_tests=required_tests)
             JOB_STORE[job_id]={"status":"complete","result":result,"created":time.time()}
         except HTTPException as e:
             JOB_STORE[job_id]={"status":"error","error":f"{e.status_code}: {e.detail}","created":time.time()}
@@ -7695,6 +7710,114 @@ async def generate_validate_refine_async(
 # with the static / buckling / thermal results, why the design failed, and the script itself, so
 # it can be handed to Claude (or anyone) who rewrites the script. Poll GET /job/{id} as usual.
 # ═══════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════
+# REQUIRED TESTS
+# Each micro part in Supabase lists the analyses it must pass (project_parts.required_tests, named as in
+# test_plan.py: static_stress, buckling, thermal_stress). The frontend sends that list with every generation.
+# The backend then (a) runs exactly those tests, (b) never calls the part "passed" unless each one ran, and
+# (c) for a user-supplied build123d file, reads the tests from a `TEST_PLAN = {...}` block inside the script.
+# ═══════════════════════════════════════════════════════════════════
+_VALID_TEST_TYPES = ("static_stress", "buckling", "thermal_stress")
+_TEST_TYPE_ALIASES = {"static": "static_stress", "static_fea": "static_stress", "stress": "static_stress",
+                      "thermal": "thermal_stress", "thermal_fea": "thermal_stress", "buckle": "buckling"}
+
+
+def parse_required_tests(raw):
+    """Form value -> list of valid test type names in canonical order. Accepts a JSON list or a comma/space
+    separated string; unknown names are ignored. Empty or missing -> [] (not specified)."""
+    if raw is None or not isinstance(raw, (str, list, tuple)):
+        return []
+    if isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        s = raw.strip()
+        if not s:
+            return []
+        try:
+            v = json.loads(s)
+            items = v if isinstance(v, list) else [v]
+        except Exception:
+            items = [x for x in re.split(r"[,\s;]+", s) if x]
+    wanted = set()
+    for x in items:
+        k = str(x).strip().lower()
+        k = _TEST_TYPE_ALIASES.get(k, k)
+        if k in _VALID_TEST_TYPES:
+            wanted.add(k)
+    return [t for t in _VALID_TEST_TYPES if t in wanted]
+
+
+def extract_embedded_test_plan(script):
+    """Read `TEST_PLAN = {...}` from the top level of the user's script WITHOUT running it (ast.literal_eval,
+    so only plain literals are accepted). Returns the plan as JSON text, or None when the script has none."""
+    try:
+        tree = ast.parse(script)
+    except SyntaxError:
+        return None
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "TEST_PLAN" for t in node.targets):
+            try:
+                val = ast.literal_eval(node.value)
+            except Exception as e:
+                raise ValueError(f"TEST_PLAN in the script must be a plain dict literal (numbers, strings, lists, dicts): {e}")
+            if not isinstance(val, dict):
+                raise ValueError("TEST_PLAN in the script must be a dict")
+            return json.dumps(val)
+    return None
+
+
+def restrict_plan_to_required(plan, required):
+    """Keep only the tests whose type this part must pass. Returns (plan or None, skipped_types, missing_types).
+    With no required list the plan is returned unchanged."""
+    if not required or not isinstance(plan, dict):
+        return plan, [], []
+    tests = [t for t in (plan.get("tests") or []) if isinstance(t, dict)]
+    ttype = lambda t: (t.get("type") or "static_stress")
+    present = {ttype(t) for t in tests}
+    kept = [t for t in tests if ttype(t) in required]
+    skipped = sorted(present - set(required))
+    missing = [r for r in required if r not in present]
+    if not kept:
+        return None, skipped, missing
+    p2 = dict(plan)
+    p2["tests"] = kept
+    return p2, skipped, missing
+
+
+def required_tests_status(required, result):
+    """Per required type: PASS / FAIL / NOT_RUN / NOT_PLANNED, or GENERIC for static_stress when no test plan
+    existed and only the single fallback load case ran."""
+    out = {}
+    rs = [r for r in (((result or {}).get("test_plan_results") or {}).get("results") or []) if isinstance(r, dict)]
+    fea = (result or {}).get("analytical_fea") or {}
+    for t in required:
+        mine = [r for r in rs if (r.get("type") or "static_stress") == t]
+        if mine:
+            sts = [str(r.get("status")) for r in mine]
+            st = "FAIL" if "FAIL" in sts else ("PASS" if all(s == "PASS" for s in sts) else "NOT_RUN")
+            out[t] = {"status": st, "tests": [r.get("test_id") for r in mine]}
+        elif t == "static_stress" and fea and not rs:
+            out[t] = {"status": "GENERIC", "tests": [], "note": "no test plan, so only the single generic load case ran"}
+        else:
+            out[t] = {"status": "NOT_PLANNED", "tests": []}
+    return out
+
+
+def apply_required_tests_gate(quality, req_status, hint=""):
+    """A part is never 'passed' while a required test was not planned or did not complete."""
+    for t, s in (req_status or {}).items():
+        st = s.get("status")
+        if st == "NOT_PLANNED":
+            msg = f"Required test '{t}' was not run: the test plan has no {t} test. {hint}".strip()
+        elif st == "NOT_RUN":
+            msg = f"Required test '{t}' did not complete (see the test results)."
+        else:
+            continue
+        quality["passed"] = False
+        if msg not in quality["reasons"]:
+            quality["reasons"].append(msg)
+
 
 def _rp_json(obj, limit=4000):
     """Compact JSON for the report, hard-capped so one huge solver blob cannot bloat the file."""
@@ -7783,7 +7906,8 @@ def build_analysis_report_md(result, quality, script, meta=None, gi=None, fv=Non
         return [
             "Send this whole file to Claude and say: *Fix the build123d script so it passes. Keep the stated dimensions, "
             "bolt holes and the faces the test plan loads/fixes.* Then upload the new script with "
-            "**Generate STL -> Use my build123d file**.",
+            "**Generate STL -> Give the build123d code file**.",
+            "Keep the `TEST_PLAN = {...}` block at the top level of the script: it tells the backend which of the required tests to run.",
             "",
             "Script rules enforced by the server sandbox: only `from build123d import *`, `math` and `numpy` may be imported; "
             "the final solid must be assigned to `result`; no file I/O, `open`, `eval`, `getattr` or dunder access; units are mm, Z is up.",
@@ -7803,6 +7927,26 @@ def build_analysis_report_md(result, quality, script, meta=None, gi=None, fv=Non
             out.append(f"- {r}")
         return out or ["Nothing failed."]
     sec("Why it did not pass" if not passed else "Quality-gate notes", _why)
+
+    def _required():
+        req = result.get("required_tests") or meta.get("required_tests") or []
+        if not req:
+            return []
+        st = result.get("required_tests_status") or {}
+        out = ["Tests this part must pass (from its Supabase record): " + ", ".join(req), ""]
+        for t in req:
+            s = st.get(t) or {}
+            tag = s.get("status", "NOT_RUN" if error else "UNKNOWN")
+            line = f"- {t}: **{tag}**"
+            if s.get("tests"):
+                line += f" (tests: {', '.join(str(x) for x in s['tests'])})"
+            if s.get("note"):
+                line += f" ({s['note']})"
+            if tag == "NOT_PLANNED":
+                line += ": no test of this type in the plan"
+            out.append(line)
+        return out
+    sec("Required tests", _required)
 
     fea = result.get("analytical_fea") or {}
     tp = result.get("test_plan_results") or {}
@@ -7940,6 +8084,7 @@ async def generate_from_script_async(
     min_safety_factor: float = Form(1.0),
     run_topology: bool = Form(False),
     test_plan_json: Optional[str] = Form(None),
+    required_tests: Optional[str] = Form(None),
 ):
     """
     Run a user-supplied build123d script (NO LLM involved) through sandbox -> geometry checks -> mesh -> FEM
@@ -7962,7 +8107,8 @@ async def generate_from_script_async(
                 force_dir=force_dir, operating_temp_c=operating_temp_c, surface_finish=surface_finish,
                 reliability=reliability, project_description=project_description, min_health_score=min_health_score,
                 max_critical_violations=max_critical_violations, max_high_violations=max_high_violations,
-                min_safety_factor=min_safety_factor, run_topology=run_topology, test_plan_json=test_plan_json)
+                min_safety_factor=min_safety_factor, run_topology=run_topology, test_plan_json=test_plan_json,
+                required_tests=required_tests)
             JOB_STORE[job_id] = {"status": "complete", "result": result, "created": time.time()}
         except HTTPException as e:
             JOB_STORE[job_id] = {"status": "error", "error": f"{e.status_code}: {e.detail}", "created": time.time()}
@@ -7978,7 +8124,7 @@ async def generate_from_script_async(
 async def run_user_script_analysis(script, prompt, part_name, material, force_n, force_dir, operating_temp_c,
                                    surface_finish, reliability, project_description, min_health_score,
                                    max_critical_violations, max_high_violations, min_safety_factor,
-                                   run_topology, test_plan_json):
+                                   run_topology, test_plan_json, required_tests=None):
     if not B3D:
         raise HTTPException(503, "build123d not installed")
     script = (script or "").replace("\r\n", "\n").lstrip("\ufeff")
@@ -8021,17 +8167,35 @@ async def run_user_script_analysis(script, prompt, part_name, material, force_n,
     # 3) mesh + optional user test plan
     _job_progress(stage="meshing_and_fem")
     mesh, stl_bytes = await mesh_from_cad_object(obj)
+    required = parse_required_tests(required_tests)
+    meta["required_tests"] = required
     plan, plan_diag = None, {}
+    plan_text, plan_source = None, None
     if test_plan_json and test_plan_json.strip():
-        plan_diag["provided"] = True
+        plan_text, plan_source = test_plan_json, "uploaded test plan file"
+    else:
         try:
-            plan = TP.parse_plan(test_plan_json)
-            chk = await run_plan_tests(obj, plan, dry_run=True)
-            if chk.get("overall") != "RESOLVED":
-                msg = chk.get("error") or next((r.get("error") for r in chk.get("results", []) if r.get("error")),
-                                               "its face selectors do not resolve on this geometry")
-                plan_diag["error"] = f"test plan rejected: {msg}"
-                plan = None
+            emb = extract_embedded_test_plan(script)
+            if emb:
+                plan_text, plan_source = emb, "TEST_PLAN inside the script"
+        except ValueError as e:
+            plan_diag["provided"] = True
+            plan_diag["error"] = str(e)
+    if plan_text:
+        plan_diag["provided"] = True
+        plan_diag["source"] = plan_source
+        try:
+            plan = TP.parse_plan(plan_text)
+            plan, skipped, _missing = restrict_plan_to_required(plan, required)
+            if skipped:
+                plan_diag["skipped_not_required"] = skipped
+            if plan is not None:
+                chk = await run_plan_tests(obj, plan, dry_run=True)
+                if chk.get("overall") != "RESOLVED":
+                    msg = chk.get("error") or next((r.get("error") for r in chk.get("results", []) if r.get("error")),
+                                                   "its face selectors do not resolve on this geometry")
+                    plan_diag["error"] = f"test plan rejected: {msg}"
+                    plan = None
         except TP.PlanError as e:
             plan_diag["error"] = f"test plan invalid: {e}"
             plan = None
@@ -8067,6 +8231,11 @@ async def run_user_script_analysis(script, prompt, part_name, material, force_n,
         quality["passed"] = False
         quality["reasons"].insert(0, "Geometry inspection failed: " + "; ".join(gi["issues"]))
     _verification_gate(bool(plan_diag.get("provided")), result, plan_diag, quality)
+    if required:
+        req_status = required_tests_status(required, result)
+        result["required_tests"] = required
+        result["required_tests_status"] = req_status
+        apply_required_tests_gate(quality, req_status, "Add it to TEST_PLAN in the script, or upload a test plan file.")
 
     entry = {"iteration": 1, "stage": "analyzed", "passed": quality["passed"], "health_score": quality["score"],
              "reasons": quality["reasons"], "metrics": quality["metrics"],
