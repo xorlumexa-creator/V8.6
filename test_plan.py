@@ -28,6 +28,10 @@ HOT_YIELD = {
     "steel_4340":     [(20, 1.00), (200, 0.95), (300, 0.90), (400, 0.85), (500, 0.70), (600, 0.40)],
     "titanium_6al4v": [(20, 1.00), (100, 0.90), (200, 0.80), (300, 0.72), (400, 0.66), (500, 0.60)],
     "inconel_718":    [(20, 1.00), (200, 0.93), (400, 0.88), (600, 0.85), (650, 0.83), (700, 0.60)],
+    # FDM polymers: rough trends around the glass transition (PETG about 80 C, PLA about 60 C). They fall off a cliff
+    # near those temperatures, so treat thermal results for these as indicative and replace with your filament's datasheet.
+    "petg_plastic":   [(20, 1.00), (40, 0.85), (60, 0.60), (70, 0.40), (80, 0.15), (90, 0.08)],
+    "pla_plastic":    [(20, 1.00), (40, 0.80), (50, 0.50), (60, 0.15), (70, 0.06)],
 }
 
 
