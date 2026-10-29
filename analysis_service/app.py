@@ -2,7 +2,16 @@
 
 Pipeline: gmsh (STEP import, tet10 mesh) -> match faces by position/area/bbox -> .inp -> ccx -> .frd -> metrics.
 Run:  uvicorn app:app --host 0.0.0.0 --port 8000      Env: CCX_API_KEY (optional shared secret), CCX_BIN (default ccx),
-CCX_THREADS (forced to 1 unless CCX_ALLOW_MULTITHREAD is set), CCX_TIMEOUT_S (default 600), MAX_NODES (default 12000)."""
+CCX_THREADS (forced to 1 unless CCX_ALLOW_MULTITHREAD is set), CCX_TIMEOUT_S (default 840), MAX_NODES (default 30000),
+MAX_NODES_CEILING (default 60000), MESH_ATTEMPTS (default 12), MESH_TIME_BUDGET_S (default 300), SOLVE_BUDGET_S (default 870),
+FEM_STRAIGHT_MIDSIDE (default 0).
+
+v2 (performance): the mesher now coarsens in bigger, smarter steps and keeps going until the mesh fits (it used to give up after
+6 small steps), remembers the element size it settled on so the 2nd and 3rd test of the same part skip the expensive early
+attempts, accepts a mesh up to MAX_NODES_CEILING as a last resort instead of failing, and holds every request inside
+SOLVE_BUDGET_S so the main backend's 900 s wait never expires first. CalculiX is still forced onto ONE thread (SPOOLES is wrong
+on several)."""
+import hashlib
 import json
 import math
 import os
@@ -34,8 +43,19 @@ CCX_BIN = os.environ.get("CCX_BIN", "ccx")
 # CalculiX's SPOOLES solver gives random results on several threads (seen: buckling factors off by 100x, a 6% equilibrium
 # error in a plain static solve). These solves take seconds, so run on ONE thread unless multi-thread is explicitly allowed.
 CCX_THREADS = os.environ.get("CCX_THREADS", "1") if os.environ.get("CCX_ALLOW_MULTITHREAD") else "1"
-CCX_TIMEOUT_S = float(os.environ.get("CCX_TIMEOUT_S", "600"))
-MAX_NODES = int(os.environ.get("MAX_NODES", "12000"))
+CCX_TIMEOUT_S = float(os.environ.get("CCX_TIMEOUT_S", "840"))      # cap for ONE CalculiX run
+# The main backend waits 900 s for every /solve call (CCX_TIMEOUT_S in main.py) and that call covers meshing plus the CalculiX
+# run(s), two of them for buckling. The whole request is held to SOLVE_BUDGET_S so it ends with a clear error, never a dead socket.
+SOLVE_BUDGET_S = float(os.environ.get("SOLVE_BUDGET_S", "870"))
+MAX_NODES = int(os.environ.get("MAX_NODES", "30000"))              # mesh TARGET (up to 1.3x of it is accepted without fuss)
+# Last resort: when coarsening runs out of attempts or time, a mesh up to this many nodes is still solved instead of failing.
+NODE_CEILING = int(os.environ.get("MAX_NODES_CEILING", str(max(2 * MAX_NODES, 60000))))
+MESH_ATTEMPTS = int(os.environ.get("MESH_ATTEMPTS", "12"))         # was a fixed 6
+MESH_TIME_BUDGET_S = float(os.environ.get("MESH_TIME_BUDGET_S", "300"))
+# Straight-sided tet10 (mid-edge nodes on the straight edge, not pulled onto curved CAD edges). Off by default so existing results
+# do not change; switch it on if CalculiX ever reports "nonpositive jacobian" (coarse elements next to small round holes).
+STRAIGHT_MIDSIDE = os.environ.get("FEM_STRAIGHT_MIDSIDE", "0") == "1"
+_MESH_HINTS = {}        # sha1(step)+settings -> {"lc", "curv", "n"}: where the coarsening settled for this exact solid
 API_KEY = os.environ.get("CCX_API_KEY", "").strip()
 _lock = threading.Lock()          # one solve at a time: keeps memory predictable on small machines
 
@@ -54,6 +74,69 @@ class SolveError(Exception):
     def __init__(self, stage, msg, design_related=False):
         super().__init__(msg)
         self.stage, self.design_related = stage, design_related
+
+
+def _ccx_timeout(deadline=None):
+    """Seconds one CalculiX run may take: the per-run cap, or what is left of this request's budget if that is smaller."""
+    if deadline is None:
+        return CCX_TIMEOUT_S
+    return max(30.0, min(CCX_TIMEOUT_S, deadline - time.time()))
+
+
+def _mesh_with_budget(gmsh, step_path, diag_mm, case):
+    """Mesh the loaded solid as tet10 and return (n_nodes, lc, curv, attempts, max_nodes, hard_max).
+    Starts from the element size the geometry asks for, then coarsens until the node count fits MAX_NODES x 1.3. Steps follow the
+    node count (thin parts scale about with 1/size^2) so it converges in a few attempts, and it keeps going for MESH_ATTEMPTS
+    tries. If it still does not fit, or the meshing time budget is used up, a mesh up to NODE_CEILING nodes is accepted."""
+    lc = FC.choose_lc(diag_mm, case.get("min_thickness_mm"))
+    max_nodes = int(case.get("max_nodes") or MAX_NODES)
+    hard_max = int(max_nodes * 1.3)
+    ceiling = max(hard_max, int(case.get("max_nodes_ceiling") or NODE_CEILING))
+    gmsh.option.setNumber("Mesh.ElementOrder", 2)
+    if STRAIGHT_MIDSIDE:
+        gmsh.option.setNumber("Mesh.SecondOrderLinear", 1)
+    curv = 12
+    hint_key = hint = None
+    try:
+        with open(step_path, "rb") as fh:
+            hint_key = f"{hashlib.sha1(fh.read()).hexdigest()}:{max_nodes}:{int(STRAIGHT_MIDSIDE)}"
+        hint = _MESH_HINTS.get(hint_key)
+    except OSError:
+        pass
+    if hint:                                   # this exact solid was meshed for an earlier test: start where that ended
+        lc, curv = hint["lc"], hint["curv"]
+    n_nodes, attempts, mesh_t0 = 0, 0, time.time()
+    for attempt in range(MESH_ATTEMPTS):
+        attempts = attempt + 1
+        gmsh.model.mesh.clear()
+        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", curv)
+        gmsh.option.setNumber("Mesh.MeshSizeMax", lc)
+        gmsh.option.setNumber("Mesh.MeshSizeMin", lc * 0.2)
+        try:
+            gmsh.model.mesh.generate(3)
+        except Exception as e:
+            raise SolveError("mesh", f"gmsh meshing failed: {e}", design_related=True)
+        n_nodes = len(gmsh.model.mesh.getNodes(-1, -1, True, False)[0])
+        limit = max(hard_max, int(hint["n"] * 1.02)) if (hint and attempt == 0) else hard_max
+        if n_nodes <= limit:
+            break
+        if n_nodes <= ceiling and time.time() - mesh_t0 > MESH_TIME_BUDGET_S:
+            break                              # out of meshing time: take the bigger mesh rather than fail
+        if attempt + 1 < MESH_ATTEMPTS:
+            new_lc = min(lc * min(2.0, max(1.15, (n_nodes / max_nodes) ** 0.5 * 1.05)), diag_mm / 4.0)
+            if new_lc <= lc * 1.001:
+                break                          # element size is already as coarse as it can usefully get
+            lc = new_lc
+            curv = max(4, curv - 2)
+    if n_nodes > ceiling:
+        raise SolveError("mesh", f"mesh still has {n_nodes} nodes (limit {max_nodes}, ceiling {ceiling}) at element size "
+                                 f"{lc:.2f} mm after {attempts} attempts: the geometry has many tiny features (small fillets, "
+                                 "holes or ribs) - simplify them or raise MAX_NODES / MAX_NODES_CEILING", design_related=True)
+    if hint_key:
+        if len(_MESH_HINTS) > 64:
+            _MESH_HINTS.clear()
+        _MESH_HINTS[hint_key] = {"lc": lc, "curv": curv, "n": n_nodes}
+    return n_nodes, lc, curv, attempts, max_nodes, hard_max
 
 
 def _auth(key):
@@ -79,7 +162,8 @@ def _ccx_version():
 
 
 # ---------------------------------------------------------------------------------------------- the solve
-def _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, sc, modes, accuracy, threads, env, tag="a"):
+def _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, sc, modes, accuracy, threads, env, tag="a",
+                  deadline=None):
     """Linear buckling in its own CalculiX run: a deck with ONE *BUCKLE step whose load is the reference load (scaled to a
     ~1 N total, which keeps CalculiX from skipping modes). Factors are scaled back to the ACTUAL load. CalculiX's eigenvalue
     solver is known to return random values with SPOOLES on more than 1-2 threads, so every thread setting is forced to
@@ -92,9 +176,10 @@ def _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, s
                  FC.tet10_gmsh_to_ccx(conn), set(fixed_nodes), forces, float(mat["E_mpa"]), float(mat["nu"]),
                  analysis="buckling", buckle_modes=modes, buckle_scale=sc, buckle_accuracy=accuracy)
     try:
-        r = subprocess.run([CCX_BIN, job], cwd=workdir, capture_output=True, text=True, env=env, timeout=CCX_TIMEOUT_S)
+        r = subprocess.run([CCX_BIN, job], cwd=workdir, capture_output=True, text=True, env=env, timeout=_ccx_timeout(deadline))
     except subprocess.TimeoutExpired:
-        raise SolveError("solve", f"CalculiX buckling run exceeded {CCX_TIMEOUT_S:.0f}s")
+        raise SolveError("solve", f"CalculiX buckling run exceeded {_ccx_timeout(deadline):.0f}s (run cap {CCX_TIMEOUT_S:.0f}s, "
+                                  f"request budget {SOLVE_BUDGET_S:.0f}s)")
     tail = (r.stdout + r.stderr).strip().splitlines()[-8:]
     dat_p, frd_p = os.path.join(workdir, job + ".dat"), os.path.join(workdir, job + ".frd")
     dat = open(dat_p, errors="ignore").read() if os.path.exists(dat_p) else ""
@@ -123,12 +208,13 @@ def _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, s
     return bk
 
 
-def _buckling_checked(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale, modes, accuracy, threads, env):
+def _buckling_checked(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale, modes, accuracy, threads, env,
+                      deadline=None):
     """Two buckling runs at load scales 10x apart. A correct linear buckling factor (per actual load) does not depend on the
     size of the reference load; the CalculiX failure modes (random values, a skipped first mode) do. A mismatch marks the
     result as suspect so it can never be passed off as a verdict."""
-    a = _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale, modes, accuracy, threads, env, "a")
-    b = _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale * 0.1, modes, accuracy, threads, env, "b")
+    a = _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale, modes, accuracy, threads, env, "a", deadline)
+    b = _run_buckling(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale * 0.1, modes, accuracy, threads, env, "b", deadline)
     fa, fb = a.get("factor"), b.get("factor")
     agree = bool(fa and fb and abs(fa - fb) <= 0.03 * max(fa, fb))
     a["check"] = {"factor_load_1N": fa, "factor_load_0.1N": fb, "agree_within_3pct": agree}
@@ -143,6 +229,7 @@ def solve_case(step_path, case, workdir, gmsh=None):
     """Returns (result_dict, timings). Raises SolveError(stage, msg, design_related)."""
     gmsh = gmsh or _gmsh()
     t0 = time.time()
+    deadline = t0 + SOLVE_BUDGET_S
     tm = {}
     mat = case["material"]
     analysis = case.get("analysis", "static")
@@ -201,34 +288,11 @@ def solve_case(step_path, case, workdir, gmsh=None):
         if {t for ts in flux_tags for t in ts} & {t for ts in temp_tags for t in ts}:
             raise SolveError("face_match", "a heat-input face and a temperature face resolved to the same gmsh surface")
 
-        # ---- mesh (tet10), coarsened if it would exceed the node budget
-        lc = FC.choose_lc(exp_ext, case.get("min_thickness_mm"))
-        max_nodes = int(case.get("max_nodes") or MAX_NODES)
-        gmsh.option.setNumber("Mesh.ElementOrder", 2)
-        # a mesh a little over the budget is fine (the estimate is rough and RAM is not the limit at this size);
-        # beyond that, coarsen the element size AND the curvature refinement that small fillets/holes trigger
-        hard_max = int(max_nodes * 1.3)
-        curv = 12
-        n_nodes = 0
-        for attempt in range(6):
-            gmsh.model.mesh.clear()
-            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", curv)
-            gmsh.option.setNumber("Mesh.MeshSizeMax", lc)
-            gmsh.option.setNumber("Mesh.MeshSizeMin", lc * 0.2)
-            try:
-                gmsh.model.mesh.generate(3)
-            except Exception as e:
-                raise SolveError("mesh", f"gmsh meshing failed: {e}", design_related=True)
-            n_nodes = len(gmsh.model.mesh.getNodes(-1, -1, True, False)[0])
-            if n_nodes <= hard_max:
-                break
-            lc *= min(1.6, (n_nodes / max_nodes) ** (1 / 3) * 1.1)
-            curv = max(4, curv - 2)
-        if n_nodes > hard_max:
-            raise SolveError("mesh", f"mesh still has {n_nodes} nodes (limit {max_nodes}) at element size {lc:.2f} mm "
-                                     "after coarsening: the geometry has many tiny features (small fillets, holes or "
-                                     "ribs) - simplify them or raise MAX_NODES", design_related=True)
-        tm["mesh_s"] = round(time.time() - t0, 2)
+        # ---- mesh (tet10), coarsened if it would exceed the node budget (see _mesh_with_budget)
+        mesh_t = time.time()
+        n_nodes, lc, curv, mesh_attempts, max_nodes, hard_max = _mesh_with_budget(gmsh, step_path, exp_ext, case)
+        tm["mesh_s"] = round(time.time() - mesh_t, 2)
+        tm["mesh_attempts"] = mesh_attempts
 
         ntags, ncoords, _ = gmsh.model.mesh.getNodes(-1, -1, True, False)
         coords = np.asarray(ncoords, float).reshape(-1, 3)
@@ -298,9 +362,11 @@ def solve_case(step_path, case, workdir, gmsh=None):
                            "temps": temp_bc, "cflux_mw": cflux} if analysis == "thermal" else None))
     env = dict(os.environ, OMP_NUM_THREADS=CCX_THREADS, CCX_NPROC_EQUATION_SOLVER=CCX_THREADS)
     try:
-        r = subprocess.run([CCX_BIN, "job"], cwd=workdir, capture_output=True, text=True, env=env, timeout=CCX_TIMEOUT_S)
+        r = subprocess.run([CCX_BIN, "job"], cwd=workdir, capture_output=True, text=True, env=env, timeout=_ccx_timeout(deadline))
     except subprocess.TimeoutExpired:
-        raise SolveError("solve", f"CalculiX exceeded {CCX_TIMEOUT_S:.0f}s")
+        raise SolveError("solve", f"CalculiX exceeded {_ccx_timeout(deadline):.0f}s (run cap {CCX_TIMEOUT_S:.0f}s, "
+                                  f"request budget {SOLVE_BUDGET_S:.0f}s, {n_nodes} nodes): raise CCX_TIMEOUT_S / SOLVE_BUDGET_S "
+                                  "(and CCX_TIMEOUT_S in the main backend) or simplify the part")
     except FileNotFoundError:
         raise SolveError("setup", f"CalculiX binary '{CCX_BIN}' not found on this machine")
     frd = os.path.join(workdir, "job.frd")
@@ -319,7 +385,7 @@ def solve_case(step_path, case, workdir, gmsh=None):
     if analysis == "buckling":
         out["buckling"] = _buckling_checked(workdir, node_xyz, elem_ids, conn, fixed_nodes, forces, mat, bscale,
                                             int(case.get("buckle_modes") or 3), case.get("buckle_accuracy"),
-                                            int(case.get("buckle_threads") or 1), env)
+                                            int(case.get("buckle_threads") or 1), env, deadline)
     bc = FC.bc_sanity(res["DISP"], fixed_nodes, load_nodes, force_by_load)
     if analysis == "thermal":
         ts = FC.thermal_sanity(res["NDTEMP"], temp_bc, bool(cflux))
@@ -359,7 +425,8 @@ def solve_case(step_path, case, workdir, gmsh=None):
                            "disp_mm": [round(float(v), 5) for v in d3] if d3 else None})
         out["probes"] = probes
     out.update({"analysis": analysis, "bc_check": bc, "mesh": {"nodes": n_nodes, "elements": int(len(elem_ids)), "element_size_mm": round(lc, 3),
-                                         "unit_scale_applied": k},
+                                         "unit_scale_applied": k, "attempts": mesh_attempts, "target_nodes": max_nodes,
+                                         "over_target": bool(n_nodes > hard_max)},
                 "versions": {"ccx": _ccx_version()}})
     tm["total_s"] = round(time.time() - t0, 2)
     return out, tm
@@ -369,7 +436,9 @@ def solve_case(step_path, case, workdir, gmsh=None):
 @app.get("/health")
 def health():
     info = {"ok": True, "ccx_bin": CCX_BIN, "ccx": _ccx_version(), "threads": CCX_THREADS, "max_nodes": MAX_NODES,
-            "auth_required": bool(API_KEY)}
+            "hard_max_nodes": int(MAX_NODES * 1.3), "node_ceiling": NODE_CEILING, "mesh_attempts": MESH_ATTEMPTS,
+            "ccx_timeout_s": CCX_TIMEOUT_S, "solve_budget_s": SOLVE_BUDGET_S, "straight_midside": STRAIGHT_MIDSIDE,
+            "version": "v2-adaptive-mesh", "auth_required": bool(API_KEY)}
     try:
         import gmsh
         info["gmsh"] = gmsh.__version__
