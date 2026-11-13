@@ -47,7 +47,14 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-COPY main.py test_plan.py assembly.py ./
+# Copy EVERY top-level module. main.py imports aero_design, cog_balance, crank_design, drone_frame, flight_check,
+# capacity, skin_check and design_graph from sibling files; the old line copied only main/test_plan/assembly, so on
+# this image those imports failed silently and the balance / aero / flight / skin endpoints all answered 503.
+# tests/test_install_modules.py fails if main.py ever imports a file this line would not copy.
+COPY *.py ./
+
+# Build-time guard: fail the BUILD (not the first request) if any design module cannot be imported.
+RUN python -c "import test_plan, assembly, cog_balance, aero_design, crank_design, drone_frame, flight_check, capacity, skin_check, design_graph; print('all design modules import OK')"
 
 # One worker on purpose: background jobs (JOB_STORE) and the SimScale lock live in process memory.
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
