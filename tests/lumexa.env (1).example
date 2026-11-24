@@ -1,0 +1,14 @@
+# Copy this file to ~/.lumexa.env on the tablet, fill it in, then run: chmod 600 ~/.lumexa.env
+# start_all.sh and tunnel.sh read it. Never commit the real file.
+#
+# KEY  - shared secret between the backend and the CalculiX solver. Any long random string:  openssl rand -hex 32
+# REG  - the registration secret stored in Supabase as lumexa_runner.config key 'register_secret'.
+#        On the existing project it is already set, so keep the REG value you already have.
+#        (Only on a brand-new project: insert one with the SQL shown in
+#         supabase/migrations/20261113090000_lumexa_backend_registry.sql, then use the same value here.)
+# SB   - your Supabase project URL (Project Settings > API > Project URL)
+# ANON - that project's anon / publishable key (Project Settings > API)
+KEY=
+REG=
+SB=https://YOUR-PROJECT-REF.supabase.co
+ANON=
