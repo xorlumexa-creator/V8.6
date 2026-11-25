@@ -1,1 +1,123 @@
-.
+name: lumexa-backend
+
+# Runs the whole Lumexa compute stack inside one GitHub Actions runner:
+#   CalculiX solver service (analysis_service, port 8000)  +  FastAPI backend (main.py, port 8001)
+# and exposes the backend through a Cloudflare quick tunnel. The tunnel URL is registered in Supabase
+# (public.lumexa_register_backend), which is where the app (lumexa_get_backend) and the pg_cron job runner
+# (lumexa_runner.tick -> /ccx-health, /generate-from-script-async, /job/{id}) look it up.
+# A run lasts ~5h40m, then starts its own replacement.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"   # safety net if the self-restart ever fails
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      # --- backend (main.py) ---
+      AI_PROVIDER: nvidia
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      SIMSCALE_API_KEY: ${{ secrets.SIMSCALE_API_KEY }}
+      SIMSCALE_TEMPLATE_PROJECT_ID: ${{ secrets.SIMSCALE_TEMPLATE_PROJECT_ID }}
+      SIMSCALE_TEMPLATE_SIMULATION_ID: ${{ secrets.SIMSCALE_TEMPLATE_SIMULATION_ID }}
+      SIMSCALE_TEMPLATE_MESH_OPERATION_ID: ${{ secrets.SIMSCALE_TEMPLATE_MESH_OPERATION_ID }}
+      ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }}
+      KB_ENABLED: "1"
+      KB_EMBEDDINGS: "0"
+      MALLOC_ARENA_MAX: "2"
+      OMP_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+      PYTHONUNBUFFERED: "1"
+      # --- CalculiX wiring: the Supabase tick() only submits jobs when GET /ccx-health answers 200 ---
+      FEA_SOLVER: ${{ vars.FEA_SOLVER || 'calculix' }}
+      CCX_SERVICE_URL: http://127.0.0.1:8000
+      CCX_API_KEY: ${{ secrets.CCX_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: System libraries (OpenCASCADE / GL / CalculiX)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            calculix-ccx \
+            libgl1 libglu1-mesa libxrender1 libxext6 libsm6 libice6 libx11-6 libxi6 \
+            libxrandr2 libxfixes3 libxcursor1 libxinerama1 libfontconfig1 libxft2 \
+            libxt6 libxkbcommon0 libdbus-1-3 libxcb1 libgomp1 libegl1 libosmesa6
+          ccx -v 2>&1 | head -3 || true
+
+      - name: Python dependencies (backend + solver in separate envs)
+        run: |
+          pip install -r requirements.txt
+          python -m venv "$HOME/venv-ccx"
+          "$HOME/venv-ccx/bin/pip" install -r analysis_service/requirements.txt
+
+      - name: Start CalculiX solver service (8000)
+        working-directory: analysis_service
+        env:
+          CCX_THREADS: "4"
+          MAX_NODES: "30000"
+          FEM_STRAIGHT_MIDSIDE: "1"
+        run: |
+          nohup "$HOME/venv-ccx/bin/uvicorn" app:app --host 127.0.0.1 --port 8000 > "$GITHUB_WORKSPACE/solver.log" 2>&1 &
+          for i in $(seq 1 40); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:8000/health)" = 200 ] && echo "solver up" && exit 0
+            sleep 3
+          done
+          echo "solver did not start"; tail -50 "$GITHUB_WORKSPACE/solver.log"; exit 1
+
+      - name: Start backend (8001)
+        run: |
+          nohup uvicorn main:app --host 127.0.0.1 --port 8001 --workers 1 > backend.log 2>&1 &
+          for i in $(seq 1 60); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:8001/)" = 200 ] && break
+            sleep 3
+          done
+          [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:8001/)" = 200 ] || { echo "backend did not start"; tail -50 backend.log; exit 1; }
+          # this is the exact check the Supabase job runner makes before it submits a job
+          code=$(curl -s -o ccx-health.json -w '%{http_code}' localhost:8001/ccx-health)
+          echo "/ccx-health -> $code"; cat ccx-health.json; echo
+          [ "$code" = 200 ] || { tail -50 backend.log; exit 1; }
+
+      - name: Start tunnel and register URL in Supabase
+        env:
+          SB: ${{ secrets.SB }}
+          ANON: ${{ secrets.ANON }}
+          REG: ${{ secrets.REG }}
+        run: |
+          curl -fsSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --url http://localhost:8001 > tunnel.log 2>&1 &
+          URL=""
+          for i in $(seq 1 30); do
+            URL=$(grep -a -o 'https://[a-z0-9-]*\.trycloudflare\.com' tunnel.log | tail -1)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          [ -z "$URL" ] && { echo "no tunnel URL"; cat tunnel.log; exit 1; }
+          echo "::add-mask::$URL"   # keep the address out of the logs (matters on a public repo)
+          resp=$(curl -s -X POST "$SB/rest/v1/rpc/lumexa_register_backend" \
+            -H "apikey: $ANON" -H "Authorization: Bearer $ANON" \
+            -H "Content-Type: application/json" \
+            -d "{\"p_url\":\"$URL\",\"p_secret\":\"$REG\"}")
+          echo "register -> $resp"
+          echo "$resp" | grep -q "$URL" || { echo "registration failed"; exit 1; }
+
+      - name: Keep alive, then start the next run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep 20400   # 5h40m
+          gh workflow run backend.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+          sleep 600     # overlap so the new run can register its URL first
